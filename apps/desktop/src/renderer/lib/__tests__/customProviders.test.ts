@@ -1,12 +1,79 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   appendDiscoveredCustomProviderModels,
+  createCustomProvider,
   customProviderModelConfigFromCatalogModel,
   providerViewToCustomProviderConfig,
   replaceCustomProviderModelId,
+  updateCustomProvider,
 } from '../customProviders';
-import type { ProviderView } from '@cindy/model-providers';
+import type { CustomProviderConfig, ProviderView } from '@cindy/model-providers';
+
+const createCustomProviderMock = vi.fn();
+const updateCustomProviderMock = vi.fn();
+const safeStorageStoreMock = vi.fn();
+
+const customProviderConfig = {
+  id: 'test-provider',
+  name: 'Test Provider',
+  runtimes: {
+    codex: {
+      baseUrl: 'https://example.com/v1',
+      models: [{ id: 'test-model', name: 'Test Model' }],
+    },
+  },
+} satisfies CustomProviderConfig;
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.stubGlobal('window', {
+    electronAPI: {
+      maker: {
+        createCustomProvider: createCustomProviderMock,
+        updateCustomProvider: updateCustomProviderMock,
+      },
+      safeStorageStore: safeStorageStoreMock,
+    },
+  });
+  createCustomProviderMock.mockResolvedValue(undefined);
+  updateCustomProviderMock.mockResolvedValue(undefined);
+  safeStorageStoreMock.mockResolvedValue(true);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('custom provider key persistence', () => {
+  it('rejects create when safe storage reports that the key was not stored', async () => {
+    safeStorageStoreMock.mockResolvedValue(false);
+
+    await expect(
+      createCustomProvider(customProviderConfig, { codex: 'test-key' }),
+    ).rejects.toThrow('Failed to securely store the API key for codex.');
+
+    expect(createCustomProviderMock).toHaveBeenCalledWith(customProviderConfig);
+    expect(safeStorageStoreMock).toHaveBeenCalledWith(
+      'provider_key_test-provider_codex',
+      'test-key',
+    );
+  });
+
+  it('rejects update when safe storage reports that the key was not stored', async () => {
+    safeStorageStoreMock.mockResolvedValue(false);
+
+    await expect(
+      updateCustomProvider(customProviderConfig, { codex: 'replacement-key' }),
+    ).rejects.toThrow('Failed to securely store the API key for codex.');
+
+    expect(updateCustomProviderMock).toHaveBeenCalledWith(customProviderConfig);
+    expect(safeStorageStoreMock).toHaveBeenCalledWith(
+      'provider_key_test-provider_codex',
+      'replacement-key',
+    );
+  });
+});
 
 describe('replaceCustomProviderModelId', () => {
   it('drops hidden metadata when the model id changes', () => {

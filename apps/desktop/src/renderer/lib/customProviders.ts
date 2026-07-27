@@ -124,7 +124,13 @@ async function saveKeys(providerId: string, keys: RuntimeKeys): Promise<void> {
   for (const agent of ALL_AGENTS) {
     const key = keys[agent]?.trim();
     if (key) {
-      await window.electronAPI.safeStorageStore(customProviderSecretStorageKey(providerId, agent), key);
+      const stored = await window.electronAPI.safeStorageStore(
+        customProviderSecretStorageKey(providerId, agent),
+        key,
+      );
+      if (!stored) {
+        throw new Error(`Failed to securely store the API key for ${agent}.`);
+      }
     }
   }
 }
