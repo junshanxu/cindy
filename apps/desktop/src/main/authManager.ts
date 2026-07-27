@@ -387,7 +387,15 @@ function removeSafe(key: string): void {
  * 范围内。当前收益是把窗口从数秒级压到一次 syscall,且真正高频的那条路径
  * (passive)已经完全不删。
  */
-function removeSafeIfUnchanged(key: string, expected: string): boolean {
+type RemoveIfUnchangedResult =
+  /** 确实删掉了(或删除时文件已不在,目标状态达成)。 */
+  | 'deleted'
+  /** 磁盘上的已经不是本次判定的那一枚,按约定不删。 */
+  | 'changed'
+  /** 删除真的失败了(权限 / IO):凭证还在盘上,调用方不得当成已清理。 */
+  | 'failed';
+
+function removeSafeIfUnchanged(key: string, expected: string): RemoveIfUnchangedResult {
   const filepath = path.join(SAFE_STORAGE_DIR(), `${key}.enc`);
   const identity = (): string | null => {
     try {
@@ -398,12 +406,22 @@ function removeSafeIfUnchanged(key: string, expected: string): boolean {
     }
   };
   const before = identity();
-  if (before === null) return false;
-  if (readSafe(key) !== expected) return false;
+  if (before === null) return 'changed';
+  if (readSafe(key) !== expected) return 'changed';
   // 读内容期间文件被换掉(另一个实例写入了替换凭证)→ 那枚不在本次判定范围内。
-  if (identity() !== before) return false;
-  removeSafe(key);
-  return true;
+  if (identity() !== before) return 'changed';
+  try {
+    // 不走 removeSafe():它吞掉所有 unlink 错误,会让调用方把「没删成」当成
+    // 「已清理」并据此打日志。这里必须如实区分。
+    fs.unlinkSync(filepath);
+    return 'deleted';
+  } catch (err) {
+    // 这一瞬别人已经删掉了 → 目标状态达成,算成功。
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return 'deleted';
+    // EPERM / EACCES / EBUSY 等:凭证仍在盘上。
+    log.warn(`failed to delete persisted secret ${key}: ${(err as Error).message}`);
+    return 'failed';
+  }
 }
 
 // ── PKCE (Node.js native crypto) ────────────────────────────────────────────
@@ -1784,16 +1802,27 @@ async function runColdStartRefreshFlow(storedToken: string): Promise<AuthState> 
           log.warn(
             'cold-start refresh: definitive credential failure — passive shared-userData instance starts logged out and keeps the persisted refresh token',
           );
-        } else if (removeSafeIfUnchanged(REFRESH_TOKEN_KEY, storedToken)) {
-          log.warn(
-            'cold-start refresh: definitive credential failure — clearing persisted refresh token',
-          );
         } else {
-          // 判定失败后磁盘 token 已被换掉(另一个实例写入了替换凭证):那枚不在本次
-          // 判定范围内,不能删。
-          log.warn(
-            'cold-start refresh: definitive credential failure, but the persisted refresh token changed meanwhile — keeping the replacement',
-          );
+          switch (removeSafeIfUnchanged(REFRESH_TOKEN_KEY, storedToken)) {
+            case 'deleted':
+              log.warn(
+                'cold-start refresh: definitive credential failure — cleared persisted refresh token',
+              );
+              break;
+            case 'changed':
+              // 判定失败后磁盘 token 已被换掉(另一个实例写入了替换凭证):那枚不在
+              // 本次判定范围内,不能删。
+              log.warn(
+                'cold-start refresh: definitive credential failure, but the persisted refresh token changed meanwhile — keeping the replacement',
+              );
+              break;
+            case 'failed':
+              // 删除真的失败了:凭证仍在盘上,下次启动会再判一次。不能报成已清理。
+              log.error(
+                'cold-start refresh: definitive credential failure, but deleting the persisted refresh token failed — it is still on disk',
+              );
+              break;
+          }
         }
       } else if (action.kind === 'replacement-retry') {
         log.warn(

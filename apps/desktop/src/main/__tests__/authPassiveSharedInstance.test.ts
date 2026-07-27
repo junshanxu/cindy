@@ -176,20 +176,30 @@ describe('passive shared-userData instance auth isolation', () => {
     // 非 passive 也不能无条件删：判定与删除之间另一个实例可能写入了替换凭证。
     expect(body).toContain('removeSafeIfUnchanged(REFRESH_TOKEN_KEY, storedToken)');
     expect(body).not.toContain('removeSafe(REFRESH_TOKEN_KEY);');
+    // 三种结果各自如实记日志，尤其 'failed' 不得报成已清理。
+    expect(body).toContain("case 'deleted':");
+    expect(body).toContain("case 'changed':");
+    expect(body).toContain("case 'failed':");
 
     // compare-and-delete 读不出磁盘内容时不得删（宁留失效 token 也不误删有效凭证），
     // 并且要在内容比对前后各校验一次文件身份，收紧 read→unlink 之间的 TOCTOU。
     const helper = sliceBody(
-      'function removeSafeIfUnchanged(key: string, expected: string): boolean {',
+      'function removeSafeIfUnchanged(key: string, expected: string): RemoveIfUnchangedResult {',
       '\n}\n',
     );
-    expect(helper).toContain('if (readSafe(key) !== expected) return false;');
+    expect(helper).toContain("if (readSafe(key) !== expected) return 'changed';");
     expect(helper).toContain('const before = identity();');
-    expect(helper).toContain('if (before === null) return false;');
-    expect(helper).toContain('if (identity() !== before) return false;');
-    expect(helper.indexOf('if (identity() !== before) return false;')).toBeLessThan(
-      helper.indexOf('removeSafe(key);'),
+    expect(helper).toContain("if (before === null) return 'changed';");
+    expect(helper).toContain("if (identity() !== before) return 'changed';");
+    expect(helper.indexOf("if (identity() !== before) return 'changed';")).toBeLessThan(
+      helper.indexOf('fs.unlinkSync(filepath);'),
     );
+
+    // 删除失败必须如实回报：removeSafe() 吞掉所有 unlink 错误，用它会让调用方把
+    // 「没删成」当成「已清理」并据此打日志。ENOENT 例外——目标状态已达成。
+    expect(helper).not.toContain('removeSafe(key);');
+    expect(helper).toContain("if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return 'deleted';");
+    expect(helper).toContain("return 'failed';");
   });
 
   it('relogin marker:passive 不消费 marker,但同样保持登出(不得拿旧 token 登进去)', () => {
