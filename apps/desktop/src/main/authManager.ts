@@ -296,6 +296,16 @@ function isPassiveSharedUserDataInstance(): boolean {
   return !app.isPackaged && process.env.XDT_PASSIVE_SHARED_USER_DATA === '1';
 }
 
+/**
+ * passive 实例「本进程已登出」的墓碑(进程内,不落盘)。
+ *
+ * passive 登出保留磁盘 token(那是 primary 的),于是登出后任何 initialize() ——
+ * 副窗 mount、右侧栏子窗口、renderer reload —— 都会读到仍在的 token 把本进程
+ * 冷启动登回去,还顺手轮换一次共享 token。有了墓碑,「只登出本进程」才是稳定的:
+ * 直到用户在本进程显式登录或重启进程为止。
+ */
+let passiveLocalSignOut = false;
+
 // ── safeStorage helpers ─────────────────────────────────────────────────────
 
 const SAFE_STORAGE_DIR = () => path.join(app.getPath('userData'), 'safe-storage');
@@ -1130,7 +1140,9 @@ function clearAuth(
   if (!opts.preservePersistedRefreshToken) {
     if (isPassiveSharedUserDataInstance()) {
       // passive 共享实例无权删整机凭证:它的登出只清本进程内存态,磁盘 token 留给
-      // primary(见 isPassiveSharedUserDataInstance 的事故记录)。
+      // primary(见 isPassiveSharedUserDataInstance 的事故记录)。同时立墓碑,否则
+      // 下一次 initialize() 会拿 primary 的 token 把本进程登回去。
+      passiveLocalSignOut = true;
       log.info(
         'passive shared-userData instance keeps the persisted refresh token (local sign-out only)',
       );
@@ -1141,7 +1153,12 @@ function clearAuth(
     }
   }
   // 未登录时固定使用 stable；同步中的旧请求会被 authStateEpoch 守卫丢弃。
-  canaryFlagStore.clear();
+  // canary-flag.json 同样是整机一份的账号派生状态:passive 清掉它,packaged primary
+  // 下次更新轮询就会把自己当 stable 用户,拉到错误的 manifest(见 manifestService
+  // fetchManifest)。passive 只登出本进程,不改这个共享文件。
+  if (!isPassiveSharedUserDataInstance()) {
+    canaryFlagStore.clear();
+  }
   // provider key(XD / Mivo)是绑定账号的本机密钥,**不在登出时清** —— 同账号重新登录 /
   // 会话过期重登需保留,避免每次都重填(本地 only 后服务器已无副本可拉回)。换账号导致的
   // 串号边界改由 login / 冷启动时 providerSecretStore.reconcileOwner 处理:owner 变了才清。
@@ -1445,6 +1462,15 @@ export async function getAccountDeletionStatus(): Promise<AccountDeletionStatus 
 }
 
 export function clearAccountDeletionReceipt(): void {
+  // 唯一调用方是 logout()。receipt 同样是整机一份:primary 发起账号删除挑战后,
+  // passive 一次本地登出就会删掉它,primary 随后 confirmAccountDeletion() 直接
+  // ACCOUNT_DELETION_RECEIPT_MISSING。passive 不碰。
+  // (账号删除确认成功后的清理走另外两处 removeSafe(ACCOUNT_DELETION_RECEIPT_KEY),
+  //  那是账号级终态,不受本闸门约束。)
+  if (isPassiveSharedUserDataInstance()) {
+    log.info('passive shared-userData instance keeps the account-deletion receipt');
+    return;
+  }
   removeSafe(ACCOUNT_DELETION_RECEIPT_KEY);
 }
 
@@ -1573,13 +1599,29 @@ export async function initialize(options: AuthInitializeOptions = {}): Promise<A
     return snapshotAuthState();
   }
 
+  // passive 实例在本进程登出过:磁盘上的 token 是 primary 的,不能拿它把自己登回去
+  // （副窗 mount / renderer reload 都会走到这里）。直到显式登录或进程重启为止。
+  if (passiveLocalSignOut) {
+    log.info('passive shared-userData instance stays signed out locally (tombstone)');
+    commitActiveAppSession('signed-out');
+    return snapshotLoggedOutAuthState();
+  }
+
   // release-relogin-on-update: if the auto-updater dropped a relogin marker
   // for *this* version, wipe persisted auth and force the user back to the
   // OAuth flow. The flag is one-shot: once consumed, subsequent launches
   // see no marker and no refresh_token, so the user stays logged out
   // naturally until they sign in (rather than getting kicked every launch).
+  //
+  // marker 是一次性的、整机一份:passive 若消费它,primary 就再也看不到这次
+  // requireRelogin 更新的标记,而 passive 顺带删掉的又正是 primary 的 token ——
+  // 本 PR 要防的失败被原样重现。passive 一律不碰 marker,交给 primary 处理。
   const reloginFlag = readReloginFlag();
-  if (reloginFlag && reloginFlag.version === app.getVersion()) {
+  if (
+    reloginFlag &&
+    reloginFlag.version === app.getVersion() &&
+    !isPassiveSharedUserDataInstance()
+  ) {
     log.info(
       'relogin marker hit for v%s — clearing persisted auth',
       reloginFlag.version,
@@ -1867,6 +1909,8 @@ async function completeLogin(
     removeSafe(ACCOUNT_DELETION_RECEIPT_KEY);
     accountDeletionRestoredNoticePending = deletionWasRestored;
     clearReloginFlag();
+    // 显式登录解除 passive 本地登出墓碑(见 passiveLocalSignOut)。
+    passiveLocalSignOut = false;
     currentUser = nextUser;
     commitActiveAppSession('cloud', currentUser.id);
   } finally {
@@ -2421,6 +2465,16 @@ export async function logout(): Promise<void> {
 /**
  * Called on system resume (powerMonitor 'resume' event).
  * If the app JWT is expired or expiring within 5 minutes, trigger a refresh.
+ *
+ * 唤醒续期对 passive 实例**有意不加闸门**（与 scheduleRefresh 的处理不同）。
+ *
+ * passive 让出的是「周期性主动轮换」——那是每 55 分钟一次、与 primary 规律对撞的
+ * 噪音源。但它不能连按需续期一起让出:access token 过期后,primary 的续期只更新
+ * 磁盘上的 refresh token,不会更新本进程内存里的 access token,而
+ * getAccountDeletionAvailability() / updateServerProfile() 这类直接走 apiFetch 的
+ * 路径拿不到 401 重试,会一直失败到进程重启。resume 是低频事件,让它作为按需自愈
+ * 入口，代价（一次轮换）由 primary 侧既有的 replacement-retry 消化——轮换本身不会
+ * 踢人，把 primary 踢下线的是删除凭证，那条已由 clearAuth 的闸门堵住。
  */
 export function handleResume(): void {
   if (accessToken === null) return;

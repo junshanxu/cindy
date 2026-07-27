@@ -98,4 +98,61 @@ describe('passive shared-userData instance auth isolation', () => {
     expect(body).toContain("await expireRuntimeAuth(previousUserId, 'credential-lost', {");
     expect(body).toContain('preservePersistedRefreshToken: true');
   });
+
+  it('唤醒续期有意不加闸门:passive 让出的是周期轮换,不是按需自愈', () => {
+    const body = sliceBody('export function handleResume(): void {', '\n}\n');
+
+    // 拦掉 resume 会让 passive 的 access token 过期后再无替换：primary 的续期只更新
+    // 磁盘 refresh token，不更新本进程内存里的 access token，而直接走 apiFetch 的
+    // 路径（getAccountDeletionAvailability / updateServerProfile）拿不到 401 重试。
+    // 这条断言把取舍钉住，避免后续 review 来回改。
+    expect(body).not.toContain('isPassiveSharedUserDataInstance');
+    expect(body).toContain('refresh();');
+  });
+
+  it('登出墓碑:passive 本地登出后 initialize 不得用 primary 的 token 登回来', () => {
+    const clearBody = sliceBody('function clearAuth(', 'commitActiveAppSession');
+    const passiveIdx = clearBody.indexOf('if (isPassiveSharedUserDataInstance()) {');
+    // 墓碑必须和「保留磁盘 token」在同一分支里立起来。
+    expect(clearBody.indexOf('passiveLocalSignOut = true;')).toBeGreaterThan(passiveIdx);
+
+    const initBody = sliceBody(
+      'export async function initialize(options: AuthInitializeOptions = {}): Promise<AuthState> {',
+      'const reloginFlag = readReloginFlag();',
+    );
+    expect(initBody).toContain('if (passiveLocalSignOut) {');
+    // 早退必须发生在读持久化 token 之前。
+    expect(initBody).toContain('return snapshotLoggedOutAuthState();');
+
+    // 显式登录解除墓碑，否则 passive 上登出后就再也登不回来。
+    expect(authSource).toContain('passiveLocalSignOut = false;');
+  });
+
+  it('relogin marker:passive 不消费整机一份的 marker,也不删 primary 的 token', () => {
+    const start = authSource.indexOf('const reloginFlag = readReloginFlag();');
+    const end = authSource.indexOf('clearReloginFlag();', start);
+    const body = authSource.slice(start, end);
+
+    // marker 一次性且整机一份：passive 消费掉，primary 就永远看不到这次
+    // requireRelogin；顺带删掉的又正是 primary 的 token。
+    expect(body).toContain('!isPassiveSharedUserDataInstance()');
+    const guardIdx = body.indexOf('!isPassiveSharedUserDataInstance()');
+    expect(body.indexOf('removeSafe(REFRESH_TOKEN_KEY);')).toBeGreaterThan(guardIdx);
+  });
+
+  it('其余整机一份的账号派生状态:canary flag 与账号删除 receipt 都不被 passive 清掉', () => {
+    const clearBody = sliceBody('function clearAuth(', 'clearPerAccountIntegrationsInBackground');
+    // canary-flag.json 被清 → packaged primary 下次更新轮询按 stable 拉 manifest。
+    expect(clearBody).toContain('if (!isPassiveSharedUserDataInstance()) {');
+    const canaryGuardIdx = clearBody.indexOf('if (!isPassiveSharedUserDataInstance()) {');
+    expect(clearBody.indexOf('canaryFlagStore.clear();')).toBeGreaterThan(canaryGuardIdx);
+
+    // receipt 被清 → primary 的 confirmAccountDeletion() 拿 RECEIPT_MISSING。
+    const receiptBody = sliceBody('export function clearAccountDeletionReceipt(): void {', '\n}\n');
+    const receiptGuardIdx = receiptBody.indexOf('if (isPassiveSharedUserDataInstance()) {');
+    expect(receiptGuardIdx).toBeGreaterThan(-1);
+    expect(receiptBody.indexOf('removeSafe(ACCOUNT_DELETION_RECEIPT_KEY);')).toBeGreaterThan(
+      receiptGuardIdx,
+    );
+  });
 });
