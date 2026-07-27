@@ -120,7 +120,11 @@ export async function fetchProviderModels(
       || (!!spec.modelsUrl?.trim() && !isLoopbackProviderUrl(spec.modelsUrl.trim()))
     )
   ) {
-    throw new TypeError('no-auth provider model discovery requires loopback URLs');
+    return {
+      ok: false,
+      code: 'UNKNOWN',
+      detail: 'no-auth provider model discovery requires loopback URLs',
+    };
   }
   const { url, init } = buildModelsFetchRequest(spec);
   let res: Response;

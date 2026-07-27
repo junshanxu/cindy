@@ -4,7 +4,7 @@
  * （模式同 providerDiagnostics.test.ts）。
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
 import {
   buildModelsFetchRequest,
@@ -101,6 +101,34 @@ describe('buildModelsFetchRequest', () => {
 });
 
 describe('fetchProviderModels', () => {
+  it.each([
+    {
+      baseUrl: 'https://remote.example/v1',
+      modelsUrl: null,
+    },
+    {
+      baseUrl: 'http://127.0.0.1:4000/v1',
+      modelsUrl: 'https://remote.example/v1/models',
+    },
+  ])('returns a structured failure for non-loopback no-auth discovery: %j', async (urls) => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const result = await fetchProviderModels(
+      spec({
+        ...urls,
+        authMethod: 'none',
+        apiKey: null,
+      }),
+      fetchImpl,
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      code: 'UNKNOWN',
+      detail: 'no-auth provider model discovery requires loopback URLs',
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('parses OpenAI {data:[{id}]} shape, preferring display_name/name for labels', async () => {
     const r = await fetchProviderModels(spec(), async () =>
       fakeResponse(
