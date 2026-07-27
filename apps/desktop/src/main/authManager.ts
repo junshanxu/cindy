@@ -367,6 +367,23 @@ function removeSafe(key: string): void {
   }
 }
 
+/**
+ * 只在磁盘内容仍等于 `expected` 时删除(compare-and-delete)。
+ *
+ * 共享 userData 下,「判定这枚 token 已失效」与「执行删除」之间存在窗口:另一个
+ * 实例可能刚好在这中间写入了有效的替换 token。无条件删就会把别人刚写的有效凭证
+ * 删掉——正是本 PR 要防的失败模式。冷启动路径尤其危险:它带 transient 重试与
+ * replacement recheck,从判定到删除可能隔了数秒。
+ *
+ * 读不出来(加密不可用 / IO 抖动 / 解密失败)时一律不删:宁可留一枚已失效的
+ * token(下次 refresh 自然会再判一次),也不能误删有效凭证。
+ */
+function removeSafeIfUnchanged(key: string, expected: string): boolean {
+  if (readSafe(key) !== expected) return false;
+  removeSafe(key);
+  return true;
+}
+
 // ── PKCE (Node.js native crypto) ────────────────────────────────────────────
 
 function generatePKCE(): { codeVerifier: string; codeChallenge: string } {
@@ -1461,16 +1478,19 @@ export async function getAccountDeletionStatus(): Promise<AccountDeletionStatus 
   return createAuthClient().getAccountDeletionStatus(receiptToken);
 }
 
+/**
+ * 显式清除账号删除 receipt。
+ *
+ * 注意这不只是 logout 的内部步骤:它经 `auth:account-deletion:clear-receipt`
+ * (bootstrap-electron.ts)暴露给 renderer,用户在登录页处理无效/已取消的挑战、
+ * 或 dismiss 已完成的删除状态时会直接调到。这类显式清理在 passive 实例上必须
+ * 照常生效 —— 否则 receipt 永远留在盘上,`snapshotAuthState()` 每次启动又把它
+ * 报出来,dismiss 不掉。
+ *
+ * 需要保护的只有「passive 登出顺带清掉 primary 的 receipt」那条隐式路径,闸门
+ * 因此加在 logout() 的调用点上,不在这里。
+ */
 export function clearAccountDeletionReceipt(): void {
-  // 唯一调用方是 logout()。receipt 同样是整机一份:primary 发起账号删除挑战后,
-  // passive 一次本地登出就会删掉它,primary 随后 confirmAccountDeletion() 直接
-  // ACCOUNT_DELETION_RECEIPT_MISSING。passive 不碰。
-  // (账号删除确认成功后的清理走另外两处 removeSafe(ACCOUNT_DELETION_RECEIPT_KEY),
-  //  那是账号级终态,不受本闸门约束。)
-  if (isPassiveSharedUserDataInstance()) {
-    log.info('passive shared-userData instance keeps the account-deletion receipt');
-    return;
-  }
   removeSafe(ACCOUNT_DELETION_RECEIPT_KEY);
 }
 
@@ -1724,11 +1744,25 @@ async function runColdStartRefreshFlow(storedToken: string): Promise<AuthState> 
       // 与运行时 refresh() 的清除条件保持一致(共用 authRefreshFailure)。
       const action: RefreshFailureAction = failureAction ?? { kind: 'transient-failure' };
       if (action.kind === 'definitive-failure') {
-        log.warn(
-          'cold-start refresh: definitive credential failure — clearing persisted refresh token',
-        );
         lastAcceptedRefreshToken = null;
-        removeSafe(REFRESH_TOKEN_KEY);
+        if (isPassiveSharedUserDataInstance()) {
+          // passive 只对本进程判定失效:磁盘 token 是整机共用的,而 passive 冷启动拿到
+          // INVALID_REFRESH_TOKEN 最常见的原因恰恰是 primary 刚轮换过它。删掉就是把
+          // primary 踢下线。
+          log.warn(
+            'cold-start refresh: definitive credential failure — passive shared-userData instance starts logged out and keeps the persisted refresh token',
+          );
+        } else if (removeSafeIfUnchanged(REFRESH_TOKEN_KEY, storedToken)) {
+          log.warn(
+            'cold-start refresh: definitive credential failure — clearing persisted refresh token',
+          );
+        } else {
+          // 判定失败后磁盘 token 已被换掉(另一个实例写入了替换凭证):那枚不在本次
+          // 判定范围内,不能删。
+          log.warn(
+            'cold-start refresh: definitive credential failure, but the persisted refresh token changed meanwhile — keeping the replacement',
+          );
+        }
       } else if (action.kind === 'replacement-retry') {
         log.warn(
           `cold-start refresh failed for a stale token after ${attempts} attempt(s) — keeping latest refresh token, starting logged out`,
@@ -2447,7 +2481,16 @@ export async function logout(): Promise<void> {
   }
   // Ordinary logout abandons an unconfirmed challenge. Confirmed deletion uses
   // clearLocalSessionAfterAccountDeletion() and intentionally preserves receipt.
-  clearAccountDeletionReceipt();
+  //
+  // receipt 也是整机一份:primary 发起账号删除挑战后,passive 一次本地登出就会删掉
+  // 它,primary 随后 confirmAccountDeletion() 直接 ACCOUNT_DELETION_RECEIPT_MISSING。
+  // 闸门只加在这条隐式路径上——renderer 主动调的显式清理仍照常生效(见
+  // clearAccountDeletionReceipt 的注释)。
+  if (isPassiveSharedUserDataInstance()) {
+    log.info('passive shared-userData instance keeps the account-deletion receipt on logout');
+  } else {
+    clearAccountDeletionReceipt();
+  }
   clearAuth();
 
   // passive 共享实例跳过服务端登出:refresh token 按 (user, device) 一对一存,而它与

@@ -148,11 +148,38 @@ describe('passive shared-userData instance auth isolation', () => {
     expect(clearBody.indexOf('canaryFlagStore.clear();')).toBeGreaterThan(canaryGuardIdx);
 
     // receipt 被清 → primary 的 confirmAccountDeletion() 拿 RECEIPT_MISSING。
-    const receiptBody = sliceBody('export function clearAccountDeletionReceipt(): void {', '\n}\n');
-    const receiptGuardIdx = receiptBody.indexOf('if (isPassiveSharedUserDataInstance()) {');
+    // 闸门必须加在 logout 这条隐式路径上，而不是函数体里。
+    const logoutBody = sliceBody('export async function logout(): Promise<void> {', '\n}\n');
+    const receiptGuardIdx = logoutBody.indexOf('if (isPassiveSharedUserDataInstance()) {');
     expect(receiptGuardIdx).toBeGreaterThan(-1);
-    expect(receiptBody.indexOf('removeSafe(ACCOUNT_DELETION_RECEIPT_KEY);')).toBeGreaterThan(
-      receiptGuardIdx,
+    expect(logoutBody.indexOf('clearAccountDeletionReceipt();')).toBeGreaterThan(receiptGuardIdx);
+  });
+
+  it('receipt 的显式清理不被闸门波及:renderer 主动 dismiss 在 passive 上必须照常生效', () => {
+    // clearAccountDeletionReceipt() 经 auth:account-deletion:clear-receipt 暴露给
+    // renderer（登录页处理无效/已取消挑战、dismiss 已完成状态）。把整个函数禁掉会让
+    // receipt 永远留在盘上，snapshotAuthState() 每次启动又报出来，dismiss 不掉。
+    const body = sliceBody('export function clearAccountDeletionReceipt(): void {', '\n}\n');
+    expect(body).not.toContain('isPassiveSharedUserDataInstance');
+    expect(body).toContain('removeSafe(ACCOUNT_DELETION_RECEIPT_KEY);');
+  });
+
+  it('冷启动确定性失效:passive 不删盘,非 passive 也只做 compare-and-delete', () => {
+    const start = authSource.indexOf("if (action.kind === 'definitive-failure') {");
+    const end = authSource.indexOf("} else if (action.kind === 'replacement-retry') {", start);
+    const body = authSource.slice(start, end);
+
+    // passive 冷启动拿到 INVALID_REFRESH_TOKEN，最常见的原因就是 primary 刚轮换过它。
+    expect(body).toContain('if (isPassiveSharedUserDataInstance()) {');
+    // 非 passive 也不能无条件删：判定与删除之间另一个实例可能写入了替换凭证。
+    expect(body).toContain('removeSafeIfUnchanged(REFRESH_TOKEN_KEY, storedToken)');
+    expect(body).not.toContain('removeSafe(REFRESH_TOKEN_KEY);');
+
+    // compare-and-delete 读不出磁盘内容时不得删（宁留失效 token 也不误删有效凭证）。
+    const helper = sliceBody(
+      'function removeSafeIfUnchanged(key: string, expected: string): boolean {',
+      '\n}\n',
     );
+    expect(helper).toContain('if (readSafe(key) !== expected) return false;');
   });
 });
