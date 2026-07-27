@@ -268,6 +268,34 @@ function createAuthClient(): CindyAuthClient {
   });
 }
 
+// ── passive 共享实例闸门 ────────────────────────────────────────────────────
+
+/**
+ * 共享 userData 的 passive dev 实例(`--preserve-running` / `--passive` 非 isolated)。
+ *
+ * 这类实例复用 primary 的登录态,但对共享状态保持只读——与 owner-namespace 迁移
+ * (ownerNamespaceMigration.ts)、localDb schema(localDb/index.ts)同一条契约。auth
+ * 侧的共享物有三个,passive 一个都不能改:
+ *   1. 磁盘 refresh token 文件(整机一份,删了 primary 下次续期就被踢);
+ *   2. 服务端 refresh token(按 (user, device) 一对一存,passive 与 primary 共用
+ *      同一 deviceId,调登出会把 primary 的那份一起作废);
+ *   3. 由前者派生的续期节奏(定时 refresh 会轮换共享 token,让 primary 反复走
+ *      replacement-retry)。
+ *
+ * 2026-07-27 事故:两个 MIGRATE_FAILED 的 passive 实例在 LocalDbGate fatal 界面点
+ * 「返回登录」,logout 删掉整机 refresh token,正在使用的 primary 在下一个 refresh
+ * 周期(隔了 19 / 46 分钟)被判定 credential-lost 强制重登。同源事故 2026-07-23 已
+ * 发生过一次,当时只把静默半死改成明确弹重登(见 authSessionExpiredDetection.test.ts),
+ * 没有堵住 passive 的写入权。
+ *
+ * packaged 恒不设置该 env(index.ts 启动时对 packaged / isolated 显式 delete 兜底,
+ * 防 ambient env 污染),线上零影响;`--isolated` 沙箱有独立 userData 与 deviceId,
+ * 本来就不共享,不受此闸门约束。
+ */
+function isPassiveSharedUserDataInstance(): boolean {
+  return !app.isPackaged && process.env.XDT_PASSIVE_SHARED_USER_DATA === '1';
+}
+
 // ── safeStorage helpers ─────────────────────────────────────────────────────
 
 const SAFE_STORAGE_DIR = () => path.join(app.getPath('userData'), 'safe-storage');
@@ -680,6 +708,14 @@ function scheduleRefresh(token: string): void {
     clearTimeout(refreshTimer);
     refreshTimer = null;
   }
+  if (isPassiveSharedUserDataInstance()) {
+    // passive 共享实例不主动续期:定时 refresh 会轮换整机共用的 refresh token,让
+    // primary 每轮都走 replacement-retry(2026-07-27 两边日志每 55 分钟互刷一次
+    // 「refresh token changed on disk」就是这么来的)。冷启动那一次 refresh 仍保留
+    // ——passive 需要它换取 access token;之后的续期节奏交给 primary。
+    log.info('passive shared-userData instance skips scheduled refresh (primary owns renewal)');
+    return;
+  }
   try {
     const payload = JSON.parse(
       Buffer.from(token.split('.')[1], 'base64').toString('utf-8'),
@@ -796,6 +832,13 @@ let coldStartAuthInFlight: Promise<AuthState> | null = null;
 function scheduleRefreshRetryAfterTransientFailure(): void {
   if (refreshTimer !== null) {
     clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
+  if (isPassiveSharedUserDataInstance()) {
+    // 同 scheduleRefresh:passive 不接管续期,瞬时失败也不排重试,免得把整机共用的
+    // refresh token 又轮换一次。
+    log.info('passive shared-userData instance skips refresh retry (primary owns renewal)');
+    return;
   }
   refreshTimer = setTimeout(() => void refresh(), RUNTIME_REFRESH_RETRY_MS);
 }
@@ -1085,9 +1128,17 @@ function clearAuth(
     refreshTimer = null;
   }
   if (!opts.preservePersistedRefreshToken) {
-    removeSafe(REFRESH_TOKEN_KEY);
-    removeSafe(LEGACY_ACCOUNT_REFRESH_TOKEN_KEY);
-    removeSafe(LEGACY_REFRESH_TOKEN_KEY);
+    if (isPassiveSharedUserDataInstance()) {
+      // passive 共享实例无权删整机凭证:它的登出只清本进程内存态,磁盘 token 留给
+      // primary(见 isPassiveSharedUserDataInstance 的事故记录)。
+      log.info(
+        'passive shared-userData instance keeps the persisted refresh token (local sign-out only)',
+      );
+    } else {
+      removeSafe(REFRESH_TOKEN_KEY);
+      removeSafe(LEGACY_ACCOUNT_REFRESH_TOKEN_KEY);
+      removeSafe(LEGACY_REFRESH_TOKEN_KEY);
+    }
   }
   // 未登录时固定使用 stable；同步中的旧请求会被 authStateEpoch 守卫丢弃。
   canaryFlagStore.clear();
@@ -2355,7 +2406,10 @@ export async function logout(): Promise<void> {
   clearAccountDeletionReceipt();
   clearAuth();
 
-  if (currentAccessToken) {
+  // passive 共享实例跳过服务端登出:refresh token 按 (user, device) 一对一存,而它与
+  // primary 共用同一 deviceId——调这一发会把 primary 的那份一起作废,即使本地文件留着,
+  // primary 下次续期照样拿到确定性失败被踢。
+  if (currentAccessToken && !isPassiveSharedUserDataInstance()) {
     apiFetch('/api/auth/logout', {
       method: 'POST',
       body: { deviceId },

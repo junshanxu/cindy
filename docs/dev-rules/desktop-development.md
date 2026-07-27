@@ -43,6 +43,13 @@ Desktop 连接的是你自己的 Cindy 云端账号（remote）。这与登录�
   （dev 与 packaged 实例都登记——dev 与正式版共库双开受支持），发现其它存活实例
   共享同一 userData 时同样推迟——搬家式迁移必须独占 userData 才能执行，否则会打断
   还在运行的旧版本实例（2026-07-23 slack-hook.json／网关凭证被搬走事故）。
+  **auth 凭证同属这条只读契约**：passive 共享实例不删磁盘 refresh token、不调服务端
+  登出、不排定时续期，它的「退出登录」只清本进程内存态，磁盘与服务端凭证留给
+  primary（`authManager.ts` 的 `isPassiveSharedUserDataInstance`）。冷启动那一次
+  refresh 仍会发生——passive 需要它换取 access token，primary 侧由 replacement-retry
+  消化。代价是同机两个实例的登录态可能不一致，这是有意的：passive 无权代表整机登出
+  （2026-07-27 事故：MIGRATE_FAILED 的 passive 实例在 fatal 界面点「返回登录」，删掉
+  整机 refresh token，primary 在 19／46 分钟后的续期周期被强制重登）。
 - `--preserve-running`：并行 dev，不停止任何已有 Cindy dev 进程，每个新实例强制 passive
   并共享当前 userData／登录态；仅供能证明实例归属的上层编排，或用户明确「不要关当前
   实例／不要重新登录」时用。仅支持 remote，禁止与 `--isolated` 组合。

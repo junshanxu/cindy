@@ -1,0 +1,101 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { describe, expect, it } from 'vitest';
+
+/**
+ * 共享 userData 的 passive dev 实例对 auth 凭证保持只读的回归守卫(authManager 依赖
+ * Electron,node 测试环境无法直接 import,沿用 authSessionExpiredDetection.test.ts 的
+ * 源码守卫模式)。
+ *
+ * 守护的契约:passive 共享实例可以**用**登录态,但不能**改**它。三个共享物——磁盘
+ * refresh token 文件、服务端按 (user, device) 一对一存的 refresh token、由前者派生的
+ * 续期节奏——一个都不能动。
+ *
+ * 2026-07-27 事故:两个 MIGRATE_FAILED 的 passive 实例(05:30 与 07:51)在 LocalDbGate
+ * fatal 界面点「返回登录」,logout 删掉整机 refresh token;正在使用的 primary 分别在
+ * 19 / 46 分钟后的 refresh 周期被判 credential-lost 强制重登,当场还中断了在跑的
+ * scheduler run、IM 连接与 device-link 持有权。同源事故 2026-07-23 已发生过一次,当时
+ * 只把静默半死改成明确弹重登(正确的报警),没有堵住 passive 的写入权。
+ */
+describe('passive shared-userData instance auth isolation', () => {
+  const authSource = readFileSync(resolve(process.cwd(), 'src/main/authManager.ts'), 'utf8').replace(
+    /\r\n/g,
+    '\n',
+  );
+
+  const sliceBody = (startAnchor: string, endAnchor: string): string => {
+    const start = authSource.indexOf(startAnchor);
+    expect(start, `anchor not found: ${startAnchor}`).toBeGreaterThan(-1);
+    const end = authSource.indexOf(endAnchor, start);
+    expect(end, `end anchor not found: ${endAnchor}`).toBeGreaterThan(start);
+    return authSource.slice(start, end);
+  };
+
+  it('判定复用启动期已落地的 XDT_PASSIVE_SHARED_USER_DATA,且 packaged 无条件排除', () => {
+    const body = sliceBody('function isPassiveSharedUserDataInstance(): boolean {', '\n}\n');
+
+    // packaged 恒不设置该 env,但仍保留 isPackaged 双保险,防 ambient env 污染线上语义。
+    expect(body).toContain('!app.isPackaged');
+    expect(body).toContain("process.env.XDT_PASSIVE_SHARED_USER_DATA === '1'");
+    // 不新增判定通道:isolated 沙箱有独立 userData 与 deviceId,不该出现在这条判定里。
+    expect(body).not.toContain('XDT_ISOLATED');
+  });
+
+  it('clearAuth:passive 共享实例不删磁盘 refresh token', () => {
+    const body = sliceBody('function clearAuth(', 'commitActiveAppSession');
+
+    const guardIdx = body.indexOf('if (!opts.preservePersistedRefreshToken) {');
+    const passiveIdx = body.indexOf('if (isPassiveSharedUserDataInstance()) {');
+    expect(guardIdx).toBeGreaterThan(-1);
+    // passive 判定必须落在 opts 守卫之内、三个 removeSafe 之前——即显式 preserve 与
+    // passive 身份是两道独立的闸,任一命中都不得删盘。
+    expect(passiveIdx).toBeGreaterThan(guardIdx);
+    expect(body.indexOf('removeSafe(REFRESH_TOKEN_KEY);')).toBeGreaterThan(passiveIdx);
+    expect(body.indexOf('removeSafe(LEGACY_ACCOUNT_REFRESH_TOKEN_KEY);')).toBeGreaterThan(passiveIdx);
+    expect(body.indexOf('removeSafe(LEGACY_REFRESH_TOKEN_KEY);')).toBeGreaterThan(passiveIdx);
+  });
+
+  it('logout:passive 共享实例不调服务端登出(会连坐作废 primary 的 device token)', () => {
+    const body = sliceBody('export async function logout(): Promise<void> {', '\n}\n');
+
+    // refresh token 服务端按 (user, device) 一对一存,passive 与 primary 共用 deviceId:
+    // 只留本地文件不够,这一发也必须拦,否则 primary 下次续期拿确定性失败被踢。
+    expect(body).toContain('!isPassiveSharedUserDataInstance()');
+    const guardIdx = body.indexOf('!isPassiveSharedUserDataInstance()');
+    expect(body.indexOf("apiFetch('/api/auth/logout'")).toBeGreaterThan(guardIdx);
+  });
+
+  it('续期节奏:passive 共享实例既不排定时 refresh,也不排瞬时失败重试', () => {
+    const scheduleBody = sliceBody('function scheduleRefresh(token: string): void {', '\n}\n');
+    const passiveIdx = scheduleBody.indexOf('if (isPassiveSharedUserDataInstance()) {');
+    expect(passiveIdx).toBeGreaterThan(-1);
+    // 早退必须发生在排 timer 之前。
+    expect(scheduleBody.indexOf('setTimeout(')).toBeGreaterThan(passiveIdx);
+    expect(scheduleBody.slice(passiveIdx)).toContain('return;');
+
+    const retryBody = sliceBody(
+      'function scheduleRefreshRetryAfterTransientFailure(): void {',
+      '\n}\n',
+    );
+    const retryPassiveIdx = retryBody.indexOf('if (isPassiveSharedUserDataInstance()) {');
+    expect(retryPassiveIdx).toBeGreaterThan(-1);
+    expect(retryBody.indexOf('refreshTimer = setTimeout(')).toBeGreaterThan(retryPassiveIdx);
+    // 早退前必须把已清掉的 timer 置 null,不留悬空引用。
+    expect(retryBody.slice(0, retryPassiveIdx)).toContain('refreshTimer = null;');
+  });
+
+  it('refresh 本身不被 passive 拦:冷启动仍能换 access token,凭证缺席仍走过期出口', () => {
+    const body = sliceBody(
+      'export async function refresh(): Promise<boolean> {',
+      'const diskTokenChangedBeforeRefresh',
+    );
+
+    // passive 需要冷启动那一次 refresh 才有可用会话;拦掉 refresh() 本身会让它拿不到
+    // access token。闸门只加在「排 timer」和「删凭证」上,不加在 refresh 入口。
+    expect(body).not.toContain('isPassiveSharedUserDataInstance');
+    // 且 passive 被 primary 换掉 token 时仍明确过期(只影响本进程、不删盘),
+    // 不得退回 2026-07-23 那种静默半死。
+    expect(body).toContain("await expireRuntimeAuth(previousUserId, 'credential-lost', {");
+    expect(body).toContain('preservePersistedRefreshToken: true');
+  });
+});
