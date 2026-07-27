@@ -130,14 +130,16 @@ describe('passive shared-userData instance auth isolation', () => {
 
   it('relogin marker:passive 不消费整机一份的 marker,也不删 primary 的 token', () => {
     const start = authSource.indexOf('const reloginFlag = readReloginFlag();');
-    const end = authSource.indexOf('clearReloginFlag();', start);
+    const end = authSource.indexOf('// Old Feishu-auth refresh tokens', start);
     const body = authSource.slice(start, end);
 
     // marker 一次性且整机一份：passive 消费掉，primary 就永远看不到这次
-    // requireRelogin；顺带删掉的又正是 primary 的 token。
-    expect(body).toContain('!isPassiveSharedUserDataInstance()');
-    const guardIdx = body.indexOf('!isPassiveSharedUserDataInstance()');
-    expect(body.indexOf('removeSafe(REFRESH_TOKEN_KEY);')).toBeGreaterThan(guardIdx);
+    // requireRelogin；顺带删掉的又正是 primary 的 token。清理与消费必须整体落在
+    // 非 passive 分支里。
+    const passiveIdx = body.indexOf('if (isPassiveSharedUserDataInstance()) {');
+    expect(passiveIdx).toBeGreaterThan(-1);
+    expect(body.indexOf('removeSafe(REFRESH_TOKEN_KEY);')).toBeGreaterThan(passiveIdx);
+    expect(body.indexOf('clearReloginFlag();')).toBeGreaterThan(passiveIdx);
   });
 
   it('其余整机一份的账号派生状态:canary flag 与账号删除 receipt 都不被 passive 清掉', () => {
@@ -175,11 +177,35 @@ describe('passive shared-userData instance auth isolation', () => {
     expect(body).toContain('removeSafeIfUnchanged(REFRESH_TOKEN_KEY, storedToken)');
     expect(body).not.toContain('removeSafe(REFRESH_TOKEN_KEY);');
 
-    // compare-and-delete 读不出磁盘内容时不得删（宁留失效 token 也不误删有效凭证）。
+    // compare-and-delete 读不出磁盘内容时不得删（宁留失效 token 也不误删有效凭证），
+    // 并且要在内容比对前后各校验一次文件身份，收紧 read→unlink 之间的 TOCTOU。
     const helper = sliceBody(
       'function removeSafeIfUnchanged(key: string, expected: string): boolean {',
       '\n}\n',
     );
     expect(helper).toContain('if (readSafe(key) !== expected) return false;');
+    expect(helper).toContain('const before = identity();');
+    expect(helper).toContain('if (before === null) return false;');
+    expect(helper).toContain('if (identity() !== before) return false;');
+    expect(helper.indexOf('if (identity() !== before) return false;')).toBeLessThan(
+      helper.indexOf('removeSafe(key);'),
+    );
+  });
+
+  it('relogin marker:passive 不消费 marker,但同样保持登出(不得拿旧 token 登进去)', () => {
+    const start = authSource.indexOf('const reloginFlag = readReloginFlag();');
+    const end = authSource.indexOf('// Old Feishu-auth refresh tokens', start);
+    const body = authSource.slice(start, end);
+
+    // marker 命中 = 这个版本要求重新登录。passive 跑的是同一个版本，不消费 marker
+    // 不等于可以拿旧 token 冷启动登进去——那正是 marker 想避免的。
+    const passiveIdx = body.indexOf('if (isPassiveSharedUserDataInstance()) {');
+    expect(passiveIdx).toBeGreaterThan(-1);
+    const passiveBranch = body.slice(passiveIdx, body.indexOf('lastAcceptedRefreshToken = null;'));
+    expect(passiveBranch).toContain('passiveLocalSignOut = true;');
+    expect(passiveBranch).toContain('return snapshotLoggedOutAuthState();');
+    // 但这条分支里不得出现任何删除或 marker 消费。
+    expect(passiveBranch).not.toContain('removeSafe(');
+    expect(passiveBranch).not.toContain('clearReloginFlag();');
   });
 });

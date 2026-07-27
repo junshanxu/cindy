@@ -377,9 +377,31 @@ function removeSafe(key: string): void {
  *
  * 读不出来(加密不可用 / IO 抖动 / 解密失败)时一律不删:宁可留一枚已失效的
  * token(下次 refresh 自然会再判一次),也不能误删有效凭证。
+ *
+ * 内容比对之外再校验一次文件身份(inode / mtime / size),把「读到的是旧值、删掉的
+ * 却是刚写入的新文件」这段 TOCTOU 收紧到两次 stat 之间。
+ *
+ * **这不是真正原子的 compare-and-delete**:POSIX 没有按路径的 CAS unlink,而本模块
+ * 的写入侧(writeSafe 直接 writeFileSync 覆盖)同样不原子。要彻底消除竞态,得把整个
+ * safeStorage 层改成「临时文件 + rename 写入 + 跨进程锁」,那是独立重构,不在本次
+ * 范围内。当前收益是把窗口从数秒级压到一次 syscall,且真正高频的那条路径
+ * (passive)已经完全不删。
  */
 function removeSafeIfUnchanged(key: string, expected: string): boolean {
+  const filepath = path.join(SAFE_STORAGE_DIR(), `${key}.enc`);
+  const identity = (): string | null => {
+    try {
+      const s = fs.statSync(filepath);
+      return `${s.ino}:${s.mtimeMs}:${s.size}`;
+    } catch {
+      return null;
+    }
+  };
+  const before = identity();
+  if (before === null) return false;
   if (readSafe(key) !== expected) return false;
+  // 读内容期间文件被换掉(另一个实例写入了替换凭证)→ 那枚不在本次判定范围内。
+  if (identity() !== before) return false;
   removeSafe(key);
   return true;
 }
@@ -1635,13 +1657,23 @@ export async function initialize(options: AuthInitializeOptions = {}): Promise<A
   //
   // marker 是一次性的、整机一份:passive 若消费它,primary 就再也看不到这次
   // requireRelogin 更新的标记,而 passive 顺带删掉的又正是 primary 的 token ——
-  // 本 PR 要防的失败被原样重现。passive 一律不碰 marker,交给 primary 处理。
+  // 本 PR 要防的失败被原样重现。
+  //
+  // 但「不消费」不等于「可以无视」:marker 命中说明这个版本要求重新登录,passive
+  // 跑的是同一个版本,拿旧 token 冷启动登录正是 marker 想避免的事。所以 passive
+  // 照样保持登出(复用 passiveLocalSignOut 墓碑,避免副窗 initialize() 又绕回来),
+  // 只是不动磁盘 token、不消费 marker —— 那两件事留给 primary。
   const reloginFlag = readReloginFlag();
-  if (
-    reloginFlag &&
-    reloginFlag.version === app.getVersion() &&
-    !isPassiveSharedUserDataInstance()
-  ) {
+  if (reloginFlag && reloginFlag.version === app.getVersion()) {
+    if (isPassiveSharedUserDataInstance()) {
+      log.info(
+        'relogin marker hit for v%s — passive shared-userData instance stays signed out, leaving the marker and token to the primary',
+        reloginFlag.version,
+      );
+      passiveLocalSignOut = true;
+      commitActiveAppSession('signed-out');
+      return snapshotLoggedOutAuthState();
+    }
     log.info(
       'relogin marker hit for v%s — clearing persisted auth',
       reloginFlag.version,
