@@ -5310,7 +5310,6 @@ export function registerGhostIpc(): void {
             error: error instanceof Error ? error.message : String(error),
           });
           throwIpcError('INTERNAL', 'Unable to verify the installed Plugin source');
-        }
         // 用户已在本地包确认流程中明确选择了这份真实包：同 id 可以原位替换，
         // 市场来源不是永久所有权。替换前先切断旧市场更新路由；落位失败再恢复，
         // 全程不清理 Secret、KV、偏好或其它按 ghostId 保存的用户状态。
@@ -5351,7 +5350,9 @@ export function registerGhostIpc(): void {
           }
         }
         runtime.stop(inspected.manifest.id);
-        getGhostNodeRuntimeBroker().stop(inspected.manifest.id);
+        // Windows 上 stop() 只是发出终止信号；等旧 utilityProcess 实际退出，
+        // 否则它还会占用插件目录，接下来的原子 rename 可能报 EPERM。
+        await getGhostNodeRuntimeBroker().stopAndWait(inspected.manifest.id);
         getGhostAgentSlot().clearGhost(inspected.manifest.id);
         getGhostErrandSlot().clearGhost(inspected.manifest.id);
         let result: Awaited<ReturnType<typeof manager.update>>;
