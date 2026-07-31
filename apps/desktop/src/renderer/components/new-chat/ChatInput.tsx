@@ -1481,6 +1481,13 @@ export function ChatInput({
 
   const folderOpen = folderPickerOpen ?? internalFolderOpen;
   const setFolderOpen = onFolderPickerOpenChange ?? setInternalFolderOpen;
+  // `dispatchSend` 在取发送快照后可能等待 effort runtime 同步。此窗口内继续编辑会让
+  // 成功发送后的清理误删尚未发送的文字或附件，因此 composer 必须作为一个整体短暂只读。
+  // 正常路径没有等待；只有设置同步中的会话最多锁 5 秒（见 dispatchSend 的 preflight）。
+  const [sendDispatchInFlight, setSendDispatchInFlight] = useState(false);
+  const composerEditorLocked = disabled || sendDispatchInFlight;
+  const composerMutationLockedRef = useRef(composerEditorLocked);
+  composerMutationLockedRef.current = composerEditorLocked;
 
   useEffect(() => {
     setWorkingDir(initialWorkingDir ?? null);
@@ -1527,7 +1534,7 @@ export function ChatInput({
     // autofocus would otherwise overwrite routed Plugin/Create end-focus.
     // doc 模式下必须关掉,理由见上方 disableAutofocus prop 注释。
     autofocus: !disableAutofocus && !disabled ? 'end' : false,
-    editable: !disabled,
+    editable: !composerEditorLocked,
     extensions: [
       Document,
       Paragraph,
@@ -1624,6 +1631,7 @@ export function ChatInput({
         return false;
       },
       handlePaste(view, event) {
+        if (composerMutationLockedRef.current) return true;
         // Intercept clipboard file/folder/image. Three sources to handle,
         // matching the onDrop logic below:
         //   1. Folder copied from OS file manager  → addFolderPath (@dir chip)
@@ -2200,10 +2208,6 @@ export function ChatInput({
     [editor],
   );
 
-  useEffect(() => {
-    editor?.setEditable(!disabled);
-  }, [disabled, editor]);
-
   // Hold a live ref to the editor for handlers that mount before Tiptap
   // exposes it through React (e.g. the blur handler above).
   const editorRef = useRef<Editor | null>(null);
@@ -2360,6 +2364,11 @@ export function ChatInput({
   );
 
   const voiceInput = useVoiceInput(editor, disabled, messages, voiceInputOptions);
+  const composerMutationLocked = composerEditorLocked || voiceInput.isBusy;
+  composerMutationLockedRef.current = composerMutationLocked;
+  useEffect(() => {
+    editor?.setEditable(!composerMutationLocked);
+  }, [composerMutationLocked, editor]);
   const { settings: voiceInputSettings } = useVoiceInputSettings();
   const voiceInputShortcutLabel = useMemo(
     () => formatVoiceInputShortcut(voiceInputSettings.shortcut),
@@ -2409,7 +2418,7 @@ export function ChatInput({
   const voiceInputCanStopAndSendRef = useRef(false);
   const composerCanSubmitRef = useRef(false);
   const handleVoiceInputStartRef = useRef(handleVoiceInputStart);
-  const disabledRef = useRef(disabled);
+  const disabledRef = useRef(composerMutationLocked);
   const disableAutofocusRef = useRef(disableAutofocus);
   const focusOnStorageKeyChangeRef = useRef(focusOnStorageKeyChange);
   const latestStorageKeyRef = useRef<string | undefined>(storageKey);
@@ -2437,11 +2446,11 @@ export function ChatInput({
     voiceInputStopRef.current = handleVoiceInputStopWithRefinement;
     voiceInputCancelRef.current = voiceInput.cancel;
     handleVoiceInputStartRef.current = handleVoiceInputStart;
-    disabledRef.current = disabled;
+    disabledRef.current = composerMutationLocked;
     disableAutofocusRef.current = disableAutofocus;
     focusOnStorageKeyChangeRef.current = focusOnStorageKeyChange;
   }, [
-    disabled,
+    composerMutationLocked,
     disableAutofocus,
     focusOnStorageKeyChange,
     handleVoiceInputStart,
@@ -2737,19 +2746,6 @@ export function ChatInput({
         .finally(releaseInFlight);
     });
   }, []);
-
-  useEffect(() => {
-    if (!editor) return;
-    const nextEditable = !voiceInput.isBusy;
-    if (editor.isEditable !== nextEditable) {
-      editor.setEditable(nextEditable, false);
-    }
-    return () => {
-      if (!editor.isDestroyed && !editor.isEditable) {
-        editor.setEditable(true, false);
-      }
-    };
-  }, [editor, voiceInput.isBusy]);
 
   // While dictation holds the editor read-only the native caret disappears;
   // the decoration renders a mic-shaped caret at the insertion point instead
@@ -3539,11 +3535,6 @@ export function ChatInput({
 
   // ── Send / Stop wiring ─────────────────────────────────────────────
   const dispatchSendInFlightRef = useRef(false);
-  // 仅在 effort 的持久化/runtime 预检期间禁用 composer。真正的 onSend 可能是一次很长的
-  // Agent 请求，不能把它当作「按钮仍在 preflight」而一直锁住输入框；同步 ref 仍负责拦住
-  // 重复派发。
-  const [effortPreflightInFlight, setEffortPreflightInFlight] = useState(false);
-  const sendDispatchInFlight = effortPreflightInFlight;
   const dispatchSendRef = useRef<(deliveryMode?: MessageDeliveryMode) => void | Promise<void>>(
     () => {},
   );
@@ -3669,7 +3660,7 @@ export function ChatInput({
             const coordinator = effortChangeCoordinatorRef.current;
             let runtimeSettled = false;
             let timeoutId: ReturnType<typeof setTimeout> | undefined;
-            setEffortPreflightInFlight(true);
+            setSendDispatchInFlight(true);
             try {
               await Promise.race([
                 coordinator.awaitRuntimeSettled(sessionId).then(() => {
@@ -3681,7 +3672,7 @@ export function ChatInput({
               ]);
             } finally {
               if (timeoutId !== undefined) clearTimeout(timeoutId);
-              setEffortPreflightInFlight(false);
+              setSendDispatchInFlight(false);
             }
 
             // 不把 timeout 写成全局 dirty：若迟到的是「持久化失败、runtime 尚未触碰」，旧实现
@@ -5218,7 +5209,7 @@ export function ChatInput({
           root gap-4,让 chip 与输入框间距接近 GoalIndicator 的节奏。 */}
       {planModeEntry && planModeEnabled && (
         <div className="-mb-2 w-full">
-          <PlanModeIndicator onExit={() => void onPlanModeChange?.(false)} disabled={disabled} />
+          <PlanModeIndicator onExit={() => void onPlanModeChange?.(false)} disabled={composerMutationLocked} />
         </div>
       )}
       {/* Voice-input error + attachment rejections (oversize / blocked /
@@ -5388,6 +5379,7 @@ export function ChatInput({
               e.stopPropagation();
               dragCounterRef.current = 0;
               setIsDragOver(false);
+              if (composerMutationLocked) return;
               onComposerDropHandled?.();
               // .cindy / .cshare 已被窗口级 capture 接管(装入 / 导入链路),
               // 这里只清理拖拽 UI 状态,不当附件消费。
@@ -5554,8 +5546,8 @@ export function ChatInput({
             {hasAttachments && (
               <ThumbnailStrip
                 attachments={attachments}
-                onRemove={removeFile}
-                onUpdate={updateFile}
+                onRemove={composerMutationLocked ? () => undefined : removeFile}
+                onUpdate={composerMutationLocked ? () => undefined : updateFile}
               />
             )}
 
@@ -5571,7 +5563,7 @@ export function ChatInput({
                 className={cn(
                   'w-[calc(100%+11px)] -mr-[11px]',
                   // Disabled gets the same visual cue as the old textarea
-                  disabled && 'cursor-not-allowed opacity-60',
+                  composerMutationLocked && 'cursor-not-allowed opacity-60',
                   voiceInput.isBusy && 'cursor-default',
                 )}
                 data-voice-draft-active={voiceInput.draftText ? 'true' : undefined}
@@ -5637,7 +5629,9 @@ export function ChatInput({
                 <ExtraDirsButton
                   extraDirs={extraDirs ?? []}
                   workingDir={workingDir}
-                  onAddFiles={localAttachmentPickerEnabled ? addFiles : undefined}
+                  onAddFiles={
+                    localAttachmentPickerEnabled && !composerMutationLocked ? addFiles : undefined
+                  }
                   planMode={planModeEntry}
                   plugins={pluginsForMenu}
                   pluginAvailableIds={pluginAvailableIds}
@@ -5659,7 +5653,7 @@ export function ChatInput({
                         }
                       : undefined
                   }
-                  disabled={disabled}
+                  disabled={composerMutationLocked}
                   dense={effectiveDenseToolbar}
                   visualVariant={isCreateAgentVariant ? 'create-agent' : 'default'}
                 />
@@ -5668,7 +5662,7 @@ export function ChatInput({
                   onPermissionModeChange={handlePermissionModeChange}
                   vendorKey={vendorKey}
                   deviceId={deviceLinkDeviceId}
-                  disabled={disabled}
+                  disabled={composerMutationLocked}
                   dense={effectiveDenseToolbar}
                   iconOnly={useUltraCompactToolbar}
                   visualVariant={isCreateAgentVariant ? 'create-agent' : 'default'}
@@ -5765,7 +5759,7 @@ export function ChatInput({
                     onProviderChange={handleProviderChange}
                     onNavigateToProviders={handleNavigateToProviders}
                     switching={remoteSwitchInFlight}
-                    disabled={disabled || agentSendDispatchInFlight || agentSwitchInFlight}
+                    disabled={composerMutationLocked}
                     visualVariant={isCreateAgentVariant ? 'create-agent' : 'default'}
                     compactToolbar={useNarrowToolbar}
                     ultraCompactToolbar={useUltraCompactToolbar}
@@ -5793,7 +5787,7 @@ export function ChatInput({
                   )}
                   <VoiceInputButton
                     state={voiceInput.state}
-                    disabled={!!disabled || !editor}
+                    disabled={composerMutationLocked || !editor}
                     shortcutLabel={voiceInputShortcutLabel}
                     onStart={handleVoiceInputStart}
                     onStop={handleVoiceInputPlainStop}
