@@ -4626,6 +4626,7 @@ final class AgentIslandController {
   private var globalMouseUpMonitor: Any?
   private var localMouseUpMonitor: Any?
   private var screenParameterObserver: NSObjectProtocol?
+  private var workspaceWakeObserver: NSObjectProtocol?
   private var activeSpaceObserver: NSObjectProtocol?
   private var activeApplicationObserver: NSObjectProtocol?
   private var screenMetricsTimer: Timer?
@@ -4848,6 +4849,16 @@ final class AgentIslandController {
     ) { [weak self] _ in
       self?.scheduleScreenMetricsPublish()
     }
+    workspaceWakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+      forName: NSWorkspace.didWakeNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      // Sleep can restore the same display set without emitting the screen-parameter
+      // notification. Refreshing here makes the main process recompute every island
+      // frame against the post-wake display coordinates instead of stale ones.
+      self?.scheduleScreenMetricsPublish()
+    }
     activeSpaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
       forName: NSWorkspace.activeSpaceDidChangeNotification,
       object: nil,
@@ -4886,6 +4897,9 @@ final class AgentIslandController {
     if let screenParameterObserver {
       NotificationCenter.default.removeObserver(screenParameterObserver)
     }
+    if let workspaceWakeObserver {
+      NSWorkspace.shared.notificationCenter.removeObserver(workspaceWakeObserver)
+    }
     if let activeSpaceObserver {
       NSWorkspace.shared.notificationCenter.removeObserver(activeSpaceObserver)
     }
@@ -4893,6 +4907,7 @@ final class AgentIslandController {
       NSWorkspace.shared.notificationCenter.removeObserver(activeApplicationObserver)
     }
     screenParameterObserver = nil
+    workspaceWakeObserver = nil
     activeSpaceObserver = nil
     activeApplicationObserver = nil
     screenMetricsTimer?.invalidate()

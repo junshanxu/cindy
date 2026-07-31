@@ -97,6 +97,20 @@ describe('MacAgentIslandNativeHost', () => {
     expect(source).not.toContain('makeKey()');
   });
 
+  it('refreshes native display metrics after macOS wakes from sleep', () => {
+    const source = fs.readFileSync(
+      new URL('../../../../native/agent-island/macos-agent-island-helper.swift', import.meta.url),
+      'utf8',
+    );
+
+    const wakeObserver = source.match(
+      /workspaceWakeObserver = NSWorkspace[\s\S]*?\n {4}}\n {4}activeSpaceObserver/,
+    )?.[0];
+
+    expect(wakeObserver).toContain('NSWorkspace.didWakeNotification');
+    expect(wakeObserver).toContain('scheduleScreenMetricsPublish()');
+  });
+
   it('keeps native Agent marks aligned with the renderer icons', () => {
     const nativeSource = fs.readFileSync(
       new URL('../../../../native/agent-island/macos-agent-island-helper.swift', import.meta.url),
