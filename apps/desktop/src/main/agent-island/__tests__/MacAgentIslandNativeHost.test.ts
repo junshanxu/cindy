@@ -104,9 +104,10 @@ describe('MacAgentIslandNativeHost', () => {
     );
 
     const wakeObserver = source.match(
-      /workspaceWakeObserver = NSWorkspace[\s\S]*?\n {4}}\n {4}activeSpaceObserver/,
+      /workspaceWakeObserver\s*=\s*NSWorkspace\.shared\.notificationCenter\.addObserver\(\s*forName:\s*NSWorkspace\.didWakeNotification,[\s\S]*?self\?\.scheduleScreenMetricsPublish\(\)\s*\n\s*}/,
     )?.[0];
 
+    expect(wakeObserver).toBeTruthy();
     expect(wakeObserver).toContain('NSWorkspace.didWakeNotification');
     expect(wakeObserver).toContain('scheduleScreenMetricsPublish()');
   });
