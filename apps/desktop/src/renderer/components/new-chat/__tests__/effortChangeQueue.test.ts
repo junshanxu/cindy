@@ -4,6 +4,7 @@ import type { Effort } from '@/lib/userPreferences.types';
 import {
   createEffortChangeCoordinator,
   enqueueEffortChange,
+  getEffortChangeCoordinator,
   isSessionScopeCurrent,
 } from '../effortChangeQueue';
 
@@ -345,5 +346,67 @@ describe('effort change coordinator', () => {
     await pending;
 
     expect(remoteSwitchInFlight).toBe(false);
+  });
+
+  it('发送 preflight 会先等待已排队的持久化，再等待 runtime 投影', async () => {
+    const coordinator = createEffortChangeCoordinator();
+    const persistGate = deferred();
+    const runtimeGate = deferred();
+    const write = enqueueEffortChange(coordinator, 'session-a', 'xhigh', {
+      persist: async () => persistGate.promise,
+      applyRuntime: async () => runtimeGate.promise,
+      onCommitted: () => undefined,
+    });
+    let settled = false;
+    const preflight = coordinator.awaitRuntimeSettled('session-a').then(() => {
+      settled = true;
+    });
+
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    persistGate.resolve();
+    await write;
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    runtimeGate.resolve();
+    await preflight;
+    expect(settled).toBe(true);
+  });
+
+  it('发送 preflight 不会遗漏旧请求迟到触发的最新档位重放', async () => {
+    const coordinator = createEffortChangeCoordinator();
+    const attempts: Array<{ effort: Effort; gate: ReturnType<typeof deferred> }> = [];
+    const applyRuntime = vi.fn((_sessionId: string, effort: Effort) => {
+      const gate = deferred();
+      attempts.push({ effort, gate });
+      return gate.promise;
+    });
+
+    coordinator.publishRuntimeEffort('session-a', 'high', applyRuntime);
+    coordinator.publishRuntimeEffort('session-a', 'xhigh', applyRuntime);
+    const preflight = coordinator.awaitRuntimeSettled('session-a');
+
+    attempts[1].gate.resolve();
+    await Promise.resolve();
+    attempts[0].gate.resolve();
+    await vi.waitFor(() => expect(attempts).toHaveLength(3));
+    let settled = false;
+    void preflight.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(attempts[2].effort).toBe('xhigh');
+    attempts[2].gate.resolve();
+    await preflight;
+  });
+
+  it('共享协调器在 ChatInput remount 后仍保留待恢复标记', () => {
+    const firstMount = getEffortChangeCoordinator();
+    firstMount.markRuntimeDirty('session-remount');
+
+    const secondMount = getEffortChangeCoordinator();
+    expect(secondMount.isRuntimeDirty('session-remount')).toBe(true);
+    secondMount.suppressRuntimeEffort('session-remount');
   });
 });

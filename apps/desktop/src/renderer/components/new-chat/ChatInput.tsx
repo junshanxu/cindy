@@ -95,8 +95,8 @@ import {
   type ModelMemoryAccessors,
 } from './ModelSelector';
 import {
-  createEffortChangeCoordinator,
   enqueueEffortChange,
+  getEffortChangeCoordinator,
   isSessionScopeCurrent,
 } from './effortChangeQueue';
 import { useRemoteSessionConnection } from '@/features/cc-agent/hooks/useRemoteSessionConnection';
@@ -3539,8 +3539,11 @@ export function ChatInput({
 
   // ── Send / Stop wiring ─────────────────────────────────────────────
   const dispatchSendInFlightRef = useRef(false);
-  const [localSendDispatchInFlight, setSendDispatchInFlight] = useState(false);
-  const sendDispatchInFlight = localSendDispatchInFlight || agentSendDispatchInFlight;
+  // 仅在 effort 的持久化/runtime 预检期间禁用 composer。真正的 onSend 可能是一次很长的
+  // Agent 请求，不能把它当作「按钮仍在 preflight」而一直锁住输入框；同步 ref 仍负责拦住
+  // 重复派发。
+  const [effortPreflightInFlight, setEffortPreflightInFlight] = useState(false);
+  const sendDispatchInFlight = effortPreflightInFlight;
   const dispatchSendRef = useRef<(deliveryMode?: MessageDeliveryMode) => void | Promise<void>>(
     () => {},
   );
@@ -3559,7 +3562,6 @@ export function ChatInput({
       if (!finishAgentSendDispatch) return;
       draftSaveSchedulerRef.current?.flush();
       dispatchSendInFlightRef.current = true;
-      setSendDispatchInFlight(true);
       try {
         await resolveSessionMessageReferencesForSend(editor);
         // 引用 chip 水合会跨 device-link await；等待期间若旧客户端 / 其他入口登记了切换，
@@ -3660,14 +3662,48 @@ export function ChatInput({
             );
           });
         };
-        dispatchSendInFlightRef.current = true;
-        setSendDispatchInFlight(true);
         let result: boolean | void;
+        let effortForSend = activeEffort;
         try {
+          if (sessionId) {
+            const coordinator = effortChangeCoordinatorRef.current;
+            let runtimeSettled = false;
+            let timeoutId: ReturnType<typeof setTimeout> | undefined;
+            setEffortPreflightInFlight(true);
+            try {
+              await Promise.race([
+                coordinator.awaitRuntimeSettled(sessionId).then(() => {
+                  runtimeSettled = true;
+                }),
+                new Promise<void>((resolve) => {
+                  timeoutId = setTimeout(resolve, 5000);
+                }),
+              ]);
+            } finally {
+              if (timeoutId !== undefined) clearTimeout(timeoutId);
+              setEffortPreflightInFlight(false);
+            }
+
+            // 不把 timeout 写成全局 dirty：若迟到的是「持久化失败、runtime 尚未触碰」，旧实现
+            // 会永久阻断后续发送。当前这次发送直接失败；下一次会重新等待真实 settle 结果。
+            if (!runtimeSettled) {
+              toast.error(t('newChat.chatInput.effortRuntimeDirty'));
+              return;
+            }
+            // 路由切换后复用的编辑器不能把 A 会话的内容送进 B，也不能清掉 B 的草稿。
+            if (!isSessionScopeCurrent(sessionId, currentSessionIdRef.current)) return;
+            if (coordinator.isRuntimeDirty(sessionId)) {
+              toast.error(t('newChat.chatInput.effortRuntimeDirty'));
+              return;
+            }
+            // 等待 commit 后，闭包里的 activeEffort 可能仍是旧 props；以该 session 已提交的
+            // 选择发送，保证本 turn 与 UI/SQLite 的 effort 相同。
+            effortForSend = coordinator.getCommittedEffort(sessionId) ?? activeEffort;
+          }
           result = await onSend(
             textToSend,
             activeModel,
-            activeEffort,
+            effortForSend,
             activePermissionMode,
             filesToSend,
             mentionsToSend,
@@ -3684,9 +3720,6 @@ export function ChatInput({
         } catch (error) {
           log.warn('send rejected:', error instanceof Error ? error.message : String(error));
           return;
-        } finally {
-          dispatchSendInFlightRef.current = false;
-          setSendDispatchInFlight(false);
         }
         if (result === false) return;
         markRecentPluginUsage();
@@ -3711,7 +3744,6 @@ export function ChatInput({
         }
       } finally {
         dispatchSendInFlightRef.current = false;
-        setSendDispatchInFlight(false);
         finishAgentSendDispatch();
       }
     },
@@ -3734,6 +3766,7 @@ export function ChatInput({
       providers,
       confirmDialog,
       navigate,
+      sessionId,
     ],
   );
   useEffect(() => {
@@ -3801,7 +3834,7 @@ export function ChatInput({
   // 跨实例 / 跨重启的持久化由调用方通过 rememberedEffortByModel + onRememberedEffortChange
   // 注入 (NewMakerDraftRoute 走 newMakerDraft store)。
   const effortByModelRef = useRef<Map<string, Effort>>(new Map());
-  const effortChangeCoordinatorRef = useRef(createEffortChangeCoordinator());
+  const effortChangeCoordinatorRef = useRef(getEffortChangeCoordinator());
   const localRuntimeSwitchSeqBySessionRef = useRef(new Map<string, number>());
 
   useLayoutEffect(() => {
