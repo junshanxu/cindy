@@ -104,12 +104,13 @@ describe('MacAgentIslandNativeHost', () => {
     );
 
     const wakeObserver = source.match(
-      /workspaceWakeObserver\s*=\s*NSWorkspace\.shared\.notificationCenter\.addObserver\(\s*forName:\s*NSWorkspace\.didWakeNotification,[\s\S]*?self\?\.scheduleScreenMetricsPublish\(\)\s*\n\s*}/,
+      /workspaceWakeObserver\s*=\s*NSWorkspace\.shared\.notificationCenter\.addObserver\(\s*forName:\s*NSWorkspace\.didWakeNotification,[\s\S]*?self\?\.scheduleScreenMetricsPublish\(forceRefresh:\s*true\)\s*\n\s*}/,
     )?.[0];
 
     expect(wakeObserver).toBeTruthy();
     expect(wakeObserver).toContain('NSWorkspace.didWakeNotification');
-    expect(wakeObserver).toContain('scheduleScreenMetricsPublish()');
+    expect(wakeObserver).toContain('scheduleScreenMetricsPublish(forceRefresh: true)');
+    expect(source).toContain('payload["forceRefresh"] = true');
   });
 
   it('keeps native Agent marks aligned with the renderer icons', () => {

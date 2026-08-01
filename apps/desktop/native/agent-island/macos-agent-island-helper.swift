@@ -4630,6 +4630,7 @@ final class AgentIslandController {
   private var activeSpaceObserver: NSObjectProtocol?
   private var activeApplicationObserver: NSObjectProtocol?
   private var screenMetricsTimer: Timer?
+  private var pendingScreenMetricsForceRefresh = false
   private var dragInteraction: PanelDragInteraction?
   private var pendingMoveInteraction: PanelDragInteraction?
   private var lastMoveTime: TimeInterval = 0
@@ -4857,7 +4858,7 @@ final class AgentIslandController {
       // Sleep can restore the same display set without emitting the screen-parameter
       // notification. Refreshing here makes the main process recompute every island
       // frame against the post-wake display coordinates instead of stale ones.
-      self?.scheduleScreenMetricsPublish()
+      self?.scheduleScreenMetricsPublish(forceRefresh: true)
     }
     activeSpaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
       forName: NSWorkspace.activeSpaceDidChangeNotification,
@@ -4951,7 +4952,7 @@ final class AgentIslandController {
     return true
   }
 
-  func publishScreenMetrics() {
+  func publishScreenMetrics(forceRefresh: Bool = false) {
     var payload: [String: Any] = [
       "type": "screen-metrics",
       "screens": AgentIslandScreenMetricsProvider.allMetrics().map { $0.dictionary },
@@ -4959,14 +4960,21 @@ final class AgentIslandController {
     if let preferredDisplayId = AgentIslandScreenMetricsProvider.preferredDisplayId() {
       payload["preferredDisplayId"] = preferredDisplayId
     }
+    if forceRefresh {
+      payload["forceRefresh"] = true
+    }
     eventSink(payload)
   }
 
-  private func scheduleScreenMetricsPublish() {
+  private func scheduleScreenMetricsPublish(forceRefresh: Bool = false) {
+    pendingScreenMetricsForceRefresh = pendingScreenMetricsForceRefresh || forceRefresh
     screenMetricsTimer?.invalidate()
     screenMetricsTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: false) { [weak self] _ in
-      self?.screenMetricsTimer = nil
-      self?.publishScreenMetrics()
+      guard let self else { return }
+      self.screenMetricsTimer = nil
+      let forceRefresh = self.pendingScreenMetricsForceRefresh
+      self.pendingScreenMetricsForceRefresh = false
+      self.publishScreenMetrics(forceRefresh: forceRefresh)
     }
     RunLoop.main.add(screenMetricsTimer!, forMode: .common)
   }
