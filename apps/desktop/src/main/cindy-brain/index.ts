@@ -3995,12 +3995,14 @@ async function installOrUpdateMarketGhostPackageLocked(
     expected.beforeCommitInLock?.();
     const runtime = getGhostRuntime();
     runtime.stop(expected.ghostId);
-    getGhostNodeRuntimeBroker().stop(expected.ghostId);
-    getGhostAgentSlot().clearGhost(expected.ghostId);
-    getGhostErrandSlot().clearGhost(expected.ghostId);
     let result: Awaited<ReturnType<typeof manager.update>>;
     let packagePlaced = false;
     try {
+      // 市场更新同样会原位 rename 插件目录。Windows 上不能只发停止信号，
+      // 必须确认旧 utilityProcess 已离开，否则入口文件仍可能被占用而报 EPERM。
+      await getGhostNodeRuntimeBroker().stopAndWait(expected.ghostId);
+      getGhostAgentSlot().clearGhost(expected.ghostId);
+      getGhostErrandSlot().clearGhost(expected.ghostId);
       // 与首装分支同一口径:钉住 inspect 时校验过的包字节(见上)。
       result = await manager.update(cindyFilePath, {
         expectedPackageSha256: inspected.packageSha256,
@@ -5348,7 +5350,6 @@ export function registerGhostIpc(): void {
             });
             throwIpcError('INTERNAL', 'Unable to detach the installed Plugin source');
           }
-        }
         runtime.stop(inspected.manifest.id);
         // Windows 上 stop() 只是发出终止信号；等旧 utilityProcess 实际退出，
         // 否则它还会占用插件目录，接下来的原子 rename 可能报 EPERM。

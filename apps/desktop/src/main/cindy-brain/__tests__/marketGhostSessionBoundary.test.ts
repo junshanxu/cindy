@@ -123,5 +123,32 @@ describe('market Ghost session boundary', () => {
       initialBranch.indexOf('return installAndDock('),
     );
     expect(body.match(/expected\.beforeCommitInLock\?\.\(\);/g)).toHaveLength(2);
+
+    const waitIndex = body.indexOf(
+      'await getGhostNodeRuntimeBroker().stopAndWait(expected.ghostId);',
+    );
+    const updateIndex = body.indexOf('await manager.update(cindyFilePath');
+
+    expect(waitIndex).toBeGreaterThan(-1);
+    expect(waitIndex).toBeLessThan(updateIndex);
+    expect(body.indexOf('spawnIfResident(installed);')).toBeGreaterThan(waitIndex);
+  });
+
+  it('restores a resident local-update plugin if waiting for shutdown fails', () => {
+    const updateStart = source.indexOf("ipcMain.handle('ghosts:update'");
+    const updateEnd = source.indexOf("ipcMain.handle('ghosts:pick-file'", updateStart);
+    const body = source.slice(updateStart, updateEnd);
+
+    const waitIndex = body.indexOf(
+      'await getGhostNodeRuntimeBroker().stopAndWait(inspected.manifest.id);',
+    );
+    const updateIndex = body.indexOf('result = await manager.update(lizFilePath');
+    const restoreIndex = body.indexOf(
+      'if (previousGhost) spawnIfResident(previousGhost);',
+    );
+
+    expect(waitIndex).toBeGreaterThan(-1);
+    expect(waitIndex).toBeLessThan(updateIndex);
+    expect(restoreIndex).toBeGreaterThan(updateIndex);
   });
 });
