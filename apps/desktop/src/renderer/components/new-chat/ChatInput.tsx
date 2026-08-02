@@ -99,6 +99,10 @@ import {
   getEffortChangeCoordinator,
   isSessionScopeCurrent,
 } from './effortChangeQueue';
+import {
+  captureComposerSendSnapshot,
+  isComposerSendSnapshotCurrent,
+} from './composerSendSnapshot';
 import { useRemoteSessionConnection } from '@/features/cc-agent/hooks/useRemoteSessionConnection';
 
 import {
@@ -1083,6 +1087,8 @@ export function ChatInput({
     updateFile,
     clearFiles,
   } = attachmentState;
+  const attachmentsRef = useRef(attachments);
+  attachmentsRef.current = attachments;
   // browser-comment-chip:内置浏览器页面评论(结构化,不进草稿文本),渲染为
   // 「N 条注释」胶囊,发送时序列化 + 截图并入 filesToSend。
   const [browserComments, setBrowserComments] = useState<BrowserCommentDraftItem[]>([]);
@@ -1166,6 +1172,11 @@ export function ChatInput({
   const agentSwitchInFlight = useSyncExternalStore(
     subscribeAgentSwitchPending,
     () => !!sessionId && hasPendingAgentSwitchOperation(sessionId),
+    () => false,
+  );
+  const agentSendDispatchInFlight = useSyncExternalStore(
+    subscribeAgentSwitchPending,
+    () => !!sessionId && hasPendingAgentSendDispatch(sessionId),
     () => false,
   );
   useEffect(() => {
@@ -3636,6 +3647,11 @@ export function ChatInput({
           ? findGhostByCommand(eligibleGhosts, ghostCommandWord)
           : null;
         const textToSend = expandGhostCommand(text, eligibleGhosts);
+        const sendSnapshot = captureComposerSendSnapshot(
+          editor.getJSON(),
+          attachmentsRef.current,
+          browserCommentsRef.current,
+        );
         let recentUsageMarked = false;
         const markRecentPluginUsage = () => {
           if (!usedGhost || recentUsageMarked) return;
@@ -3708,6 +3724,19 @@ export function ChatInput({
         }
         if (result === false) return;
         markRecentPluginUsage();
+        // onSend may wait on auth, commands, a remote device, or attachment work.
+        // Only clear the exact accepted snapshot; if the user changed anything
+        // after dispatch, preserve the whole current draft so no unsent work is lost.
+        if (
+          !isComposerSendSnapshotCurrent(
+            sendSnapshot,
+            editor.getJSON(),
+            attachmentsRef.current,
+            browserCommentsRef.current,
+          )
+        ) {
+          return;
+        }
         // Suppress onUpdate's draft-save during the post-send clearContent so
         // we don't write a transient empty-doc entry that we're about to drop.
         isRestoringRef.current = true;
@@ -5753,7 +5782,7 @@ export function ChatInput({
                     onProviderChange={handleProviderChange}
                     onNavigateToProviders={handleNavigateToProviders}
                     switching={remoteSwitchInFlight}
-                    disabled={composerMutationLocked}
+                    disabled={disabled || agentSendDispatchInFlight || agentSwitchInFlight}
                     visualVariant={isCreateAgentVariant ? 'create-agent' : 'default'}
                     compactToolbar={useNarrowToolbar}
                     ultraCompactToolbar={useUltraCompactToolbar}

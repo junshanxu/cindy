@@ -161,7 +161,9 @@ export function createEffortChangeCoordinator(): EffortChangeCoordinator {
         const commitTail = lane.commitTail;
         await commitTail;
         const runtimeAttempts = [...lane.runtimeAttempts];
-        if (runtimeAttempts.length > 0) await Promise.all(runtimeAttempts);
+        // runtime failure is represented by runtimeDirty and must be handled by the
+        // caller's dedicated toast path, not leak as a generic dispatch rejection.
+        if (runtimeAttempts.length > 0) await Promise.allSettled(runtimeAttempts);
         if (commitTail === lane.commitTail && lane.runtimeAttempts.size === 0) return;
       }
     },

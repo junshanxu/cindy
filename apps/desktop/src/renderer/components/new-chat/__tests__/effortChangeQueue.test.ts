@@ -401,6 +401,16 @@ describe('effort change coordinator', () => {
     await preflight;
   });
 
+  it('runtime 拒绝由 dirty 状态承接，不让等待链抛出通用错误', async () => {
+    const coordinator = createEffortChangeCoordinator();
+    coordinator.publishRuntimeEffort('session-a', 'high', async () => {
+      throw new Error('runtime failed');
+    });
+
+    await expect(coordinator.awaitRuntimeSettled('session-a')).resolves.toBeUndefined();
+    expect(coordinator.isRuntimeDirty('session-a')).toBe(true);
+  });
+
   it('共享协调器在 ChatInput remount 后仍保留真实 runtime 失败标记', async () => {
     const firstMount = getEffortChangeCoordinator();
     firstMount.publishRuntimeEffort('session-remount', 'high', async () => {
