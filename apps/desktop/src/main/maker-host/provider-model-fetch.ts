@@ -43,13 +43,19 @@ export interface ProviderModelsFetchSpec {
   apiKey?: string | null;
   /** 附加请求头（自定义供应商的 headers 配置）。 */
   headers?: Record<string, string>;
+  /**
+   * 已保存自定义供应商 id：给出时 main 侧按 (id, agent) 读取已存的 main-only 鉴权请求头
+   * 并并入 `headers`，无需 renderer 回读明文头（headers 是 main-only 密文，见
+   * isRendererAccessibleSafeStorageKey）。仅用于“刷新模型”复用已存请求头鉴权的端点。
+   */
+  savedProviderId?: string;
 }
 
 /** 结构化结果（查询型返回：renderer 需要 code 渲染分类文案，不走 throwIpcError）。 */
 export interface ProviderModelsFetchResult {
   ok: boolean;
-  /** 拉到的模型清单（ok=true 时给出；已按 id 去重）。 */
-  models?: { id: string; name: string }[];
+  /** 拉到的模型清单（ok=true 时给出；已按 id 去重;contextWindow 为端点声明的上下文长度,尽力提取）。 */
+  models?: { id: string; name: string; contextWindow?: number }[];
   /** 失败分类码（ok=false 时给出）。 */
   code?: ProviderErrorCode;
   /** HTTP 状态码（网络层失败时缺省）。 */

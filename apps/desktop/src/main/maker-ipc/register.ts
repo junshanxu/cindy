@@ -32,7 +32,7 @@ import { redactSensitiveText } from '@cindy/maker-shared/error-redaction';
 import { permissionModeOrAsk } from '@cindy/maker-shared/permission-mode';
 import { DL_SESSION_REFERENCE_CAPABILITY_CHANNEL } from '@cindy/device-link';
 import { and, desc, eq, gte, inArray, isNull, sql } from 'drizzle-orm';
-import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron';
 import { getActiveAppSession } from '../appSessionState.js';
 import type { AgentMeta } from '../../renderer/lib/ccAgent.types';
 import {
@@ -49,8 +49,15 @@ import { normalizeWorkingDirForProjectSettings } from '../../shared/workingDir.j
 import { buildTurnUsageDetails } from '../../shared/turnUsageDetails.js';
 import type { DesktopCommandContext } from '../commands/index.js';
 import { getDesktopCommandRegistry } from '../commands/index.js';
-import { initGithubIssueSubmit, IssueConfirmBridge } from '../github-issue/index.js';
-import { initGhostGrantConfirmBridge } from '../cindy-brain/ghostGrantConfirmBridge.js';
+import {
+  initGithubIssueSubmit,
+  IssueConfirmBridge,
+  type IssueConfirmInteractionSnapshot,
+} from '../github-issue/index.js';
+import {
+  initGhostGrantConfirmBridge,
+  type GhostGrantConfirmInteractionSnapshot,
+} from '../cindy-brain/ghostGrantConfirmBridge.js';
 import { createFeishuDesktopConfirmNotifier } from '../im/desktopConfirmNoticeWiring.js';
 import {
   initGhostSetupInteractionBridge,
@@ -78,12 +85,14 @@ import {
 import {
   initRenameSessionsConfirm,
   RenameSessionsConfirmBridge,
+  type RenameSessionsConfirmInteractionSnapshot,
 } from '../session-title-rename/index.js';
 import {
   getBrowserAvailability,
   openBrowserForLogin,
 } from '../mcp-integrations/browser.js';
 import { getActiveCodexBridgeInstanceId, getActiveCodexBridgeServerNames, shutdownCodexEnvironment } from '../mcp-integrations/codexEnvironment.js';
+import { invalidatePiEnvironment, shutdownPiEnvironment } from '../mcp-integrations/piEnvironment.js';
 import { REMOTE_MEMORY_SERVER_NAME } from '../mcp-integrations/codexHttpBridge.js';
 import { getRemoteMcpBridgeToken } from '../mcp-integrations/remoteMcpBridgeToken.js';
 import {
@@ -120,15 +129,22 @@ import {
   saveAgentInputQueueSnapshot,
 } from '../localDb/agentInputQueueSnapshots.js';
 import { ensureDialogueWorkspaceDir, dialogueWorkspaceRootDir } from '../localDb/dialogueWorkspace.js';
-import { healMissingDialogueWorkdir } from '../localDb/dialogueWorkdirSelfHeal.js';
 import {
+  healMissingDialogueWorkdir,
+  matchDialogueWorkspacePath,
+} from '../localDb/dialogueWorkdirSelfHeal.js';
+import {
+  broadcastMessageRow,
   broadcastMessageDeleted,
   commitMessageDeletion,
   createMessage as createDbMessage,
   findParkedEngineSession,
   getMessageDeletionTarget,
   listMessagesForAgentHandoff,
+  patchMessageAgentMeta,
+  supersedeRetriedUserTurn,
 } from '../localDb/ipc/messages.js';
+import { messageToCamel } from '../localDb/mapper.js';
 import { visibleMessageTextForConversationSearch } from '../localDb/conversationSearch.pure.js';
 import {
   applyAgentSwitchToSessionRow,
@@ -138,7 +154,6 @@ import {
   createSessionRemoteHostIdReader,
   getSessionRowSnapshot,
   persistSessionFields,
-  persistSessionPermissionModeIfAuto,
 } from '../localDb/ipc/sessions.js';
 // sidebar-card-mode: turn-done 后触发任务现状摘要生成
 import { maybeGenerateSessionTaskSummary } from '../sessionTaskSummary.js';
@@ -203,7 +218,10 @@ import {
   writeMemorySetting,
 } from '../maker-host/memory-settings-store.js';
 import { GLOBAL_PLUGIN_IDS } from '../maker-host/plugins/types.js';
-import { assertCollabProjectEnabled } from './collabProjectPolicy.js';
+import {
+  assertCollabProjectEnabled,
+  resolveLocalCollabPolicyWorkingDir,
+} from './collabProjectPolicy.js';
 import type { GitSnapshotCoordinator } from '../git-snapshot/gitSnapshotCoordinator.js';
 import {
   getRemoteNewMakerDefaults,
@@ -241,6 +259,7 @@ import {
 import {
   clearSessionPersistState,
   consumeLastAssistantPersistId,
+  consumeLastTopLevelAssistantPersistId,
   drainPersistQueue,
   enqueueDurableWrite,
   flushAssistantBlock,
@@ -248,6 +267,7 @@ import {
   getLastAssistantTranscriptUuid,
   getSessionDbAgentKind,
   markAssistantTurnCompleted,
+  markAssistantTurnFailed,
   noteAgentMeta,
   noteSessionAgentKind,
   noteSessionClearBoundary,
@@ -280,16 +300,19 @@ import {
 } from '../sessionSpendBroadcaster.js';
 import {
   codexUsageToTokens,
+  piUsageToTokens,
   recordSchedulerTurnCost,
   recordTurnCostOnMessage,
+  recordTurnUsageOnMessage,
 } from '../turnCostBroadcaster.js';
 import { recordModelMismatchOnMessage } from '../modelMismatchBroadcaster.js';
 import { detectClaudeModelMismatch } from '../../shared/modelMismatch.js';
 import { triggerClaudeAccountUsageRefresh } from '../usage/claudeAccountUsage.js';
-import { getCodexSubscriptionValuePrice, getGatewayAccountCurrency, getModelPriceQuote, getModelPricing, getModelPricingForModel, getSubscriptionDirectValuePrice } from '../usage/modelPricing.js';
-import { computeModelUsageDeltas, type ModelUsageCumulative, type ModelUsageDeltaEntry } from '../usage/modelUsageDelta.js';
-import { claudeSubscriptionUsageModelKey, codexApiUsageModelKey, codexSubscriptionUsageModelKey } from '../usage/usageHistory.js';
-import { buildClaudeTurnUsageDetails, computePriceQuoteTurnMoney, estimateClaudeSubscriptionTurnValue, isAnthropicModel, normalizeModelIdForPricing, resolveClaudeTurnCostSinks, type BillingRoute } from '../usage/turnCostCalculator.js';
+import { broadcastEffectiveModelPricing, getCodexProviderSubscriptionValuePrice, getGatewayAccountCurrency, getModelPriceQuote, getModelPricing, getModelPricingForModel, getSubscriptionDirectValuePrice } from '../usage/modelPricing.js';
+import { clearModelPriceOverride, stageProviderModelPriceOverridesClear, readModelPriceOverrideView, setModelPriceOverride } from '../usage/modelPriceOverrideStore.js';
+import { computeModelUsageDeltas, detectOutputLag, type ModelUsageCumulative, type ModelUsageDeltaEntry } from '../usage/modelUsageDelta.js';
+import { claudeSubscriptionUsageModelKey, codexApiUsageModelKey, codexSubscriptionUsageModelKey, piSubscriptionUsageModelKey } from '../usage/usageHistory.js';
+import { billingRouteForExplicitProvider, buildClaudeTurnUsageDetails, computePriceQuoteTurnMoney, estimateClaudeSubscriptionTurnValue, isAnthropicModel, normalizeModelIdForPricing, resolveClaudeTurnCostSinks, type BillingRoute } from '../usage/turnCostCalculator.js';
 import { CHATGPT_MODEL_PREFIX, XAI_MODEL_PREFIX, isSubscriptionDirectModel } from '../../shared/subscriptionModels.js';
 import {
   addRegionalMoney,
@@ -308,6 +331,7 @@ import {
   recordTurnSpend,
 } from '../usageBroadcaster.js';
 import { throwIpcError } from '../utils/ipcValidate.js';
+import { dbToMakerAgentKind, makerToDbAgentKind } from '../../shared/agentKindConversion.js';
 import { readWorkflowProgressForSession } from '../workflow-progress/reader.js';
 import {
   AgentInputCoordinator,
@@ -332,6 +356,8 @@ import { validateExtraDirs } from './extraDirsValidator.js';
 import { prepareHandoffWorktree, shouldRecycleHandoffWorktreeOnFailure } from './handoffWorktree.js';
 import { validateHandoffWorkingDir } from './handoffWorkingDir.js';
 import { registerProjectPluginPolicyHandlers } from './projectPluginPolicyHandlers.js';
+import { registerPrecreatedWorktreeDiscardHandler } from './precreatedWorktreeDiscardHandler.js';
+import { registerNewMakerWorktreePreferenceHandler } from './newMakerWorktreePreferenceHandler.js';
 import {
   restoreMissingManagedWorktreeForSession,
   WorktreeManager as worktreeManager,
@@ -351,7 +377,10 @@ import {
   readOrcaWorkerOutputReadOnly,
 } from './orcaDiagnostics.js';
 import { createMakerSendTransaction } from './makerSendTransaction.js';
-import { installDesktopInteractionHandler } from './interactionRouter.js';
+import {
+  installDesktopInteractionHandler,
+  installInteractionLifecycleObserver,
+} from './interactionRouter.js';
 import { registerMakerMessageDeleteHandler } from './messageDeleteHandler.js';
 import { normalizeUserMessage, materializeQueuedOssAttachments } from './normalizeAttachments.js';
 import { AGENT_ISLAND_DISPLAY_CONFIG } from '../agent-island/displayConfig.js';
@@ -414,18 +443,20 @@ import {
 } from '../mcp-integrations/custom-mcp-registry.js';
 import {
   getDesktopProviderService,
+  getDesktopSelectableCatalog,
   refreshActiveCatalogFromSource,
   refreshCustomProvidersIntoCatalog,
 } from '../maker-host/createDesktopProviderService.js';
 import {
   connectedProvidersForAgent,
   effectiveSourceIdForModel,
-  isAgentSelectableModel,
+  isModelSelectableForNewRoute,
   type ProviderView,
 } from '@cindy/model-providers';
 import {
   getSessionProvider,
   hydrateSessionProvider,
+  normalizeSessionProviderId,
   setSessionProvider,
 } from '../maker-host/session-provider-store.js';
 import { getActiveCatalog, setDiscoveredProviderModels } from '../maker-host/active-catalog.js';
@@ -464,8 +495,11 @@ import {
   updateCustomProviderIfUnchanged,
 } from '../maker-host/custom-provider-store.js';
 import {
+  readCustomProviderHeadersForMutation,
   readCustomProviderKeyForMutation,
+  removeCustomProviderHeaders,
   removeCustomProviderKey,
+  storeCustomProviderHeaders,
   storeCustomProviderKey,
 } from '../secrets/providerSecretStore.js';
 import { setSessionEffort, setSessionFastMode } from '../maker-host/session-effort-store.js';
@@ -479,7 +513,7 @@ import {
   setProviderDisabled,
   stageProviderDisableOverridesClear,
 } from '../maker-host/model-disable-store.js';
-import { getCurrentDataOwnerId } from '../authManager.js';
+import { readProviderOrder, setProviderOrder } from '../maker-host/provider-order-store.js';
 import {
   resolveLenientSessionRoute,
   verdictForModelRoute,
@@ -493,6 +527,7 @@ import {
   setClaudeBackgroundActivityBroadcaster,
 } from '../maker-host/claude-session-background-activity.js';
 import { readClaudeSessionRoute } from '../maker-host/claude-session-route-registry.js';
+import { consumeClaudeGatewayOpusPlanMismatch } from '../maker-host/claude-gateway-error-observer.js';
 import { setLiveCcSessionBridge } from '../maker-host/claude-transcript-relocation.js';
 import {
   CredentialModeSwitchBusyError,
@@ -516,6 +551,7 @@ import { resolveClearSessionBoundary } from './clearSessionBoundary.js';
 import { tapWindowBroadcast } from '../device-link/broadcast-tap.js';
 import { setBusyProbe as setDeviceLinkBusyProbe } from '../device-link/index.js';
 import {
+  markRemoteSettingPersistedInsideHandler,
   setRemoteWorkingDirGuard as setDeviceLinkRemoteWorkingDirGuard,
   setRemoteSettingsPersist as setDeviceLinkRemoteSettingsPersist,
 } from '../device-link/dispatch.js';
@@ -573,6 +609,7 @@ import {
   readGhostErrandSessionId,
   writeGhostErrandSessionId,
 } from '../cindy-brain/errandPrefsStore.js';
+import { isGhostPickedDir } from '../cindy-brain/pickGrantsStore.js';
 import { createGhostErrandRunner } from './ghostErrandRunner.js';
 import {
   createGhostErrandSession,
@@ -622,6 +659,77 @@ const interruptedTurnAutoResumeGuard = new InterruptedTurnAutoResumeGuard({
   },
 });
 
+// Schedule 不另建重试状态机：真正的恢复仍由 AgentInputCoordinator +
+// AutoResumeBookkeeping 独占。这里仅把「这一轮 scheduler run 已被普通自动续跑接管」
+// 和「最终仍失败」桥给 runner，让同一个 run 继续等待或正确失败。
+const pendingSchedulerAutoResumeRunBySession = new Map<string, string>();
+const schedulerAutoResumeFailureListeners = new Map<string, Set<() => void>>();
+
+function schedulerAutoResumeRunKey(sessionId: string, runId: string): string {
+  return JSON.stringify([sessionId, runId]);
+}
+
+function beginSchedulerAutoResume(sessionId: string, runId: string): void {
+  pendingSchedulerAutoResumeRunBySession.set(sessionId, runId);
+}
+
+function clearSchedulerAutoResumePending(sessionId: string, runId: string): void {
+  if (pendingSchedulerAutoResumeRunBySession.get(sessionId) === runId) {
+    pendingSchedulerAutoResumeRunBySession.delete(sessionId);
+  }
+}
+
+function notifySchedulerAutoResumeFailed(sessionId: string, runId: string): void {
+  clearSchedulerAutoResumePending(sessionId, runId);
+  const listeners = schedulerAutoResumeFailureListeners.get(
+    schedulerAutoResumeRunKey(sessionId, runId),
+  );
+  if (!listeners) return;
+  for (const listener of listeners) {
+    try {
+      listener();
+    } catch {
+      // Runner listener failures must not break chat recovery cleanup.
+    }
+  }
+}
+
+function failPendingSchedulerAutoResume(sessionId: string): void {
+  const runId = pendingSchedulerAutoResumeRunBySession.get(sessionId);
+  if (runId) notifySchedulerAutoResumeFailed(sessionId, runId);
+}
+
+export function isSchedulerAutoResumePending(sessionId: string, runId: string): boolean {
+  return pendingSchedulerAutoResumeRunBySession.get(sessionId) === runId;
+}
+
+export function onSchedulerAutoResumeFailed(
+  sessionId: string,
+  runId: string,
+  listener: () => void,
+): () => void {
+  const key = schedulerAutoResumeRunKey(sessionId, runId);
+  let listeners = schedulerAutoResumeFailureListeners.get(key);
+  if (!listeners) {
+    listeners = new Set();
+    schedulerAutoResumeFailureListeners.set(key, listeners);
+  }
+  listeners.add(listener);
+  return () => {
+    listeners!.delete(listener);
+    if (listeners!.size === 0) schedulerAutoResumeFailureListeners.delete(key);
+  };
+}
+
+/** Schedule pause/delete：只撤销仍属于该 run 的普通聊天自动续跑。 */
+export function cancelSchedulerAutoResume(sessionId: string, runId: string): boolean {
+  if (!isSchedulerAutoResumePending(sessionId, runId)) return false;
+  // teardown 是既有唯一生命周期出口：撤退避、清 coordinator 接管与隐藏续跑、
+  // 结算活动行并通知 runner。runId 校验防止迟到的旧 abort 误杀新 run。
+  autoResumeBookkeeping.teardown(sessionId);
+  return true;
+}
+
 /**
  * 中断自愈的每会话簿记(压住的错误详情 / 待确认的重连记录 / 退避排期)。
  *
@@ -641,8 +749,32 @@ const autoResumeBookkeeping = new AutoResumeBookkeeping({
   // holder 是可变绑定,必须懒读(模块初始化时 coordinator 还没建)。
   abandonTakeover: (sessionId, message) =>
     agentInputCoordinatorHolder?.abandonAutoResume(sessionId, message),
+  onAutoResumeFailed: failPendingSchedulerAutoResume,
   log: (message, fields) => log.debug(message, fields),
 });
+
+/**
+ * 用户明确停止会话时统一撤销两类自动续跑与它们的退避簿记。
+ *
+ * 这个边界必须早于 live Session 查询：owner 切换期间可能暂时拿不到 Session，
+ * 但已经排期的 timer / scheduler takeover 仍然存在，不能因此漏清后原地复活。
+ */
+function resetAutomaticRecoveryForExplicitStop(sessionId: string): void {
+  silentStopAutoResumeGuard.noteSessionReset(sessionId);
+  interruptedTurnAutoResumeGuard.noteSessionReset(sessionId);
+  autoResumeBookkeeping.teardown(sessionId);
+}
+
+function settleUndispatchedAutoResumeOutcome(
+  sessionId: string,
+  item: AgentInputQueuedMessage,
+): boolean {
+  if (!autoResumeBookkeeping.isPendingOutcomeClientId(sessionId, item.clientId)) return false;
+  // markOutcome 复用 durable-write 队列；持久化中取消时，failed patch 会排在
+  // 正在进行的 user row insert 后面，不会出现先 patch、后 insert 的窗口。
+  autoResumeBookkeeping.settleOutcome(sessionId, 'failed');
+  return true;
+}
 
 /**
  * 非 renderer 发送路径(scheduler runner / hook runner)调用:给 silent-stop
@@ -654,12 +786,11 @@ export function noteSilentStopUserSend(sessionId: string): void {
 }
 
 /**
- * 非 renderer 中止路径(IM `!stop` 等)调用:重置 silent-stop 守卫,让挂在
- * 1.5s 决策窗里的自动续跑判为 superseded(经 settle('skip') 收口),不在用户
- * 明确喊停后"原地复活"。renderer 走 ABORT_SESSION handler 内的同名调用。
+ * 非 renderer 中止路径(IM `!stop` 等)调用。历史名称保留给现有调用方；实际必须
+ * 同时撤掉 silent-stop、中断续跑及退避簿记，保证所有明确 Stop 入口同一语义。
  */
 export function noteSilentStopSessionReset(sessionId: string): void {
-  silentStopAutoResumeGuard.noteSessionReset(sessionId);
+  resetAutomaticRecoveryForExplicitStop(sessionId);
 }
 
 /**
@@ -796,7 +927,11 @@ function memorySettingsWire() {
  * bridge」的顺序约束, 并用翻转守卫包住 (同值调用不白杀 bridge)。失败只记
  * warn — 设置已落盘, 旧 bridge 的失配窗口由下一次 bridge 重建收敛。
  */
-async function shutdownCodexEnvironmentBestEffort(reason: string): Promise<void> {
+async function shutdownAgentMcpEnvironmentsBestEffort(reason: string): Promise<void> {
+  // Codex 与 Pi 各有一个懒启动的 MCP bridge 单例,server 集合在 doStart 时冻结。MCP /
+  // contacts / memory 开关变更后两者都要 invalidate,否则新会话仍连到旧 bridge:被禁用的
+  // 工具没被真正撤销、新启用的工具不可用(Pi 侧 codex review P1)。best-effort:失败只 warn,
+  // 下一次使用 lazy 重建出与新开关一致的 bridge。
   try {
     await shutdownCodexEnvironment();
   } catch (err) {
@@ -804,6 +939,8 @@ async function shutdownCodexEnvironmentBestEffort(reason: string): Promise<void>
       error: err instanceof Error ? err.message : String(err),
     });
   }
+  // Pi 用 generation lease：活动会话继续使用旧桥，新会话立即重建到新配置。
+  invalidatePiEnvironment();
 }
 
 async function applyMemoryChangeWithCodexRestart<T extends object>(
@@ -1107,7 +1244,7 @@ interface OrcaCollabService {
     { ok: true; workerId?: string } | { ok: false; errorCode: string; message: string }
   >;
   listAvailableModels: (params: { agent?: AgentKind }) => Promise<
-    { ok: true; codex?: Array<{ id: string; label: string }>; claude_code?: Array<{ id: string; label: string }> }
+    { ok: true; codex?: Array<{ id: string; label: string }>; claude_code?: Array<{ id: string; label: string }>; pi?: Array<{ id: string; label: string }> }
     | { ok: false; errorCode: string; message: string }
   >;
 }
@@ -1198,7 +1335,7 @@ export function stopOrcaIdleWatcher(): void {
 }
 
 function requireAgentKind(value: unknown): AgentKind {
-  if (value === 'claude-code' || value === 'codex') return value;
+  if (value === 'claude-code' || value === 'codex' || value === 'pi') return value;
   throwIpcError('INVALID_PARAMS', 'agentKind required');
 }
 
@@ -1336,7 +1473,7 @@ const renameSessionsConfirmBridge = new RenameSessionsConfirmBridge({
   broadcast: (channel, payload) => broadcastToAllWindows(channel, payload),
   logger: log,
   onDesktopOnlyConfirmPending: (sessionId) =>
-    desktopConfirmImNotifier(sessionId, '「批量重命名会话」的确认卡'),
+    desktopConfirmImNotifier(sessionId, '「批量重命名任务」的确认卡'),
 });
 
 /**
@@ -1463,23 +1600,39 @@ function clearPendingInteraction(requestId: string): PendingInteractionEntry | n
   return entry;
 }
 
+type RecoverableInteractionSnapshot =
+  | InteractionRequest
+  | GhostSetupInteractionSnapshot
+  | IssueConfirmInteractionSnapshot
+  | RenameSessionsConfirmInteractionSnapshot
+  | GhostGrantConfirmInteractionSnapshot;
+
+type PendingInteractionSnapshotEntry = {
+  request: RecoverableInteractionSnapshot;
+  persistId?: string;
+};
+
 /**
- * 快照:某会话当前所有挂起的 agent interaction(permission / ask_user / plan_review)。
+ * 快照:某会话当前所有挂起的 agent interaction 与 Host-owned 确认卡。
  * 供 renderer 在「打开 / 重连 / 刷新」会话时重建可操作面板 —— pending 状态原本只由实时
  * INTERACTION_REQUEST push 设置,后加入的窗口会错过那条 push,靠这个查询补回。
  * 纯内存读;O(N) 其中 N = 全局挂起交互数(极小)。
  */
 function getPendingInteractionsForSession(
   sessionId: string,
-): Array<{ request: InteractionRequest | GhostSetupInteractionSnapshot; persistId?: string }> {
-  const out: Array<{
-    request: InteractionRequest | GhostSetupInteractionSnapshot;
-    persistId?: string;
-  }> = [];
+): PendingInteractionSnapshotEntry[] {
+  const out: PendingInteractionSnapshotEntry[] = [];
   for (const entry of pendingInteractionResolvers.values()) {
     if (entry.sessionId === sessionId) out.push({ request: entry.request, persistId: entry.persistId });
   }
   out.push(
+    ...issueConfirmBridge.pendingSnapshots(sessionId).map(({ request }) => ({ request })),
+    ...renameSessionsConfirmBridge
+      .pendingSnapshots(sessionId)
+      .map(({ request }) => ({ request })),
+    ...ghostGrantConfirmBridge
+      .pendingSnapshots(sessionId)
+      .map(({ request }) => ({ request })),
     ...ghostSetupInteractionBridge
       .pendingSnapshots(sessionId)
       .map(({ request }) => ({ request })),
@@ -1487,10 +1640,29 @@ function getPendingInteractionsForSession(
   return out;
 }
 
-function hasPendingInteractionForSession(sessionId: string): boolean {
+/**
+ * Agent-owned interactions are queue/zombie boundaries. Desktop-only confirms
+ * are Host tool waiters: they are recoverable UI state, but must not block a
+ * later user turn or be cleared by turn-idle reconciliation.
+ */
+function hasPendingAgentInteractionForSession(sessionId: string): boolean {
   return (
     Array.from(pendingInteractionResolvers.values()).some((entry) => entry.sessionId === sessionId) ||
     ghostSetupInteractionBridge.pendingSnapshots(sessionId).length > 0
+  );
+}
+
+function isPendingDesktopOnlyConfirmation(requestId: string): boolean {
+  return (
+    issueConfirmBridge
+      .pendingSnapshots()
+      .some(({ request }) => request.requestId === requestId) ||
+    renameSessionsConfirmBridge
+      .pendingSnapshots()
+      .some(({ request }) => request.requestId === requestId) ||
+    ghostGrantConfirmBridge
+      .pendingSnapshots()
+      .some(({ request }) => request.requestId === requestId)
   );
 }
 
@@ -1590,7 +1762,7 @@ function defaultDecisionForPending(kind: InteractionRequest['kind'], reason: str
   return { kind, behavior: 'deny', reason } as InteractionDecision;
 }
 
-function cleanupPendingInteractionsForSession(sessionId: string, reason: string): void {
+function cleanupPendingAgentInteractionsForSession(sessionId: string, reason: string): void {
   const entries = Array.from(pendingInteractionResolvers.entries())
     .filter(([, entry]) => entry.sessionId === sessionId);
   for (const [requestId, entry] of entries) {
@@ -1599,8 +1771,16 @@ function cleanupPendingInteractionsForSession(sessionId: string, reason: string)
     entry.resolve(defaultDecisionForPending(entry.kind, reason));
     dismissRendererInteraction(entry, requestId, reason, 'deny');
   }
-  // issue 确认卡同会话清理(单点收口,覆盖 session_closed / session_aborted /
-  // orca_disable / turn_idle_reconcile 全部调用方)。
+  ghostSetupInteractionBridge.cleanupForSession(
+    sessionId,
+    reason === 'session_closed' ? 'session_closed' : 'session_aborted',
+  );
+}
+
+function cleanupPendingInteractionsForSession(sessionId: string, reason: string): void {
+  cleanupPendingAgentInteractionsForSession(sessionId, reason);
+  // Desktop-only 确认只跟随真实会话终止/中止清理。权威 NO_ACTIVE_TURN 的
+  // turn-idle reconcile 只处理 Agent-owned 僵尸，不能取消仍有效的 Host 工具等待。
   issueConfirmBridge.cleanupForSession(
     sessionId,
     reason === 'session_closed' ? 'session_closed' : 'session_aborted',
@@ -1613,13 +1793,9 @@ function cleanupPendingInteractionsForSession(sessionId: string, reason: string)
     sessionId,
     reason === 'session_closed' ? 'session_closed' : 'session_aborted',
   );
-  ghostSetupInteractionBridge.cleanupForSession(
-    sessionId,
-    reason === 'session_closed' ? 'session_closed' : 'session_aborted',
-  );
   // fs 槽 workdir 写确认的会话级记忆只在会话真正关闭时清(防 Set 无界增长)。
-  // 本函数在 session_aborted(用户点停止)/ turn_idle_reconcile 等瞬态也会被
-  // 调,那些场景确认卡该收、但"同目录本会话免弹"的记忆要保住——否则用户每
+  // 本函数在 session_aborted(用户点停止)等瞬态也会被调,那些场景确认卡该收、
+  // 但"同目录本会话免弹"的记忆要保住——否则用户每
   // 次 Stop 后同目录又要重新点一遍允许,与卡片文案承诺不符(review P2)。
   if (reason === 'session_closed') {
     getGhostFsSlot().cleanupForSession(sessionId);
@@ -1674,6 +1850,45 @@ interface WiredSessionRegistration {
  * wire 新实例，不能只按 id 去重。
  */
 const wiredSessionsById = new Map<string, WiredSessionRegistration>();
+
+/**
+ * Monotonic logical-turn generation used by direct abort reconciliation.
+ * Session ids survive owner-boundary replacement, so the Session object alone
+ * is not enough to reject a late retry for a newer turn on the same instance.
+ */
+const sessionTurnBoundaryGenerationById = new Map<string, number>();
+
+interface DirectAbortReconcileBoundary {
+  session: WiredSession;
+  generation: number;
+  turnId: string | null;
+  retryTimer: ReturnType<typeof setTimeout> | null;
+}
+
+/** One direct ABORT_SESSION retry chain per session; a newer abort supersedes the old one. */
+const directAbortReconcileBoundaries = new Map<string, DirectAbortReconcileBoundary>();
+const DIRECT_ABORT_RECONCILE_RETRY_DELAY_MS = 250;
+
+function currentSessionTurnBoundaryGeneration(sessionId: string): number {
+  return sessionTurnBoundaryGenerationById.get(sessionId) ?? 0;
+}
+
+function advanceSessionTurnBoundaryGeneration(sessionId: string): number {
+  const next = currentSessionTurnBoundaryGeneration(sessionId) + 1;
+  sessionTurnBoundaryGenerationById.set(sessionId, next);
+  return next;
+}
+
+function cancelDirectAbortReconciliation(
+  sessionId: string,
+  expected?: DirectAbortReconcileBoundary,
+): void {
+  const boundary = directAbortReconcileBoundaries.get(sessionId);
+  if (!boundary || (expected && boundary !== expected)) return;
+  if (boundary.retryTimer) clearTimeout(boundary.retryTimer);
+  boundary.retryTimer = null;
+  directAbortReconcileBoundaries.delete(sessionId);
+}
 
 /**
  * SDK result 事件的 total_cost_usd 是 session 累计 (不是 per-turn) ——
@@ -1790,6 +2005,17 @@ const rewindInputSessions = new Set<string>();
 const SESSION_REWIND_INPUT_LOCK_ID = 'session-rewind';
 const SESSION_REWIND_STOP_TIMEOUT_MS = 15_000;
 let pendingCredentialSwitchHolder: PendingCredentialSwitchService | null = null;
+function settlePendingCredentialSwitch(sessionId: string, source: string): void {
+  const pending = pendingCredentialSwitchHolder?.onTurnSettled(sessionId);
+  if (!pending) return;
+  void pending.catch((err) => {
+    log.warn('pending credential switch settle failed', {
+      sessionId,
+      source,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+}
 // turn 收口时对远端 codex MCP 做一次 best-effort ensure 的钩子 (live turn
 // 期间被推迟的 daemon bootstrap 在 idle 时点补刀)。真实现定义在
 // registerMakerIpcs 闭包内 (依赖 maker / ensure 函数), 模块级 turn 收口
@@ -1894,6 +2120,16 @@ export function isSessionInTurn(sessionId: string): boolean {
 }
 
 /**
+ * 标题素材读取需要覆盖 `status:isRunning=false` 到 terminal event 的短窗口：
+ * 逻辑 running 已结束，但最后一条 Assistant 还没有拿到 durable turn seal。
+ * dispatch boundary 正好在 terminal delivery 后才释放，不改变全局
+ * `isSessionInTurn` 的产品语义。
+ */
+export function isSessionTurnPendingCompletion(sessionId: string): boolean {
+  return sessionTurnActivityTracker.isSessionTurnDispatchBoundaryBusy(sessionId);
+}
+
+/**
  * 数据 owner 边界(登出 / 切账号)时丢弃跨 owner 的延迟 Codex 重启登记。
  * IPC handler 与本模块 holder 随进程存活,而具体 Maker 在 owner 边界被整体替换
  * (dynamic facade)—— 旧 owner 的记忆设置变更不得在新 owner 的 Maker 上兑现
@@ -1968,7 +2204,7 @@ export async function registerPendingCredentialSwitchForSession(
   const prevModel = live?.model ?? prevRow?.model ?? null;
   service.register(sessionId, {
     ...target,
-    ...(dbAgentKind ? { agentKind: dbAgentKind === 'cc' ? 'claude-code' as const : 'codex' as const } : {}),
+    ...(dbAgentKind ? { agentKind: dbToMakerAgentKind(dbAgentKind) } : {}),
     ...(prevModel
       ? {
           previousRoute: {
@@ -2118,7 +2354,16 @@ function handleAgentIslandEventAfterBroadcast(
       service.deferRemoteAuthRetryError(meta, event);
       return;
     }
-    service.handleAgentEvent(meta, event);
+    const terminalError = event.type === 'error' && isTerminalTurnErrorEvent(event);
+    const suppressErrorSound = terminalError && (
+      agentInputCoordinatorHolder?.isAutoResumePending(session.id) === true ||
+      agentInputCoordinatorHolder?.isAutoResumeDeferred(session.id) === true
+    );
+    service.handleAgentEvent(meta, event, {
+      // The auto-resume decision owns this one failure transition. A later
+      // retry failure is evaluated independently and sounds normally if final.
+      suppressErrorSound,
+    });
   } catch (error) {
     log.warn('Agent Island event update failed after maker event broadcast', {
       sessionId: session.id,
@@ -2335,8 +2580,8 @@ export function anySessionInTurn(maker?: Pick<Maker, 'listActiveSessions'> | nul
  * /goal 生命周期旁路(setter 注入避免 register↔goal-host 环):
  *  - goalClearObserver:clear-context(INPUT_CLEAR_SESSION)时清除该会话目标(上下文已抹,目标失去依据)。
  *  - goalIdleObserver:会话 turn 收尾(idle)时让 controller 兜底续跑 active 目标(#9,race-free,见 controller.maybeContinueActiveGoal)。
- *  - goalStopObserver:用户 Stop 当前 turn(ABORT_SESSION)时把 active 目标暂停。**在 sess.abort()
- *    之前 await** —— 让 pauseGoal 先置 paused + detach 监听,abort 产生的终止事件不再触达目标续跑判定。
+ *  - goalStopObserver:用户 Stop 当前 turn(ABORT_SESSION)时把 active 目标暂停。调用 observer
+ *    会同步 detach 监听/续跑资格；paused 持久化与 vendor abort 并行，回执等落盘收口。
  * bootstrap 在启动期接上 getGoalController()?.clearGoal / maybeContinueActiveGoal / pauseGoal。
  */
 let goalClearObserver: ((sessionId: string) => void) | null = null;
@@ -2352,6 +2597,21 @@ export function setGoalStopObserver(
   observer: ((sessionId: string) => void | Promise<void>) | null,
 ): void {
   goalStopObserver = observer;
+}
+
+/** Goal 的同步 detach 是 Stop 边界；vendor abort 先启动，IPC 回执等待 paused 落定。 */
+async function pauseGoalBeforeExplicitStop(sessionId: string): Promise<void> {
+  const observer = goalStopObserver;
+  if (!observer) return;
+  try {
+    await Promise.resolve(observer(sessionId));
+  } catch (err) {
+    log.error('goal pause persistence failed during explicit stop', {
+      sessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throwIpcError('INTERNAL', 'Failed to persist the stopped Goal state');
+  }
 }
 // (Option B)用户答完 AskUserQuestion 时,把结构化答案 + 本次问题(含选项)交给 goal controller
 // 即时改写目标(仅首轮、且确认这次问的就是"目标澄清问题"时,controller 内部再 guard)。
@@ -2467,7 +2727,7 @@ function settleSilentStopDone(sessionId: string, reason: 'exhausted' | 'skip' | 
   sessionTurnActivityTracker.scheduleIdleAfterTerminalBroadcast(sessionId);
   noteClaudeSessionTurnState(sessionId, false);
   agentInputCoordinatorHolder?.onTurnEvent(sessionId, 'done');
-  void pendingCredentialSwitchHolder?.onTurnSettled(sessionId);
+  settlePendingCredentialSwitch(sessionId, `silent-stop:${reason}`);
   deferredCodexRestartHolder?.onSessionSettled();
   agentInputCoordinatorHolder?.onExternalTurnSettled(sessionId);
   refreshRemoteCodexMcpOnTurnSettledHolder?.(sessionId);
@@ -2598,19 +2858,30 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
     return;
   }
   if (existing) {
+    // A runtime replacement invalidates any delayed direct-abort callback that
+    // still belongs to the old Session instance.
+    cancelDirectAbortReconciliation(session.id);
     for (const dispose of existing.disposers) dispose();
     existing.session.setInteractionListener(null);
   }
+  advanceSessionTurnBoundaryGeneration(session.id);
   const registration: WiredSessionRegistration = { session, disposers: [] };
   wiredSessionsById.set(session.id, registration);
 
   // session-agent-switch:登记本会话当前引擎,broadcaster / user 行落库据此逐行
   // stamp messages.agent_kind(切换后历史行的 agent_meta 必须按写入时引擎解析)。
-  noteSessionAgentKind(session.id, session.agentKind === 'codex' ? 'codex' : 'cc');
+  noteSessionAgentKind(session.id, makerToDbAgentKind(session.agentKind));
 
   // 订阅槽①旁听 tap(独立监听,叠加在主转发之外互不干扰):AgentEvent →
   // did-turn-*。资格(用户主会话)与自动化轮次过滤都在 tap 内部,这里零逻辑。
   const ghostSessionTap = createGhostSessionTap(session.id);
+  // 拆线收口:实例替换(上面的 existing.disposers)与会话关闭(下面 closed 的
+  // finally)两条路径都要给插件补上缺失的 did-turn-end 与在场审批的 end,否则订阅方
+  // 的「AI 在忙 / 在等审批」外层状态永久卡住。observer 也在这里摘掉。
+  registration.disposers.push(() => {
+    ghostSessionTap.dispose();
+    installInteractionLifecycleObserver(session, null);
+  });
   registration.disposers.push(session.onEvent((event: AgentEvent) => {
     ghostSessionTap.handleEvent(
       event as { type: string; data?: unknown; source?: string; turnOrigin?: { kind?: string } },
@@ -2620,7 +2891,27 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
   // 转发事件到所有 window。interaction_dismissed 单独走专用 channel,
   // 让 renderer chat store 不必扫所有 vendor-raw 找它。
   registration.disposers.push(session.onEvent((event: AgentEvent) => {
-    const broadcastEvent = redactEventForRenderer(event);
+    let attributedEvent = event;
+    if (event.type === 'error' && isTerminalTurnErrorEvent(event)) {
+      const reason = !session.remoteHostId && session.agentKind === 'claude-code'
+        ? consumeClaudeGatewayOpusPlanMismatch(session.id)
+        : null;
+      if (reason) {
+        const eventData = event.data && typeof event.data === 'object' && !Array.isArray(event.data)
+          ? (event.data as Record<string, unknown>)
+          : {};
+        attributedEvent = {
+          ...event,
+          data: { ...eventData, reason },
+        };
+        log.warn('Claude Opus plan error attributed to XD Gateway route', {
+          sessionId: session.id,
+          model: session.model,
+          reason,
+        });
+      }
+    }
+    const broadcastEvent = redactEventForRenderer(attributedEvent);
     if (event.type === 'interaction_dismissed') {
       const data = event.data as { requestId?: unknown; reason?: unknown };
       if (typeof data.requestId === 'string') {
@@ -2685,6 +2976,7 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
         interruptedTurnAutoResumeGuard.noteTurnStarted(session.id);
         const wasInTurn = sessionTurnActivityTracker.isSessionInTurn(session.id);
         sessionTurnActivityTracker.setSessionInTurn(session.id, data.isRunning);
+        if (!wasInTurn) advanceSessionTurnBoundaryGeneration(session.id);
         // 后台活动检测:turn 开始 → 该会话的 API 流量回归主线,后台横幅熄灭。
         noteClaudeSessionTurnState(session.id, true);
         if (!wasInTurn) {
@@ -2700,7 +2992,10 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
           // agent 跑在远端;device-link 被控会话不进本进程 maker-core,天然不经过。
           markSessionTurnStarted(session.id);
         }
-        if ((event.source === 'claude-code' || event.source === 'codex') && !turnModelPromiseBySession.has(session.id)) {
+        if (
+          (event.source === 'claude-code' || event.source === 'codex' || event.source === 'pi')
+          && !turnModelPromiseBySession.has(session.id)
+        ) {
           turnModelPromiseBySession.set(session.id, readSessionModelForUsage(session.id));
         }
       } else if (data.isRunning === false) {
@@ -2761,11 +3056,11 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
       // EVENT broadcast 后结束逻辑 turn，并保留 terminal grace 给 renderer 收尾；
       // 可重试 error 保持 running。
       shouldMarkTurnTerminalIdleAfterBroadcast = true;
-      if (event.source === 'claude-code' || event.source === 'codex') {
+      if (event.source === 'claude-code' || event.source === 'codex' || event.source === 'pi') {
         turnModelPromiseBySession.delete(session.id);
       }
-      const errData = event.type === 'error'
-        ? (event.data as
+      const errData = attributedEvent.type === 'error'
+        ? (attributedEvent.data as
             | { message?: unknown; reason?: unknown; sdkError?: unknown; errorStatus?: unknown }
             | undefined)
         : undefined;
@@ -2896,7 +3191,7 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
       // 提前唤醒会让 apply/重试读到 isSessionInTurn=true 而空转,退化到 10s 兜底
       // (review P2 2026-07-04)。apply 内部串行 + 幂等,fire-and-forget 安全;
       // planned upgrade close 等场景多唤一次也只是 no-op。
-      void pendingCredentialSwitchHolder?.onTurnSettled(session.id);
+      settlePendingCredentialSwitch(session.id, `event:${event.type}`);
       deferredCodexRestartHolder?.onSessionSettled();
       agentInputCoordinatorHolder?.onExternalTurnSettled(session.id);
       refreshRemoteCodexMcpOnTurnSettledHolder?.(session.id);
@@ -2919,12 +3214,15 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
     //
     // 可重试 error 仍属于同一 turn，不能 reset lastAgentMeta / tool_result 配对状态；
     // 否则未来出现 turn 中途的非终止型 error 时会打断后续 tool_result 关联。
-    // 本 turn 最后一条 assistant 的 persistId(挂 per-turn 费用用)。terminal error
-    // 也 consume(丢弃),防 persistId 串到下一轮;纯 tool 轮为 undefined。
+    // 本 turn 最后一条 assistant 的 persistId(挂 per-turn 费用 / turn 边界用)。terminal
+    // error 同样 consume，写失败 seal 后再按需交接给 paired done；纯 tool 轮为 undefined。
     let turnAssistantPersistId: string | undefined;
+    let turnBoundaryAssistantPersistId: string | undefined;
+    let isPairedFailedTurnDone = false;
     if (event.type === 'done' || isTerminalTurnErrorEvent(event)) {
       flushAssistantBlock(session.id, eventAgentMeta);
       turnAssistantPersistId = consumeLastAssistantPersistId(session.id);
+      turnBoundaryAssistantPersistId = consumeLastTopLevelAssistantPersistId(session.id);
       if (isTerminalTurnErrorEvent(event) && event.type !== 'done') {
         // 失败 turn: 记账发生在稍后的配对 done(usage 在那条事件上), 把这里
         // consume 到的 persistId 交接过去(见 pendingFailedTurnAssistantPersistId)。
@@ -2934,14 +3232,23 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
       } else {
         // done: 优先本事件 consume 的 id, 失败 turn 场景回收交接的 id;
         // 无论用没用到都清掉, 防残留错配下一轮。
-        turnAssistantPersistId ??= pendingFailedTurnAssistantPersistId.get(session.id);
+        const pendingFailedPersistId = pendingFailedTurnAssistantPersistId.get(session.id);
+        if (!turnAssistantPersistId && pendingFailedPersistId) {
+          turnAssistantPersistId = pendingFailedPersistId;
+          isPairedFailedTurnDone = true;
+        }
         pendingFailedTurnAssistantPersistId.delete(session.id);
       }
       flushOrphanToolResults(session.id, eventAgentMeta);
-      if (event.type === 'done' && turnAssistantPersistId) {
+      if (turnBoundaryAssistantPersistId) {
         // 在同一 durable FIFO 内先盖 turn seal、再复用 local-db:messages:created 广播
-        // 更新后的完整行；无需新增 IPC / device-link channel。
-        void markAssistantTurnCompleted(session.id, turnAssistantPersistId);
+        // 更新后的完整行。失败轮的 paired done 只复用 id 做 usage 记账，不能把
+        // terminal error 已写的 false seal 覆盖成 true、让施工播报重新进入标题素材。
+        if (event.type !== 'done') {
+          void markAssistantTurnFailed(session.id, turnBoundaryAssistantPersistId);
+        } else if (!isPairedFailedTurnDone) {
+          void markAssistantTurnCompleted(session.id, turnBoundaryAssistantPersistId);
+        }
       }
       // error 行在 flushOrphanToolResults 之后入队,保证 orphan tool_result 排在
       // error 行之前(历史时间线:tool 输出 → 错误卡,而非错误卡插到 tool 输出之前)。
@@ -2967,14 +3274,18 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
       ) {
         onTurnErrorEvent(
           session.id,
-          event.data as { message?: unknown; reason?: unknown; sdkError?: unknown } | null,
+          attributedEvent.data as {
+            message?: unknown;
+            reason?: unknown;
+            sdkError?: unknown;
+          } | null,
           eventAgentMeta,
         );
       }
       // 压住的错误详情必须在这里存一份:决策推迟场景下 onResumableTurnError 还没被调用过
       // (它自己那份 set 发生在接管成立时),不存就无从补落。同 clientId 内容,覆盖无害。
       if (autoResumeSuppressesPersist) {
-        autoResumeBookkeeping.stashSuppressedError(session.id, event.data);
+        autoResumeBookkeeping.stashSuppressedError(session.id, attributedEvent.data);
       }
       // deferred 路径保存 turn 开始时刻:isRemoteAuthRetry 时 onTurnErrorEvent 被跳过，
       // renderer 会稍后调 persistTurnErrorDeferred IPC。在 resetTurnPersistState 清掉
@@ -3085,6 +3396,20 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
       // 判定主线被上游静默替换(如 fable-5 高负载被路由到 opus-4-8),把标记挂到本轮
       // 收尾 assistant 的 agent_meta 上(AssistantMessage 渲染降级提示行)。
       // fire-and-forget,与记账 sink 互不阻塞;判定纯函数见 shared/modelMismatch.ts。
+      if (modelUsageDeltas && detectOutputLag(modelUsageDeltas)) {
+        // 上游在 done 时点还没结算本轮输出(实测 Vertex),这一轮的费用会偏低、下一轮偏高。
+        // 总量不丢,只是归属错位;不做纠正的理由见 usage/modelUsageDelta 文件头。
+        log.warn(
+          `turn output likely lagging upstream settlement (session=${session.id}): ` +
+            modelUsageDeltas
+              .map(
+                (d) =>
+                  `${d.model} out=${d.outputTokensDelta} in=${d.inputTokensDelta} ` +
+                  `cacheRead=${d.cacheReadTokensDelta} cacheCreate=${d.cacheCreateTokensDelta}`,
+              )
+              .join('; '),
+        );
+      }
       if (turnAssistantPersistId && modelUsageDeltas && modelUsageDeltas.length > 0) {
         const mismatchClientId = turnAssistantPersistId;
         const actualEntries = modelUsageDeltas.map((d) => ({
@@ -3112,6 +3437,14 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
           const sessionProviderForBilling = getSessionProvider(session.id);
           const observedClaudeRoute =
             sessionProviderForBilling == null ? readClaudeSessionRoute(session.id) : null;
+          const explicitProviderBillingRoute = billingRouteForExplicitProvider(
+            sessionProviderForBilling,
+            sessionProviderForBilling
+              ? getActiveCatalog().providers.find(
+                  (provider) => provider.id === sessionProviderForBilling,
+                )?.access?.kind
+              : null,
+          );
           const isClaudeSubscriptionSession = !session.remoteHostId && (
             sessionProviderForBilling === 'anthropic'
             || (
@@ -3125,11 +3458,8 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
             ? 'unknown'
             : isClaudeSubscriptionSession
               ? 'subscription'
-              : sessionProviderForBilling === 'xd' || observedClaudeRoute === 'gateway'
-                ? 'xd-gateway'
-                : sessionProviderForBilling
-                  ? 'provider-api'
-                  : 'unknown';
+              : explicitProviderBillingRoute
+                ?? (observedClaudeRoute === 'gateway' ? 'xd-gateway' : 'unknown');
           const pricing =
             billingRoute === 'xd-gateway'
               ? await getModelPricingForModel(
@@ -3137,7 +3467,7 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
                   normalizeModelIdForPricing(deltas[0]?.model),
                 )
               : await getModelPricing();
-          const { turnMoney, perModel } = resolveClaudeTurnCostSinks(
+          const { turnMoney, estimatedTurnMoney, perModel } = resolveClaudeTurnCostSinks(
             deltas,
             pricing,
             {
@@ -3161,17 +3491,19 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
             modelUsageWrites.push(recordModelTurnUsage({
               agentKind: 'claude-code',
               model: isClaudeSubscriptionValueRow ? claudeSubscriptionUsageModelKey(m.model) : m.model,
-              money: m.money,
+              // daily_model_usage does not persist RegionalMoney.kind. Keep reference estimates
+              // out of this actual-cost row so they cannot be reconstructed as real API spend.
+              money: m.money?.kind === 'actual-cost' ? m.money : null,
               inputTokensDelta: m.deltas.inputTokens,
               outputTokensDelta: m.deltas.outputTokens,
               cacheReadTokensDelta: m.deltas.cacheReadTokens,
               cacheCreateTokensDelta: m.deltas.cacheCreateTokens,
             }));
           }
-          // 纯订阅轮 (turnTotalUsd=0) 不走 recordTurnSpend, 没有任何 usage push ——
-          // 等模型行落库后重广播今日 spend 快照, 通知已打开的首页仪表盘刷新
-          // (对齐 codex 订阅轮的 rebroadcastCodexTodayUsage)。
-          if (hasSubscriptionValueRow && !turnMoney) {
+          // 无真实费用、但产生订阅价值或 provider 参考估值的轮次不走
+          // recordTurnSpend。等模型行落库后重广播今日 spend 快照,通知已打开的首页
+          // 仪表盘刷新(对齐 codex 订阅轮的 rebroadcastCodexTodayUsage)。
+          if ((hasSubscriptionValueRow || estimatedTurnMoney) && !turnMoney) {
             void Promise.allSettled(modelUsageWrites).then(() => rebroadcastTodaySpend());
           }
           if (turnMoney && turnMoney.amount > 0) {
@@ -3191,19 +3523,22 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
             });
             if (changedScheduleId) broadcastSchedulerChanged(changedScheduleId);
           } else if (turnAssistantPersistId) {
-            // 纯订阅轮(无真实计费)的「本轮价值」估算,挂到消息(isEstimate:true,chip 的
+            // 无真实计费轮的「本轮价值」估算,挂到消息(isEstimate:true,chip 的
             // "本会话价值"由 useSessionEstimatedValue 汇总),不进 daily_spend /
-            // sessions.total_cost_usd(那些是真实账单)。两类订阅同轮可叠加(如 Claude 订阅
-            // 主会话 + bridge 订阅子 agent):
+            // sessions.total_cost_usd(那些是真实账单)。provider 参考价与两类订阅估值
+            // 可叠加(如 Claude 订阅主会话 + bridge 订阅子 agent):
+            //   - provider-api 参考价:远程目录中的公开参考价,不是供应商真实账单;
             //   - bridge 订阅模型(chatgpt/ / xai/,source==='subscription'):静态参考价折算;
             //   - Claude 订阅会话(显式选 Anthropic,SDK 自报 cost=0):Anthropic 牌价折算
             //     (纯 Anthropic 轮 pricing 为 null → 家族牌价兜底表,不为估值发起网络请求)。
             // 混合轮(真实计费 > 0)走上面的真实分支,订阅部分不另挂估算 —— 一条消息只有一个
             // cost 字段,真实计费优先;订阅 token 明细仍在 turnUsageDetails.perModelCost 里。
-            const estimatedValues: RegionalMoney[] = [];
+            const estimatedValues: RegionalMoney[] = estimatedTurnMoney
+              ? [estimatedTurnMoney]
+              : [];
             for (const m of perModel) {
               if (m.source !== 'subscription') continue;
-              const quote = getSubscriptionDirectValuePrice(m.model);
+              const quote = getSubscriptionDirectValuePrice(m.model, 'claude-code', pricing);
               const value = computePriceQuoteTurnMoney(
                 m.deltas,
                 quote ?? undefined,
@@ -3215,6 +3550,7 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
               const claudeEstimated = estimateClaudeSubscriptionTurnValue(
                 perModel,
                 currentLedgerCurrency(),
+                await getModelPricing(),
               );
               if (claudeEstimated?.amount) estimatedValues.push(claudeEstimated);
             }
@@ -3222,8 +3558,8 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
               estimatedValues.length > 0
                 ? addRegionalMoney(estimatedValues)
                 : null;
+            const turnUsageDetails = buildClaudeTurnUsageDetails(doneData?.usage, deltas, 'unknown', perModel);
             if (turnEstimatedValue && turnEstimatedValue.amount > 0) {
-              const turnUsageDetails = buildClaudeTurnUsageDetails(doneData?.usage, deltas, 'unknown', perModel);
               const changedScheduleId = await recordSchedulerTurnCost({
                 sessionId: session.id,
                 clientId: turnAssistantPersistId,
@@ -3232,6 +3568,14 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
                 turnOrigin: event.turnOrigin,
               });
               if (changedScheduleId) broadcastSchedulerChanged(changedScheduleId);
+            } else {
+              // 真实计费与订阅估值都拿不到(典型:网关目录整体不下发价格、模型不在价表)
+              // —— 钱没有,但 token 明细是算好的,落下来让 UI 退回显示本轮 token。
+              await recordTurnUsageOnMessage({
+                sessionId: session.id,
+                clientId: turnAssistantPersistId,
+                turnUsageDetails,
+              });
             }
           }
         })();
@@ -3239,46 +3583,70 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
         // 窄兜底: 罕见地 done 只带 total_cost_usd、没 modelUsage —— 拆不了 daily_model_usage,
         // 但至少用累计差把总额 / session / message 记上, 别漏整轮 (review #4)。
         const rawDelta = Math.max(0, cumulative - prevReportedCost);
-        if (rawDelta > 0) {
-          void (async () => {
-            let resolvedModel = 'unknown';
-            try {
-              const model = await modelPromise;
-              resolvedModel = model;
-            } catch { /* non-fatal: 保留 SDK 原始 cost */ }
-            // 订阅直连轮(chatgpt/ / xai/)走窄兜底时: 真实计费恒 0, 不写 daily_spend /
-            // sessions.total_cost_usd(与主路径 resolveTurnCost 的 subscription gate 同口径,
-            // 避免把订阅 SDK 自报 cost 误记进计费)。
-            if (isSubscriptionDirectModel(resolvedModel)) return;
-            const providerId = getSessionProvider(session.id);
-            const observedRoute =
-              providerId == null ? readClaudeSessionRoute(session.id) : null;
-            const route: BillingRoute = session.remoteHostId
-              ? 'unknown'
-              : providerId === 'anthropic' || observedRoute === 'subscription'
-                ? 'subscription'
-                : providerId === 'xd' || observedRoute === 'gateway'
-                  ? 'xd-gateway'
-                  : providerId
-                    ? 'provider-api'
-                    : 'unknown';
-            if (route === 'subscription' || route === 'xd-gateway') return;
-            const ledgerCurrency =
-              (await getGatewayAccountCurrency()) ?? currentLedgerCurrency();
-            const money = usdToLedgerCurrency(rawDelta, ledgerCurrency);
-            const turnUsageDetails = buildClaudeTurnUsageDetails(doneData?.usage, undefined, resolvedModel);
-            recordTurnSpend(money);
-            recordSessionTurnSpend(session.id, money);
-            const changedScheduleId = await recordSchedulerTurnCost({
+        void (async () => {
+          let resolvedModel = 'unknown';
+          try {
+            const model = await modelPromise;
+            resolvedModel = model;
+          } catch { /* non-fatal: 保留 SDK 原始 cost */ }
+          const turnUsageDetails = buildClaudeTurnUsageDetails(doneData?.usage, undefined, resolvedModel);
+          // 本分支有三个"记不了钱"的出口(本轮 cost 未增长 / 订阅直连 / 订阅与网关路由),
+          // 账本口径一个字不改,但都把本轮 token 明细落下来 —— 钱算不出来不代表用量
+          // 算不出来,UI 那一格据此退回显示 token 而不是空着。
+          const recordUsageOnly = async () => {
+            if (!turnAssistantPersistId) return;
+            await recordTurnUsageOnMessage({
               sessionId: session.id,
               clientId: turnAssistantPersistId,
-              money,
               turnUsageDetails,
-              turnOrigin: event.turnOrigin,
             });
-            if (changedScheduleId) broadcastSchedulerChanged(changedScheduleId);
-          })();
-        }
+          };
+          if (rawDelta <= 0) {
+            await recordUsageOnly();
+            return;
+          }
+          const providerId = getSessionProvider(session.id);
+          const observedRoute =
+            providerId == null ? readClaudeSessionRoute(session.id) : null;
+          const explicitProviderRoute = billingRouteForExplicitProvider(
+            providerId,
+            providerId
+              ? getActiveCatalog().providers.find((provider) => provider.id === providerId)
+                  ?.access?.kind
+              : null,
+          );
+          const route: BillingRoute = session.remoteHostId
+            ? 'unknown'
+            : providerId === 'anthropic' || observedRoute === 'subscription'
+              ? 'subscription'
+              : explicitProviderRoute
+                ?? (observedRoute === 'gateway' ? 'xd-gateway' : 'unknown');
+          // 订阅直连轮(chatgpt/ / xai/)走窄兜底时: 真实计费恒 0, 不写 daily_spend /
+          // sessions.total_cost_usd(与主路径 resolveTurnCost 的 subscription gate 同口径,
+          // 避免把订阅 SDK 自报 cost 误记进计费)。但显式 provider-api 是权威路由:
+          // 自定义 API 供应商可能供应带订阅前缀的模型 id,不能按前缀把真实费用判掉。
+          if (route !== 'provider-api' && isSubscriptionDirectModel(resolvedModel)) {
+            await recordUsageOnly();
+            return;
+          }
+          if (route === 'subscription' || route === 'xd-gateway') {
+            await recordUsageOnly();
+            return;
+          }
+          const ledgerCurrency =
+            (await getGatewayAccountCurrency()) ?? currentLedgerCurrency();
+          const money = usdToLedgerCurrency(rawDelta, ledgerCurrency);
+          recordTurnSpend(money);
+          recordSessionTurnSpend(session.id, money);
+          const changedScheduleId = await recordSchedulerTurnCost({
+            sessionId: session.id,
+            clientId: turnAssistantPersistId,
+            money,
+            turnUsageDetails,
+            turnOrigin: event.turnOrigin,
+          });
+          if (changedScheduleId) broadcastSchedulerChanged(changedScheduleId);
+        })();
       }
       // 与 spend 记账并列的另一个 turn-done side-effect: 刷新 Claude 账号月度配额
       // (LiteLLM /v2/user/info)。fire-and-forget, 模块内 2s 超时 + 10s 节流。
@@ -3355,13 +3723,32 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
               isCodexBudgetRoute ||
               (sessionProvider === 'xd' && hasGatewayKey)
             );
+          // 显式来源的订阅判定以目录 access.kind 为权威(内置 anthropic 的 Claude.ai
+          // 订阅同样是订阅价值,不能只认 OpenAI/xAI);目录缺 access 的旧快照仍靠下面
+          // 的 openai oauth 分支兜底。
+          const sessionProviderAccessKind = sessionProvider
+            ? getActiveCatalog().providers.find((provider) => provider.id === sessionProvider)
+                ?.access?.kind
+            : null;
+          const isCodexSubscriptionAccessRoute =
+            !isRemoteCodexSession &&
+            sessionProvider != null &&
+            sessionProvider !== 'xd' &&
+            sessionProviderAccessKind === 'subscription' &&
+            !hasEffectiveGatewayRoute;
           const isSubscriptionValue = isRemoteCodexSession ||
             isCodexXaiProviderRoute ||
+            isCodexSubscriptionAccessRoute ||
             (
               isCodexOpenAiProviderRoute
               && codexAuthInjection === 'oauth-bearer'
               && !hasEffectiveGatewayRoute
             );
+          const usesReferencePriceEstimate =
+            !isSubscriptionValue &&
+            !isRemoteCodexSession &&
+            !hasEffectiveGatewayRoute &&
+            Boolean(sessionProvider && sessionProvider !== 'xd');
           const modelUsageKey = isSubscriptionValue
             ? codexSubscriptionUsageModelKey(pricingModel)
             : codexApiUsageModelKey(pricingModel);
@@ -3381,26 +3768,59 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
           // 避免 scheduler 的 Cost 汇总混入订阅价值或远端账号消耗。
           // fire-and-forget 不阻塞事件循环;价格表走 main 端内存 + 磁盘缓存,
           // stale 快返并后台刷新,
-          // 拉不到 / 模型无条目 → 本轮不显示。
+          // 拉不到 / 模型无条目 → 只落 token 明细,UI 退回显示本轮 token。
+          // 明细在 try 外构造:它只依赖上面已拿到的 token 数,价格请求抛错时也要能落。
+          const turnUsageDetails = buildTurnUsageDetails({
+            inputTokens: promptTokens,
+            outputTokens: completionTokens,
+            cacheReadTokens: cachedTokens,
+            cacheCreateTokens: 0,
+            model: turnModel,
+          });
+          const recordCodexUsageOnly = async () => {
+            if (!turnAssistantPersistId) return;
+            await recordTurnUsageOnMessage({
+              sessionId: session.id,
+              clientId: turnAssistantPersistId,
+              turnUsageDetails,
+            });
+          };
           try {
-            const pricing = isSubscriptionValue && !isCodexXaiProviderRoute
+            const pricing = isSubscriptionValue
               ? await getModelPricing()
               : hasEffectiveGatewayRoute
                 ? await getModelPricingForModel('xd', pricingModel)
-                : null;
+                : usesReferencePriceEstimate
+                  ? await getModelPricing()
+                  : null;
+            // 订阅估值按显式来源取各自的日期定价路由:内置 anthropic 走 Anthropic
+            // registry 参考价(含 codex 侧价格覆盖),默认/openai 保持 OpenAI 价表。
+            const subscriptionValueProviderId =
+              isCodexSubscriptionAccessRoute && sessionProvider != null
+                ? sessionProvider
+                : 'openai';
             const price = isCodexXaiProviderRoute
-              ? getSubscriptionDirectValuePrice(pricingModel)
+              ? getSubscriptionDirectValuePrice(pricingModel, 'codex', pricing)
               : isSubscriptionValue
-                ? getCodexSubscriptionValuePrice(pricingModel, pricing)
+                ? getCodexProviderSubscriptionValuePrice(
+                    subscriptionValueProviderId,
+                    pricingModel,
+                    pricing,
+                  )
                 : hasEffectiveGatewayRoute
                   ? getModelPriceQuote(pricing, 'xd', pricingModel)
-                  : undefined;
+                  : usesReferencePriceEstimate
+                    ? getModelPriceQuote(pricing, sessionProvider, pricingModel, 'codex')
+                    : undefined;
             const money = computePriceQuoteTurnMoney(
               codexUsageToTokens(u),
               price ?? undefined,
               currentLedgerCurrency(),
             );
-            if (!isSubscriptionValue && money) {
+            // Only Gateway sale prices are actual API spend. Third-party/user reference quotes
+            // are value estimates and daily_model_usage cannot preserve RegionalMoney.kind, so
+            // writing them into #billing=api would later reconstruct an estimate as actual cost.
+            if (!isSubscriptionValue && money && price?.source === 'gateway') {
               await recordModelTurnUsage({
                 agentKind: 'codex',
                 model: modelUsageKey,
@@ -3411,15 +3831,9 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
                 cacheCreateTokensDelta: 0,
               });
             }
-            const turnUsageDetails = buildTurnUsageDetails({
-              inputTokens: promptTokens,
-              outputTokens: completionTokens,
-              cacheReadTokens: cachedTokens,
-              cacheCreateTokens: 0,
-              model: turnModel,
-            });
             if (money && money.amount > 0) {
-              if (!isSubscriptionValue) {
+              const isActualApiCost = !isSubscriptionValue && price?.source === 'gateway';
+              if (isActualApiCost) {
                 void recordTurnSpend(money);
                 void recordSessionTurnSpend(session.id, money);
               }
@@ -3431,9 +3845,14 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
                 turnOrigin: event.turnOrigin,
               });
               if (changedScheduleId) broadcastSchedulerChanged(changedScheduleId);
+            } else {
+              await recordCodexUsageOnly();
             }
           } catch {
             // token row 已在价格请求前落库;价格失败只影响 API cost / message cost。
+            // 消息那一格仍要有事实可看:补落一次 token 明细。patch 是 agent_meta merge、
+            // 写的又是同一份明细,所以与上面成功分支重复执行也是幂等的(自身失败只 warn)。
+            await recordCodexUsageOnly();
           }
         })();
       }
@@ -3466,46 +3885,232 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
         });
       }
     }
+    // Pi done 事件同样携带 per-turn token/cache 明细。Pi 复用 Cindy 的 provider
+    // 路由，因此计费形态必须看 session provider，而不是把它当成一个新的计费方：
+    //   openai / anthropic / xai → 用户订阅，显示剩余窗口 + 本对话价值；
+    //   xd / 默认网关            → 实际 gateway cost。
+    // usage 事实无论价格是否可解析都持久化，保证新模型也能看到 cache 命中明细。
+    if (event.type === 'done' && event.source === 'pi') {
+      const sessionProvider = getSessionProvider(session.id);
+      const modelPromise =
+        turnModelPromiseBySession.get(session.id) ?? readSessionModelForUsage(session.id);
+      turnModelPromiseBySession.delete(session.id);
+      const rawUsage = (event.data as { usage?: unknown } | undefined)?.usage;
+      if (rawUsage && typeof rawUsage === 'object') {
+        const tokens = piUsageToTokens(rawUsage as {
+          inputTokens?: number;
+          outputTokens?: number;
+          cacheReadTokens?: number;
+          cacheCreationTokens?: number;
+        });
+        const totalTokens =
+          tokens.inputTokens +
+          tokens.outputTokens +
+          tokens.cacheReadTokens +
+          tokens.cacheCreateTokens;
+        void recordSessionTurnTokens(session.id, totalTokens);
+        void (async () => {
+          let turnModel = 'unknown';
+          try {
+            turnModel = await modelPromise;
+          } catch {
+            // 模型读取失败仍持久化 token/cache，模型显示为 unknown。
+          }
+          const pricingModel = normalizeModelIdForPricing(turnModel);
+          const effectiveProvider =
+            sessionProvider ??
+            (pricingModel.startsWith(CHATGPT_MODEL_PREFIX)
+              ? 'openai'
+              : pricingModel.startsWith(XAI_MODEL_PREFIX)
+                ? 'xai'
+                : null);
+          const isSubscriptionValue =
+            effectiveProvider === 'openai'
+            || effectiveProvider === 'anthropic'
+            || effectiveProvider === 'xai'
+            || isSubscriptionDirectModel(pricingModel);
+          const turnUsageDetails = buildTurnUsageDetails({
+            ...tokens,
+            model: turnModel,
+          });
+
+          // Pi 也必须进 daily_model_usage，否则首页仪表盘会把 Pi 的
+          // token/cache 全部漏掉。先落 usage 事实，价格解析失败也不影响。
+          const modelUsageKey = isSubscriptionValue
+            ? piSubscriptionUsageModelKey(pricingModel)
+            : pricingModel;
+          await recordModelTurnUsage({
+            agentKind: 'pi',
+            model: modelUsageKey,
+            inputTokensDelta: tokens.inputTokens,
+            outputTokensDelta: tokens.outputTokens,
+            cacheReadTokensDelta: tokens.cacheReadTokens,
+            cacheCreateTokensDelta: tokens.cacheCreateTokens,
+          });
+          void rebroadcastTodaySpend();
+
+          try {
+            // 自定义(source:'user')provider——本地 Ollama / 用户自付费兼容端点——即便
+            // 模型 id 与 XD 目录重名,也不能套用 XD 网关定价当作 Cindy 消费入账;只记 token
+            // (上方已入库),不写 money(codex review)。仅 xd / 默认网关与订阅路由计费。
+            const isCustomProviderRoute = isUserProviderSession(session.id);
+            const pricing =
+              isSubscriptionValue || isCustomProviderRoute
+                ? null
+                : await getModelPricingForModel('xd', pricingModel);
+            const price =
+              effectiveProvider === 'openai'
+              || effectiveProvider === 'anthropic'
+              || effectiveProvider === 'xai'
+                ? getModelPriceQuote(null, effectiveProvider, pricingModel)
+                : isSubscriptionDirectModel(pricingModel)
+                  ? getSubscriptionDirectValuePrice(pricingModel)
+                  : isCustomProviderRoute
+                    ? null
+                    : getModelPriceQuote(pricing, 'xd', pricingModel);
+            const money = computePriceQuoteTurnMoney(
+              tokens,
+              price ?? undefined,
+              currentLedgerCurrency(),
+            );
+            if (money && money.amount > 0) {
+              if (!isSubscriptionValue) {
+                // token 已在上方入库；这里只补真实 API/gateway 费用，
+                // 避免重复累加 token。订阅价值则由 #billing=subscription 读时估算。
+                await recordModelTurnUsage({
+                  agentKind: 'pi',
+                  model: modelUsageKey,
+                  money,
+                  inputTokensDelta: 0,
+                  outputTokensDelta: 0,
+                  cacheReadTokensDelta: 0,
+                  cacheCreateTokensDelta: 0,
+                });
+                void recordTurnSpend(money);
+                void recordSessionTurnSpend(session.id, money);
+              }
+              const changedScheduleId = await recordSchedulerTurnCost({
+                sessionId: session.id,
+                clientId: turnAssistantPersistId,
+                money,
+                turnUsageDetails,
+                turnOrigin: event.turnOrigin,
+              });
+              if (changedScheduleId) broadcastSchedulerChanged(changedScheduleId);
+            } else if (turnAssistantPersistId && turnUsageDetails) {
+              await recordTurnUsageOnMessage({
+                sessionId: session.id,
+                clientId: turnAssistantPersistId,
+                turnUsageDetails,
+              });
+            }
+          } catch {
+            // 价格读取失败不能连带丢失 token/cache 事实。
+            if (turnAssistantPersistId && turnUsageDetails) {
+              await recordTurnUsageOnMessage({
+                sessionId: session.id,
+                clientId: turnAssistantPersistId,
+                turnUsageDetails,
+              });
+            }
+          }
+
+          if (effectiveProvider === 'openai') {
+            triggerCodexAccountUsageRefresh();
+          } else if (effectiveProvider === 'anthropic') {
+            triggerClaudeSubscriptionUsageRefresh();
+          } else if (effectiveProvider === 'xd' || effectiveProvider == null) {
+            void triggerClaudeAccountUsageRefresh();
+          }
+          // xAI 没有独立订阅窗口端点；Responses bridge 从响应 headers 实时更新
+          // useXaiRateLimit 消费的快照，无需额外网络请求。
+        })();
+      }
+    }
   }));
   registration.disposers.push(session.onStatusChange((status) => {
     if (wiredSessionsById.get(session.id)?.session !== session) return;
-    broadcastToAllWindows(MAKER_PUSH.STATUS_CHANGED, { sessionId: session.id, status });
+    // The local window broadcast is best-effort, but keep this guard here as
+    // well because status callbacks are a lifecycle boundary: a third-party
+    // bridge must not be able to skip session cleanup by throwing.
+    try {
+      broadcastToAllWindows(MAKER_PUSH.STATUS_CHANGED, { sessionId: session.id, status });
+    } catch (err) {
+      log.warn('session status broadcast failed', {
+        sessionId: session.id,
+        status,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
     if (status === 'closed') {
-      cleanupPendingInteractionsForSession(session.id, 'session_closed');
-      // 会话关闭同样是"终止":退避窗口有 3–20 秒,期间会话可能被独立关掉(切 agent、
-      // 远端断开、宿主回收)。只清 coordinator 不够 —— 排期中的定时器与悬空的重连记录
-      // 都还活着,前者会到点往已关闭的会话补发消息(coordinator 关闭路径保留 recovery,
-      // 补发会把用户关掉的会话重新拉起来),后者会把结果错绑到下一个会话实例(codex P1)。
-      autoResumeBookkeeping.teardown(session.id);
-      agentInputCoordinatorHolder?.onSessionClosed(session.id);
-      // 会话关闭:兑现延迟凭证切换(直接写 route),并唤醒被它挡住的等待者。
-      pendingCredentialSwitchHolder?.onSessionClosed(session.id);
-      deferredCodexRestartHolder?.onSessionSettled();
-      agentInputCoordinatorHolder?.onExternalTurnSettled(session.id);
-      refreshRemoteCodexMcpOnTurnSettledHolder?.(session.id);
-      gitSnapshotCoordinator?.onSessionClosed(session.id);
-      wiredSessionsById.delete(session.id);
-      for (const dispose of registration.disposers) dispose();
-      session.setInteractionListener(null);
-      clearOrcaMcpHydrated(session.id);
-      knownNonOrcaSessionIds.delete(session.id);
-      lastReportedCostUsdBySession.delete(session.id);
-      lastReportedModelUsageBySession.delete(session.id);
-      turnModelPromiseBySession.delete(session.id);
-      sessionTurnActivityTracker.deleteSession(session.id);
-      markSessionTurnEnded(session.id);
-      // 后台活动检测:会话进程已关闭(closeSession / 删除),清账并广播横幅熄灭。
-      clearClaudeSessionBackgroundActivity(session.id);
-      clearSessionPersistState(session.id);
-      // 进程关闭 ≠ 通知作废:临时会话调度(非 heartbeat / 非 persistentSession)在 run
-      // 终态后立刻 closeSession,此刻完成卡片刚在灵动岛上弹出来。硬删条目会让它当场
-      // 消失,所以这条路径保留仍在展示的卡片,由 dwell 到期或用户 ack 收掉。
-      handleAgentIslandSessionClosedAfterCleanup(session.id, 'process-closed');
+      try {
+        cleanupPendingInteractionsForSession(session.id, 'session_closed');
+        // 会话关闭同样是"终止":退避窗口有 3–20 秒,期间会话可能被独立关掉(切 agent、
+        // 远端断开、宿主回收)。只清 coordinator 不够 —— 排期中的定时器与悬空的重连记录
+        // 都还活着,前者会到点往已关闭的会话补发消息(coordinator 关闭路径保留 recovery,
+        // 补发会把用户关掉的会话重新拉起来),后者会把结果错绑到下一个会话实例(codex P1)。
+        autoResumeBookkeeping.teardown(session.id);
+        agentInputCoordinatorHolder?.onSessionClosed(session.id);
+        // 会话关闭:兑现延迟凭证切换(直接写 route),并唤醒被它挡住的等待者。
+        pendingCredentialSwitchHolder?.onSessionClosed(session.id);
+        deferredCodexRestartHolder?.onSessionSettled();
+        agentInputCoordinatorHolder?.onExternalTurnSettled(session.id);
+        refreshRemoteCodexMcpOnTurnSettledHolder?.(session.id);
+        gitSnapshotCoordinator?.onSessionClosed(session.id);
+        clearOrcaMcpHydrated(session.id);
+        knownNonOrcaSessionIds.delete(session.id);
+        lastReportedCostUsdBySession.delete(session.id);
+        lastReportedModelUsageBySession.delete(session.id);
+        turnModelPromiseBySession.delete(session.id);
+        // 后台活动检测:会话进程已关闭(closeSession / 删除),清账并广播横幅熄灭。
+        clearClaudeSessionBackgroundActivity(session.id);
+        clearSessionPersistState(session.id);
+        // 进程关闭 ≠ 通知作废:临时会话调度(非 heartbeat / 非 persistentSession)在 run
+        // 终态后立刻 closeSession,此刻完成卡片刚在灵动岛上弹出来。硬删条目会让它当场
+        // 消失,所以这条路径保留仍在展示的卡片,由 dwell 到期或用户 ack 收掉。
+        handleAgentIslandSessionClosedAfterCleanup(session.id, 'process-closed');
+      } catch (err) {
+        log.warn('session close cleanup failed; forcing idle reconciliation', {
+          sessionId: session.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        // Wiring teardown is independent of the best-effort product cleanup
+        // above. A single disposer or listener error must not leave a closed
+        // session reachable from the in-memory routing map.
+        cancelDirectAbortReconciliation(session.id);
+        pendingFailedTurnAssistantPersistId.delete(session.id);
+        wiredSessionsById.delete(session.id);
+        for (const dispose of registration.disposers) {
+          try {
+            dispose();
+          } catch (err) {
+            log.warn('session disposer failed during close teardown', {
+              sessionId: session.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+        try {
+          session.setInteractionListener(null);
+        } catch (err) {
+          log.warn('session interaction listener teardown failed', {
+            sessionId: session.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+        // This must run even when an owner-boundary-sensitive cleanup above
+        // rejects. A closed Session cannot keep the desktop turn boundary busy.
+        sessionTurnActivityTracker.deleteSession(session.id);
+        sessionTurnBoundaryGenerationById.delete(session.id);
+        markSessionTurnEnded(session.id);
+      }
     }
   }));
 
   // 注入 interaction listener (permission/ask/plan 三合一,renderer 按 kind 弹不同 UI)
   installDesktopInteractionListener(session);
+  installInteractionLifecycleObserver(session, ghostSessionTap.interactionObserver);
 }
 
 /**
@@ -3520,6 +4125,10 @@ export interface RegisterMakerIpcOptions {
   onAnySessionTurnKeepaliveChange?: (isRunning: boolean) => void;
   /** 由 bootstrap 注入，避免 maker-ipc → model-access → maker-host 的循环依赖。 */
   refreshXdGatewayModels(): Promise<void>;
+  /** DB 可读后仍在后台运行的账号模型发现；新建 / 懒恢复路由前必须等待。 */
+  waitForAccountProviderModelsReady(): Promise<void>;
+  /** Provider 刷新协调器已可用；紧跟 configure 发出，避免后续 handler 失败造成永久等待。 */
+  onProviderModelAutoRefreshConfigured(): void;
 }
 
 export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions): void {
@@ -3541,10 +4150,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   // 必须是本机当前可访问的目录,挡掉控制端用任意路径越权起进程或执行 git。
   setDeviceLinkRemoteWorkingDirGuard(checkRemoteWorkingDir);
 
-  // device-link 远程 set-* 持久化回流:控制端远程切 model/effort/permission/fastMode/extraDirs
-  // 时,被控端 set-* 只改运行时不落库;这里注入「写被控端 DB + 广播 patched」,让控制端镜像
-  // 收敛到被控端真相(取代控制端乐观覆盖)。必须 await DB 写入后才回 invoke-result,否则控制端会
-  // 过早同步新聊天草稿默认值,与被控端未来 resume 的真实 row 脱节。
+  // device-link 远程 set-* 持久化回流:effort/permission/fastMode/extraDirs 等
+  // runtime-only handler 经这个注入写被控端 DB + 广播 patched。SET_MODEL 是例外:
+  // 它必须在自己的 session 锁内直接调 persistSessionFields，防队列 drain 夹在
+  // runtime 切换与 DB 落盘之间。两条路径都必须 await 持久化后才回 invoke-result。
   setDeviceLinkRemoteSettingsPersist(async (sessionId, patch) => {
     try {
       await persistSessionFields(sessionId, patch);
@@ -3578,6 +4187,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       lastByVendor: p.lastByVendor,
       fastModeByModel: p.fastModeByModel,
       effortByModel: p.effortByModel,
+      // worktree 勾选记忆(vendor 无关根字段):旧 renderer 不推此字段 → false 兜底。
+      worktreeEnabled: p.worktreeEnabled === true,
     });
     broadcastNewMakerDraftChanged();
   });
@@ -3626,13 +4237,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   registerStopSessionBackgroundTasksHandler(createElectronIpcHandlerRegistry(), {
     closeSession: (sessionId) => maker.closeSession(sessionId),
     clearBackgroundActivity: clearClaudeSessionBackgroundActivity,
-    noteSessionReset: (sessionId) => {
-      silentStopAutoResumeGuard.noteSessionReset(sessionId);
-      interruptedTurnAutoResumeGuard.noteSessionReset(sessionId);
-      // 「全部停止」是会话级止损:已排期的自动续跑必须撤掉,别在用户喊停后又补发一条。
-      autoResumeBookkeeping.teardown(sessionId);
-    },
-    notifyGoalStop: (sessionId) => goalStopObserver?.(sessionId),
+    // 「全部停止」是会话级止损:已排期的自动续跑必须撤掉,别在用户喊停后又补发一条。
+    noteSessionReset: resetAutomaticRecoveryForExplicitStop,
+    notifyGoalStop: pauseGoalBeforeExplicitStop,
   });
 
   // 单个后台任务的精确停止(消息流任务卡 / 状态栏停止按钮)。只停指定 taskId,
@@ -3714,6 +4321,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       // host 级 optional 能力；旧 desktop 缺省为 false。两个 agent 查询都带回，
       // 手机读取当前 agent 快照即可决定是否展示切换入口。
       supportsSessionAgentSwitch: true,
+      // v2 因果能力：同引擎 no-op 返回 revision，后续 SET_MODEL 在 session 锁内 CAS。
+      // 新 desktop 控制端据此与只有基础切换能力的旧 host 做安全兼容门控。
+      supportsSessionAgentSwitchCas: true,
     };
   });
 
@@ -3739,8 +4349,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       active?: unknown;
       markModelChoice?: unknown;
     };
-    if (p.agent !== 'claude-code' && p.agent !== 'codex') {
-      throwIpcError('INVALID_PARAMS', 'agent must be claude-code|codex');
+    if (p.agent !== 'claude-code' && p.agent !== 'codex' && p.agent !== 'pi') {
+      throwIpcError('INVALID_PARAMS', 'agent must be claude-code|codex|pi');
     }
     if (p.providerId !== undefined && typeof p.providerId !== 'string') {
       throwIpcError('INVALID_PARAMS', 'providerId must be string');
@@ -3771,6 +4381,19 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     });
   });
 
+  // device-link 草稿「新建会话默认启用 worktree」写穿:与上面的模型 pref 同款转发模式——
+  // 被控端不直接改 newMakerDefaultsCache(那只是镜像、renderer 才是真相),把布尔转发给
+  // 自身 renderer(WORKTREE_PREF_APPLY,仅本地窗口),renderer patchDraft 写真实草稿;
+  // 变更经既有 SYNC_NEW_MAKER_DRAFT re-mirror + NEW_MAKER_DRAFT_CHANGED 回流控制端。
+  registerNewMakerWorktreePreferenceHandler(createElectronIpcHandlerRegistry(), {
+    isDeviceLinkInvoke,
+    assertTrustedCaller: (event) =>
+      assertTrustedAppRendererEvent(
+        event as Parameters<typeof assertTrustedAppRendererEvent>[0],
+      ),
+    broadcast: broadcastToAllWindows,
+  });
+
   // 旧控制端的 device-link 会话模型预设写穿兼容入口。转发给被控端 renderer 后,renderer 将值
   // 收敛到 providerModelMemory 全局预设,同时经 SYNC_SESSION_MODEL_PREF 回流供旧控制端的
   // session-scoped 镜像显示。新控制端统一走 APPLY_NEW_MAKER_DRAFT_PREF。
@@ -3787,8 +4410,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     if (typeof p.sessionId !== 'string' || !p.sessionId) {
       throwIpcError('INVALID_PARAMS', 'sessionId required');
     }
-    if (p.agent !== 'claude-code' && p.agent !== 'codex') {
-      throwIpcError('INVALID_PARAMS', 'agent must be claude-code|codex');
+    if (p.agent !== 'claude-code' && p.agent !== 'codex' && p.agent !== 'pi') {
+      throwIpcError('INVALID_PARAMS', 'agent must be claude-code|codex|pi');
     }
     if (typeof p.providerId !== 'string' || !p.providerId) {
       throwIpcError('INVALID_PARAMS', 'providerId required');
@@ -3826,7 +4449,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     };
     if (
       typeof p.sessionId !== 'string' || !p.sessionId
-      || (p.agent !== 'claude-code' && p.agent !== 'codex')
+      || (p.agent !== 'claude-code' && p.agent !== 'codex' && p.agent !== 'pi')
       || typeof p.providerId !== 'string' || !p.providerId
       || typeof p.model !== 'string' || !p.model
     ) return;
@@ -3846,6 +4469,11 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   configureProviderModelAutoRefresh({
     listProviders: (opts) => getDesktopProviderService().listProviders(opts),
     getScopeKey: () => getActiveAppSession().generation,
+    // 通知唯一出口是 active-catalog changedListener(capabilities 先对齐再广播);
+    // 这里不再补发 PROVIDER_CHANGED——no-op/拒收刷新就该是 0 次广播。
+    refreshCatalog: async () => {
+      await refreshActiveCatalogFromSource();
+    },
     refreshProvider: (providerId) =>
       refreshBuiltinProviderModels(providerId, {
         refreshXd: options.refreshXdGatewayModels,
@@ -3859,6 +4487,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         },
       }),
   });
+  options.onProviderModelAutoRefreshConfigured();
 
   registerProviderHandlers(createElectronIpcHandlerRegistry(), {
     listProviders: (opts) => getDesktopProviderService().listProviders(opts),
@@ -3866,6 +4495,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     refreshCatalog: () => refreshCustomProvidersIntoCatalog(),
     beginRouteMutation: (providerId) => beginProviderRouteMutation(providerId),
     broadcastChanged: () => broadcastToAllWindows(MAKER_PUSH.PROVIDER_CHANGED, {}),
+    listProviderIds: () => getDesktopSelectableCatalog().providers.map((provider) => provider.id),
+    setProviderOrder: (providerIds) => setProviderOrder(providerIds),
+    getProviderOrder: () => readProviderOrder(),
     listPresets: () => getActiveCatalog().presets ?? [],
     testConnection: (input) => testProviderConnection(input),
     fetchModels: (spec) => fetchProviderModels(spec),
@@ -3894,9 +4526,30 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       stageProviderDisableOverridesClear(providerId),
     // 「恢复默认」= 删除该供应商整组停用 override(configuration-and-overrides.md §4)。
     clearProviderDisableOverrides: (providerId) => clearProviderDisableOverrides(providerId),
-    // 停用写入的归属校验:入口捕获 / 持久化前复核,异步窗口内切账号即拒,防 A 的
-    // 点击写进 B 的 owner-scoped 偏好文件(PR #744 review 第七轮)。
-    currentOwnerId: () => getCurrentDataOwnerId(),
+    // 所有跨 await 的 provider 读写都捕获完整 app session；generation 能识别 A→B→A，
+    // 防止旧请求返回混合快照或写进后来重新进入的 A 会话。
+    currentOwnerSession: () => getActiveAppSession(),
+    readCustomProviderHeadersForMutation,
+    storeCustomProviderHeaders,
+    removeCustomProviderHeaders,
+    // 已存自定义供应商在该 agent 下的请求目标端点(baseUrl + 可选 modelsUrl),取自
+    // active-catalog routing。models-fetch 用它把 savedProviderId 请求钉回已存端点,
+    // 确保 main-only 密文头只发往该供应商自己的端点(安全边界在 main)。
+    readSavedProviderRoute: (providerId, agent) => {
+      const provider = getActiveCatalog().providers.find((p) => p.id === providerId);
+      if (!provider || provider.source !== 'user') return null;
+      const routing = provider.routing[agent];
+      if (!routing || routing.disabled) return null;
+      return { baseUrl: routing.upstream, modelsUrl: routing.modelsUrl ?? null };
+    },
+    getLedgerCurrency: currentLedgerCurrency,
+    readModelPriceOverride: (target) =>
+      readModelPriceOverrideView(target, getActiveCatalog().modelRegistry),
+    writeModelPriceOverride: (target, desired) =>
+      setModelPriceOverride(target, desired, getActiveCatalog().modelRegistry),
+    clearModelPriceOverride,
+    stageClearProviderModelPriceOverrides: stageProviderModelPriceOverridesClear,
+    broadcastPricingChanged: broadcastEffectiveModelPricing,
     // 通用 OAuth（目录 auth.oauth 描述符驱动）：login 成功后 best-effort 拉动态模型发现
     // (additions-only merge 进 active-catalog) 并广播 PROVIDER_CHANGED 让 UI 刷新连接态。
     oauthLogin: async (providerId, isCurrent) => {
@@ -3924,7 +4577,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         // 自定义供应商的发现结果 additions-only 持久化进配置（重启后仍在）;内置供应商走
         // 内存 augment（静态目录 first-wins）。任何一步失败都只降级为纯静态,不影响登录结果。
         try {
-          const fetched = new Map<string, { id: string; name: string }[] | null>();
+          const fetched = new Map<
+            string,
+            { id: string; name: string; contextWindow?: number }[] | null
+          >();
           let customChanged = false;
           for (const agent of provider.agents) {
             if (!isCurrent()) break;
@@ -3956,7 +4612,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
                 models.map((m) => ({
                   id: m.id,
                   name: m.name,
-                  contextWindow: 200_000,
+                  // 端点上报的窗口值优先,缺省才落 200K 保守默认(review P1):
+                  // 之前无条件写死 200K,发现的 1M 模型仍会显示并按 200K 压缩。
+                  contextWindow: m.contextWindow ?? 200_000,
+                  // 只有端点真给了才算已核实,可以拿去收敛运行期上报窗口;落 200K
+                  // 兜底的不标记 —— 否则 resolveVerifiedContextWindow 会拒收缺失
+                  // 标记的条目,inflate 的运行期值压不下来(review P1)。
+                  ...(m.contextWindow !== undefined ? { contextWindowVerified: true } : {}),
                   efforts: [],
                   defaultEffort: null,
                   group: `custom:${providerId}`,
@@ -4020,16 +4682,17 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           });
         }
       }
+      // Pi 的 MCP bridge 同样按首个会话冻结 server 集合:自定义 MCP 增删改后必须 invalidate,
+      // 否则新 Pi 会话仍暴露已删/已禁用的工具、拿不到新启用的工具(codex review P1)。
+      // 与 codex 分支独立(不依赖 codexRestarted),下一次 startSession lazy 重建。
+      invalidatePiEnvironment();
     },
   });
-  // Claude Auto 分类器错误响应(status≥400,含 4xx/5xx) → 单会话切 ask + 持久化 + 结构化提示。
-  // coordinator 内部会复核 DB 仍为 auto,并按 session 去重;listener 只 fire-and-forget,
-  // 绝不阻塞 proxy 响应 pipe,也不自动重放本次 tool call。
+  // Claude 原生 Auto 分类器不可用 → 会话仍保持 Auto，只把后续审批切到 Cindy reviewer。
+  // coordinator 内部复核 DB 仍为 auto 并按 session 去重；不改偏好、不弹提示。
   const handleClaudeAutoClassifierUnavailable = createClaudeAutoPermissionFallbackCoordinator({
     getSession: (sessionId) => maker.getSession(sessionId),
     getSessionMeta: (sessionId) => maker.getSessionMeta(sessionId),
-    persistPermissionModeIfAuto: (sessionId) => persistSessionPermissionModeIfAuto(sessionId),
-    broadcast: (event) => broadcastToAllWindows(MAKER_PUSH.AUTO_PERMISSION_FALLBACK, event),
     logger: log,
   });
   setClaudeAutoClassifierUnavailableListener((signal) => {
@@ -4298,8 +4961,11 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         .from(sessions)
         .where(eq(sessions.id, o.id))
         .limit(1);
-      const providerId = row?.providerId?.trim();
-      if (providerId) o.providerId = providerId;
+      if (row) {
+        // DB null 是显式默认路由，不等于「调用方未指定」。保留该三态才能阻止
+        // Pi 在同名 BYOM 存在时把默认路由误反查成自定义来源。
+        o.providerId = row.providerId?.trim() || null;
+      }
     } catch (err) {
       log.debug('pre-hydrate session provider failed (non-fatal)', {
         sessionId: o.id,
@@ -4376,7 +5042,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           ? `provider "${providerId}" is disabled for model "${model}" in settings`
           : verdict.reason === 'capability-model'
             ? `model "${model}" is not an agent chat model`
-            : `model "${model}" is disabled in settings`,
+            : verdict.reason === 'model-retired'
+              ? `model "${model}" has been retired from the catalog`
+              : `model "${model}" is disabled in settings`,
       );
     }
     return verdict.kind === 'reroute' ? verdict.providerId : undefined;
@@ -4387,6 +5055,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     didInjectOrcaInstructions: boolean;
     didInjectProjectContext: boolean;
   }> {
+    await options.waitForAccountProviderModelsReady();
     const didInjectOrcaInstructions = applyOrcaInstructions(o);
     const didInjectProjectContext = await applyProjectContextInjection(o);
 
@@ -4526,7 +5195,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     const extraDirs = await readSessionExtraDirsFromDb(target.sessionId);
     const opts = buildCreateOptsWithStderr({
       id: row.id,
-      agentKind: row.agentKind === 'codex' ? 'codex' : 'claude-code',
+      agentKind: dbToMakerAgentKind(row.agentKind),
       workingDir: row.workingDir ?? '',
       model: row.model,
       effort: row.effort as CreateOpts['effort'],
@@ -4636,13 +5305,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     }
 
     await ensureRemoteHostReady(remoteHostIdToEnsure);
-    const ensureAgentKind: 'claude-code' | 'codex' | null =
-      session?.agentKind === 'codex' || session?.agentKind === 'claude-code'
+    const ensureAgentKind: 'claude-code' | 'codex' | 'pi' | null =
+      session?.agentKind === 'codex' || session?.agentKind === 'claude-code' || session?.agentKind === 'pi'
         ? session.agentKind
         : createOpts && typeof createOpts === 'object'
           ? (() => {
               const ak = (createOpts as { agentKind?: unknown }).agentKind;
-              return ak === 'codex' || ak === 'claude-code' ? ak : null;
+              return ak === 'codex' || ak === 'claude-code' || ak === 'pi' ? ak : null;
             })()
           : null;
     if (!ensureAgentKind) return;
@@ -4658,6 +5327,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       return;
     }
 
+    // pi 无远端(SSH)支持:capabilities 已拒 remote session,这里兜底跳过。
+    if (ensureAgentKind === 'pi') return;
     await ensureRemoteAgentInstalledOrInstall(remoteHostIdToEnsure, ensureAgentKind);
 
     // codex 远端 daemon 的 MCP 注入 (cindy_orca / orca_worker_bridge 等经 SSH
@@ -4816,6 +5487,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       allocateDialogueWorkspace: ensureDialogueWorkspaceDir,
       createSessionId: createId,
       now: Date.now,
+      withSessionLock: withSendToSessionLock,
       sendWorkerReadyMessage: (session) => {
         // Orca worker 首次创建时发一条初始化消息，强制 codex 写 rollout 文件，
         // 避免 app 重启后 thread/resume 因 rollout 缺失而失败。
@@ -4836,6 +5508,36 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       warnStderr: (agentKind, line) => log.warn(`[${agentKind}/stderr] ${line}`),
     },
   );
+
+  registerPrecreatedWorktreeDiscardHandler(makerSessionRegistry, {
+    assertCaller: (event) => {
+      // device-link 的真实调用身份由 invoke async context + allowlist 证明；本机直调仍
+      // 必须来自 Cindy 自有顶层 Renderer，不能把删除能力交给 WebView/Ghost。
+      if (!isDeviceLinkInvoke()) {
+        assertTrustedAppRendererEvent(
+          event as Parameters<typeof assertTrustedAppRendererEvent>[0],
+        );
+      }
+    },
+    withSessionLock: withSendToSessionLock,
+    isSessionClaimed: async (sessionId) => {
+      if (maker.getSession(sessionId)) return true;
+      const [row] = await getDbClient()
+        .drizzle.select({ id: sessions.id })
+        .from(sessions)
+        .where(eq(sessions.id, sessionId))
+        .limit(1);
+      return !!row;
+    },
+    discard: (sessionId, expectedPath, options) =>
+      worktreeManager.discardPrecreatedWorktree(sessionId, expectedPath, options),
+    discardByRecoveryKey: (sessionId, recoveryKey, options) =>
+      worktreeManager.discardPrecreatedWorktreeByRecoveryKey(
+        sessionId,
+        recoveryKey,
+        options,
+      ),
+  });
 
   // turn 运行中登记的切换意图(下一条消息发送时刻由 send 事务 apply)。
   const agentSwitchPending = createPendingAgentSwitchRegistry();
@@ -4860,12 +5562,14 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           model: sessions.model,
           sdkSessionId: sessions.sdkSessionId,
           providerId: sessions.providerId,
+          effort: sessions.effort,
+          fastMode: sessions.fastMode,
         })
         .from(sessions)
         .where(eq(sessions.id, sessionId))
         .limit(1);
       if (!row) return;
-      const dbMakerKind = row.agentKind === 'codex' ? 'codex' : 'claude-code';
+      const dbMakerKind = dbToMakerAgentKind(row.agentKind);
       if (co.agentKind !== dbMakerKind) {
         log.warn('lazy-create: createOpts agentKind drifted from DB (agent switch); reconciling', {
           sessionId,
@@ -4874,19 +5578,23 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         });
         co.agentKind = dbMakerKind;
       }
-      // 意图制切换下,renderer 的 createOpts 快照构建于 send 事务内 apply 之前
-      // (乐观翻转后 agentKind 可能已一致,但 model/resume/providerId 仍是旧值,
+      // 意图制切换 / 凭证形态切换下,renderer 与排队项的 createOpts 快照构建于 send
+      // 事务内 apply 之前。agentKind 可能已一致,但 model/resume/providerId/effort/fast
+      // 仍是旧值；
       // 尤其 resumeSessionId 可能是**旧引擎**的原生会话 id——resume 会以错误引擎
-      // 解释它)。lazy-create 时刻 DB 行是唯一真源,三个字段无条件对齐。
+      // 解释它)。lazy-create 时刻 DB 行是唯一真源,执行字段无条件对齐。
       co.model = row.model ?? undefined;
       co.resumeSessionId = row.sdkSessionId ?? undefined;
-      co.providerId = row.providerId ?? undefined;
+      co.providerId = row.providerId;
+      co.effort = (row.effort ?? undefined) as CreateOpts['effort'];
+      co.fastMode = !!row.fastMode;
     } catch {
       // 校正读库失败按原 opts 继续(与切换功能上线前行为一致)。
     }
   }
 
   const agentSwitchDeps: MakerSessionAgentSwitchHandlerDeps = {
+    withSessionLock: withSendToSessionLock,
     // 停用轴边界裁决:目标路由被停用 → 抛错;隐式默认落点被停用 → 返回启用替代来源。
     assertModelRouteUsable: (agent, model, providerId) =>
       assertModelRouteUsable(agent, model, providerId),
@@ -4943,10 +5651,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       }
       const co = buildCreateOptsWithStderr({
         id: sessionId,
-        agentKind: row.agentKind === 'codex' ? 'codex' : 'claude-code',
+        agentKind: dbToMakerAgentKind(row.agentKind),
         workingDir: row.workingDir,
         model: row.model ?? undefined,
-        providerId: row.providerId ?? undefined,
+        providerId: row.providerId,
         effort: (row.effort ?? undefined) as CreateOpts['effort'],
         fastMode: !!row.fastMode,
         permissionMode: (row.permissionMode ?? 'ask') as CreateOpts['permissionMode'],
@@ -4999,20 +5707,19 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     setPendingHandoff: (sessionId, handoff, expectedGeneration) =>
       agentHandoffPending.set(sessionId, handoff, expectedGeneration),
     readPendingHandoffGeneration: (sessionId) => agentHandoffPending.readGeneration(sessionId),
-    onCommitted: (
-      { sessionId, deletedClientIds, updatedAt, preview, messageCount },
-      requestedClientId,
-    ) => {
+    onCommitted: ({ sessionId, deletedClientIds, updatedAt, preview }, requestedClientId) => {
       broadcastMessageDeleted({
         sessionId,
         clientId: requestedClientId,
         clientIds: deletedClientIds,
       });
+      // 不带 _count:可见消息数不是列表的权威口径,拿它 patch 的错值会被 shallow merge 一直
+      // 留住;权威口径受删除影响只有 0 或 +1,交给 sessions:list / reseed 收敛就够。
+      // 见 commitMessageDeletion 的注释与 issue #1282。
       broadcastSessionPatched(sessionId, {
         sdkSessionId: null,
         updatedAt: new Date(updatedAt).toISOString(),
         preview,
-        _count: { messages: messageCount },
       });
     },
     withCloseSuppressed: withRehydrateCloseSuppressed,
@@ -5116,6 +5823,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         agentKind: lead?.agentKind ?? leadRow?.agentKind ?? null,
       },
       (pluginId, workingDir) => getPluginRegistry().isEnabled(pluginId, workingDir),
+      (workingDir) =>
+        matchDialogueWorkspacePath(workingDir, dialogueWorkspaceRootDir()) !== null,
     );
   }
 
@@ -5246,7 +5955,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
               return {
                 ok: false,
                 errorCode: 'INVALID_ARGS',
-                message: 'working_dir 暂不支持远程会话(远端路径无法在本机校验)',
+                message: 'working_dir 暂不支持远程任务(远端路径无法在本机校验)',
               };
             }
             const checked = await validateHandoffWorkingDir(workingDirOverride);
@@ -5298,7 +6007,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
             model: meta.model,
             effort: (row?.effort ?? undefined) as SendToSessionCreateDefaults['effort'],
             fastMode: !!row?.fastMode,
-            providerId: row?.providerId ?? undefined,
+            providerId: row?.providerId,
             // working_dir 覆盖时强制继承来源会话的权限档(review 反馈):把新目录
             // 以 Full access 打开是相对 dispatcher 的权限升级,跨项目 handoff
             // 不应隐式发生;未覆盖时保持既有缺省(bypassPermissions)不变。
@@ -5326,7 +6035,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           model: inherited.model,
           effort: inherited.effort as CreateOpts['effort'],
           fastMode: !!inherited.fastMode,
-          providerId: inherited.providerId ?? undefined,
+          providerId: inherited.providerId,
           title: newTitle,
           permissionMode: inherited.permissionMode ?? 'bypassPermissions',
         });
@@ -5829,7 +6538,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       return {
         ok: false,
         errorCode: 'NO_PRIOR_ASSISTANT',
-        message: '原会话还没有可用于分叉的 Agent 回复',
+        message: '原任务还没有可用于分叉的 Agent 回复',
       };
     }
 
@@ -5906,6 +6615,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       getGhostName: getInstalledGhostName,
       getDraftDefaults: getWorkerDefaultsFromNewMaker,
       normalizeWorkingDir: (dir) => normalizeWorkingDirForStorage(dir),
+      isUserPickedDir: isGhostPickedDir,
       isSessionBusy: isSessionInTurn,
       dispatch: async ({ targetSessionId, message }) => {
         const r = await sendToSessionInternal({ targetSessionId, message });
@@ -5948,16 +6658,19 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     createDraftSession: async (params) => {
       // draft 跟随用户在 New Maker 面板的当前选择,与用户手建草稿的默认体验
       // 一致。main 侧缓存没有"当前激活 vendor"信号,取有选择记录的一档:
-      // cc 有记录用 cc;cc 无记录而 codex 有则整套跟 codex(agentKind 一起切,
-      // 避免给 codex-only 用户建出带 Claude 默认值的 cc 会话);都没有走
-      // mapper 兜底。
+      // cc 有记录用 cc;cc 无则 codex;再无则 pi(整套跟随,避免给 pi-only 用户
+      // 建出带 Claude 默认值的会话);都没有走 mapper 兜底。
       const ccDefaults = getWorkerDefaultsFromNewMaker('claude-code');
       const codexDefaults = ccDefaults.model ? null : getWorkerDefaultsFromNewMaker('codex');
+      const piDefaults =
+        ccDefaults.model || codexDefaults?.model ? null : getWorkerDefaultsFromNewMaker('pi');
       const picked = ccDefaults.model
         ? { agentKind: 'cc' as const, d: ccDefaults }
         : codexDefaults?.model
           ? { agentKind: 'codex' as const, d: codexDefaults }
-          : null;
+          : piDefaults?.model
+            ? { agentKind: 'pi' as const, d: piDefaults }
+            : null;
       const sessionId = await createPluginDraftSession({
         ...params,
         ...(picked
@@ -6011,7 +6724,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       agentKind: meta.agentKind,
       workingDir: meta.workDir,
       model: meta.model,
-      providerId: row.providerId ?? undefined,
+      providerId: row.providerId,
       resumeSessionId: meta.sdkSessionId,
       effort: (row.effort ?? undefined) as CreateOpts['effort'],
       fastMode: !!row.fastMode,
@@ -6139,7 +6852,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       fast?: unknown;
       providerId?: unknown;
     };
-    const workerAgent: AgentKind = body.workerAgent === 'codex' ? 'codex' : 'claude-code';
+    const workerAgent: AgentKind =
+      body.workerAgent === 'codex' ? 'codex' : body.workerAgent === 'pi' ? 'pi' : 'claude-code';
     const delegateTask = typeof body.delegateTask === 'string' ? body.delegateTask : undefined;
     return enableOrcaInternal(leadSessionId, {
       workerAgent,
@@ -6283,7 +6997,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     if (typeof b.label !== 'string') throwIpcError('INVALID_PARAMS', 'label required');
     const label = normalizeOrcaWorkerLabel(b.label);
     if (!label.ok) throwIpcError('INVALID_PARAMS', label.message);
-    const agent = b.agent === 'codex' ? 'codex' as const : 'claude-code' as const;
+    const agent =
+      b.agent === 'codex' ? ('codex' as const) : b.agent === 'pi' ? ('pi' as const) : ('claude-code' as const);
     const model = typeof b.model === 'string' && b.model.length > 0 ? b.model : undefined;
     await assertLeadCollabProjectEnabled(b.leadSessionId);
     const result = await orcaLifecycleService.createWorker({
@@ -6492,7 +7207,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       if (!leadRow) return null;
       return {
         id: leadRow.id,
-        agentKind: leadRow.agentKind === 'codex' ? 'codex' : 'claude-code',
+        // 走转换正本:pi lead 不能被压成 claude-code,否则 input.agent===lead.agentKind
+        // 判等失效,pi-lead 建 pi-worker 会走错默认分支(见 orcaWorkerCreationService)。
+        agentKind: dbToMakerAgentKind(leadRow.agentKind),
+        workspaceKind: leadRow.workspaceKind,
         workingDir: leadRow.workingDir,
         model: leadRow.model,
         effort: leadRow.effort,
@@ -6511,8 +7229,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       // embedding/compression,issue #882 第 3 点)不进路由可用集 —— MCP
       // create_worker 点名它们会走既有的 INVALID_PARAMS / NO_PROVIDER 拒绝路径,
       // 而不是静默路由过去。停用的供应商已在 connectedProvidersForAgent(suspended)
-      // 一层出局。isAgentSelectableModel 现在就是 isChatEligible(+ userProvider
-      // 例外),这里的 models/fastModels/effortMetaByModel 都是
+      // 一层出局。isModelSelectableForNewRoute 同时收口 chat / disabled / retired，
+      // 这里的 models/fastModels/effortMetaByModel 都是
       // orcaWorkerCreationService 唯一能看到的 provider 快照 —— 一旦某个非聊天
       // mode 的模型混进这份 id 清单,service 内所有 `provider.models.includes(id)`
       // 式的 preflight 都只按 id 存在与否放行,永远不会知道这条模型其实是图片/
@@ -6520,10 +7238,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       // 下游 service 补(2026-07 review 第 16 轮:MCP create_worker / 缓存默认
       // 路由都走这条快照,不经过 renderer 侧选择器的过滤)。
       const routableModels = (provider: ProviderView, agent: AgentKind) =>
-        (provider.models[agent] ?? []).filter(
-          (model) =>
-            model.disabled !== true &&
-            isAgentSelectableModel(model, { userProvider: provider.source === 'user' }),
+        (provider.models[agent] ?? []).filter((model) =>
+          isModelSelectableForNewRoute(model, { userProvider: provider.source === 'user' }),
         );
       const availabilityFor = (agent: AgentKind) =>
         connectedProvidersForAgent(views, agent).map((provider) => {
@@ -6556,6 +7272,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         availability: {
           'claude-code': availabilityFor('claude-code'),
           codex: availabilityFor('codex'),
+          pi: availabilityFor('pi'),
         },
         resolveDefaultProviderIdForModel: (agent, model) => (
           effectiveSourceIdForModel(views, null, model, agent)
@@ -6916,11 +7633,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     },
     listAvailableModels: async ({ agent }) => {
       try {
-        const agents: AgentKind[] = agent ? [agent] : ['codex', 'claude-code'];
+        const agents: AgentKind[] = agent ? [agent] : ['codex', 'claude-code', 'pi'];
         const result: Record<string, Array<{ id: string; label: string }>> = {};
         for (const a of agents) {
           const caps = maker.getCapabilities(a);
-          result[a === 'codex' ? 'codex' : 'claude_code'] = caps.availableModels.map((m) => ({ id: m.id, label: m.displayName }));
+          // key 必须区分 pi,否则 pi 模型会被塞进 claude_code 键与 CC 模型混淆。
+          const key = a === 'codex' ? 'codex' : a === 'pi' ? 'pi' : 'claude_code';
+          result[key] = caps.availableModels.map((m) => ({ id: m.id, label: m.displayName }));
         }
         return { ok: true, ...result };
       } catch (err) {
@@ -6998,6 +7717,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       });
       return result;
     },
+    linkPiUserEntry: (sessionId, clientId, piEntryId) =>
+      enqueueDurableWrite(`pi-entry-link:${sessionId}:${clientId}`, () =>
+        patchMessageAgentMeta(sessionId, clientId, { piEntryId })),
     beforeDispatchDirectUserTurn: (sessionId) => gitSnapshotCoordinator?.onTurnStart(sessionId),
     onUndispatchedDirectUserTurn: (sessionId) => gitSnapshotCoordinator?.onTurnAbort(sessionId),
     ackInterruptedTurnDispatched: async (sessionId, endedAt) => {
@@ -7171,7 +7893,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         throwIpcError('INTERNAL', err instanceof Error ? err.message : 'context usage lazy create failed');
       }
     }
-    if (sess.agentKind !== 'claude-code') {
+    if (sess.agentKind !== 'claude-code' && sess.agentKind !== 'pi') {
       throwIpcError('UNSUPPORTED_CAPABILITY', `Agent ${sess.agentKind} does not support context usage`);
     }
     try {
@@ -7183,6 +7905,204 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       throwIpcError('INTERNAL', err instanceof Error ? err.message : 'context usage query failed');
     }
   });
+
+  /**
+   * Reconcile the in-memory turn boundary after a vendor abort/close when the
+   * normal terminal event was lost. The vendor Session is authoritative for
+   * whether work is still running; the desktop tracker is only an event-driven
+   * view and can remain stale across owner-boundary teardown.
+   */
+  const getStableSessionForTurnBoundary = (sessionId: string): WiredSession | null => {
+    const wired = wiredSessionsById.get(sessionId)?.session;
+    if (wired) return wired;
+    try {
+      return maker.getSession(sessionId) ?? null;
+    } catch (err) {
+      // Dynamic Maker intentionally fails closed while an account owner is
+      // being replaced. A missing stable wiring snapshot means we cannot
+      // authoritatively reconcile this session yet; callers must retain their
+      // boundary and wait for the normal close/settle path.
+      log.warn('session lookup unavailable during turn-boundary reconciliation', {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  };
+
+  const reconcileSessionTurnIdle = (sessionId: string, source: string): boolean => {
+    const sess = getStableSessionForTurnBoundary(sessionId);
+    if (!sess) return false;
+    let liveSessionIdle = false;
+    try {
+      liveSessionIdle = !sess.isTurnRunning();
+    } catch (err) {
+      log.warn('live session turn-state lookup failed during reconciliation', {
+        sessionId,
+        source,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+    if (!liveSessionIdle) return false;
+    // The vendor is authoritative that this turn is over, but no terminal event
+    // reached the host. Flush and fail-seal the latest top-level Assistant before
+    // releasing the boundary; otherwise its last progress line is later treated
+    // as a legacy final answer by title regeneration. Preserve the last Assistant
+    // id for a rare late paired done so usage attribution still has a target.
+    flushAssistantBlock(sessionId, null);
+    const abortedAssistantPersistId = consumeLastAssistantPersistId(sessionId);
+    const abortedBoundaryAssistantPersistId = consumeLastTopLevelAssistantPersistId(sessionId);
+    flushOrphanToolResults(sessionId, null);
+    if (abortedAssistantPersistId) {
+      pendingFailedTurnAssistantPersistId.set(sessionId, abortedAssistantPersistId);
+    }
+    if (abortedBoundaryAssistantPersistId) {
+      void markAssistantTurnFailed(sessionId, abortedBoundaryAssistantPersistId);
+    }
+    const trackerStale = sessionTurnActivityTracker.isSessionInTurn(sessionId) ||
+      sessionTurnActivityTracker.isSessionTurnDispatchBoundaryBusy(sessionId);
+    const hadZombieInteraction = hasPendingAgentInteractionForSession(sessionId);
+    if (trackerStale || hadZombieInteraction) {
+      log.warn('reconciling stale session turn boundary', {
+        sessionId,
+        source,
+        trackerStale,
+        hadZombieInteraction,
+        liveSessionIdle,
+      });
+    } else {
+      // The owner-boundary wiring guard can drop the isRunning=true event
+      // entirely. In that case the live Session being idle is still the
+      // authoritative proof that this abort boundary can be released.
+      log.info('confirmed live session idle during turn-boundary reconciliation', {
+        sessionId,
+        source,
+      });
+    }
+    sessionTurnActivityTracker.setSessionInTurn(sessionId, false);
+    try {
+      // The marker write is best-effort and ordered behind pending message
+      // persistence. It may retry/settle after an owner boundary is available.
+      markTurnEndedAfterPersistDrain(sessionId);
+      resetTurnPersistState(sessionId);
+      noteClaudeSessionTurnState(sessionId, false);
+      settlePendingCredentialSwitch(sessionId, `reconcile:${source}`);
+      deferredCodexRestartHolder?.onSessionSettled();
+      agentInputCoordinatorHolder?.onExternalTurnSettled(sessionId);
+      refreshRemoteCodexMcpOnTurnSettledHolder?.(sessionId);
+    } catch (err) {
+      log.warn('stale session turn side-effect cleanup failed', {
+        sessionId,
+        source,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    if (hadZombieInteraction) {
+      try {
+        cleanupPendingAgentInteractionsForSession(sessionId, 'turn_idle_reconcile');
+      } catch (err) {
+        log.warn('stale session interaction cleanup failed', {
+          sessionId,
+          source,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return true;
+  };
+
+  const readDirectAbortTurnId = (session: WiredSession, sessionId: string): string | null => {
+    try {
+      return session.getCurrentTurnId?.() ?? null;
+    } catch (err) {
+      log.warn('direct abort turn-id lookup failed', {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  };
+
+  const isDirectAbortBoundaryCurrent = (
+    sessionId: string,
+    boundary: DirectAbortReconcileBoundary,
+  ): boolean => {
+    if (directAbortReconcileBoundaries.get(sessionId) !== boundary) return false;
+    if (wiredSessionsById.get(sessionId)?.session !== boundary.session) return false;
+    if (currentSessionTurnBoundaryGeneration(sessionId) !== boundary.generation) return false;
+
+    // Codex exposes a provider turn id. Compare only when both sides have an
+    // id: after an abort the old id legitimately becomes null, while a new
+    // turn with a different non-null id must invalidate this retry chain.
+    const currentTurnId = readDirectAbortTurnId(boundary.session, sessionId);
+    return boundary.turnId === null || currentTurnId === null || boundary.turnId === currentTurnId;
+  };
+
+  const scheduleDirectAbortReconciliation = (
+    sessionId: string,
+    boundary: DirectAbortReconcileBoundary,
+  ): void => {
+    if (boundary.retryTimer) return;
+    boundary.retryTimer = setTimeout(() => {
+      boundary.retryTimer = null;
+      if (!isDirectAbortBoundaryCurrent(sessionId, boundary)) {
+        cancelDirectAbortReconciliation(sessionId, boundary);
+        return;
+      }
+      reconcileDirectAbortBoundary(sessionId, boundary, 'direct-abort-retry');
+    }, DIRECT_ABORT_RECONCILE_RETRY_DELAY_MS);
+  };
+
+  const reconcileDirectAbortBoundary = (
+    sessionId: string,
+    boundary: DirectAbortReconcileBoundary,
+    source: string,
+  ): void => {
+    if (!isDirectAbortBoundaryCurrent(sessionId, boundary)) {
+      cancelDirectAbortReconciliation(sessionId, boundary);
+      return;
+    }
+
+    let reconciledIdle = false;
+    try {
+      reconciledIdle = reconcileSessionTurnIdle(sessionId, source);
+    } catch (err) {
+      log.warn('direct abort idle reconciliation failed', {
+        sessionId,
+        source,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    if (reconciledIdle) {
+      cancelDirectAbortReconciliation(sessionId, boundary);
+      return;
+    }
+
+    // Keep the boundary fail-closed until the same Session instance and turn
+    // generation prove idle. Owner replacement, a new turn, or close cancels
+    // this chain through the identity/generation guards above.
+    if (isDirectAbortBoundaryCurrent(sessionId, boundary)) {
+      scheduleDirectAbortReconciliation(sessionId, boundary);
+    } else {
+      cancelDirectAbortReconciliation(sessionId, boundary);
+    }
+  };
+
+  const beginDirectAbortReconciliation = (
+    sessionId: string,
+    session: WiredSession,
+  ): DirectAbortReconcileBoundary => {
+    cancelDirectAbortReconciliation(sessionId);
+    const boundary: DirectAbortReconcileBoundary = {
+      session,
+      generation: currentSessionTurnBoundaryGeneration(sessionId),
+      turnId: readDirectAbortTurnId(session, sessionId),
+      retryTimer: null,
+    };
+    directAbortReconcileBoundaries.set(sessionId, boundary);
+    return boundary;
+  };
 
   const inputCoordinator: AgentInputCoordinator = new AgentInputCoordinator({
     sendToAgent: async (sessionId, message, createOpts, sendOpts) => {
@@ -7208,8 +8128,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     // 被按住的 error 最终没接管 → 只补落 error 行(横幅 coordinator 自己设)。
     onResumableTurnErrorDiscarded: (sessionId: string) => {
       autoResumeBookkeeping.flushSuppressedError(sessionId);
+      getAgentIslandService()?.restoreTaskFailureSound(sessionId);
     },
-    onResumableTurnError: (sessionId: string, signals: InterruptedTurnErrorSignals) => {
+    onResumableTurnError: (
+      sessionId: string,
+      signals: InterruptedTurnErrorSignals,
+      item: AgentInputQueuedMessage,
+    ) => {
       if (!isInterruptedTurnError(signals)) return null;
       const erroredAt = Date.now();
       const decision = interruptedTurnAutoResumeGuard.onInterruptedTurn(sessionId, erroredAt);
@@ -7240,6 +8165,11 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         sessionTotal: decision.sessionTotal,
         delayMs: decision.delayMs,
       });
+      const schedulerRunId =
+        item.origin?.kind === 'scheduler' && typeof item.origin.runId === 'string'
+          ? item.origin.runId
+          : null;
+      if (schedulerRunId) beginSchedulerAutoResume(sessionId, schedulerRunId);
       // 排期的撤旧、补落与令牌都在 AutoResumeBookkeeping.schedule 里(带单测),这里只给
       // 退避时长和到点要干的事。
       autoResumeBookkeeping.schedule(sessionId, decision.delayMs, () => {
@@ -7258,16 +8188,24 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
               autoResumeBookkeeping.finalizeSuppressedError(sessionId, {
                 surfaceBanner: outcome === 'no-progress',
               });
+              if (outcome === 'no-progress') {
+                getAgentIslandService()?.restoreTaskFailureSound(sessionId);
+              }
               log.debug('interrupted-turn auto-resume not dispatched', { sessionId, outcome });
               return;
             }
-            // 自愈成功:压住的错误就此丢弃,用户看到的是「已自动继续」分隔条。
+            // 入队成功后沿用普通聊天语义丢弃被压住的错误；Schedule 的 run 接管标记
+            // 不能在这里清：resumed 只表示续跑项已经进队。标记会在续跑项即将进入
+            // vendor 前清掉，让同步返回的新 terminal error 只能靠**本 attempt**重新接管；
+            // 派发前被 Stop / clear / ghost block 丢弃时仍由 discard/undispatched 回调
+            // 立即失败同一个 run。
             autoResumeBookkeeping.discardSuppressedError(sessionId);
             log.info('interrupted-turn auto-resume dispatched', { sessionId });
           } catch (err) {
             interruptedTurnAutoResumeGuard.noteResumeSendFailed(sessionId);
             // 补发本身失败 → 回落成常规错误呈现,让用户能手点重试。
             autoResumeBookkeeping.finalizeSuppressedError(sessionId, { surfaceBanner: true });
+            getAgentIslandService()?.restoreTaskFailureSound(sessionId);
             log.warn('interrupted-turn auto-resume failed', {
               sessionId,
               error: err instanceof Error ? err.message : String(err),
@@ -7287,43 +8225,33 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     steerToAgent: (sessionId, message, sendOpts) =>
       steerToAgentAccepted(sessionId, message, sendOpts),
     abortSession: async (sessionId) => {
+      resetAutomaticRecoveryForExplicitStop(sessionId);
       markWorkerManualInterruptIfKnown(sessionId, 'input_stop');
-      const sess = maker.getSession(sessionId);
+      const sess = getStableSessionForTurnBoundary(sessionId);
       if (!sess) return;
       handleAgentIslandSessionStopped(sess);
-      await sess.abort();
-      cleanupPendingInteractionsForSession(sessionId, 'session_aborted');
-    },
-    isTurnRunning: (sessionId) => {
-      const sess = maker.getSession(sessionId);
-      return isSessionTurnDispatchBoundaryBusy(sessionTurnActivityTracker, sessionId, sess);
-    },
-    reconcileTurnIdle: (sessionId) => {
-      // steer 拿到 maker-core 权威 NO_ACTIVE_TURN 后校准本地 busy 视图。
-      // tracker 只靠事件流维护, turn 异常死亡 (没发 done / terminal error) 时会
-      // stale 为 in-turn, 让 coordinator 的 fallback drain 永久卡死 —— 插话点击
-      // 表现为"毫无反应"。复核 live session 真没在跑后, 清 tracker + 清僵尸
-      // interaction (两者都是 getDrainableHead 的 busy 门)。
-      const sess = maker.getSession(sessionId);
-      if (sess?.isTurnRunning()) return;
-      const trackerStale = sessionTurnActivityTracker.isSessionInTurn(sessionId) ||
-        sessionTurnActivityTracker.isSessionTurnDispatchBoundaryBusy(sessionId);
-      const hadZombieInteraction = hasPendingInteractionForSession(sessionId);
-      if (!trackerStale && !hadZombieInteraction) return;
-      log.warn('reconcileTurnIdle: clearing stale busy state after authoritative NO_ACTIVE_TURN', {
-        sessionId,
-        trackerStale,
-        hadZombieInteraction,
-      });
-      sessionTurnActivityTracker.setSessionInTurn(sessionId, false);
-      markSessionTurnEnded(sessionId);
-      noteClaudeSessionTurnState(sessionId, false);
-      if (hadZombieInteraction) {
-        cleanupPendingInteractionsForSession(sessionId, 'turn_idle_reconcile');
+      try {
+        await sess.abort();
+      } finally {
+        // The coordinator owns idle reconciliation after this promise settles,
+        // so its boolean result is not consumed twice. Interaction waiters are
+        // still always released even when the vendor abort rejects.
+        cleanupPendingInteractionsForSession(sessionId, 'session_aborted');
       }
     },
-    hasPendingInteraction: hasPendingInteractionForSession,
-    getAgentKind: (sessionId) => maker.getSession(sessionId)?.agentKind ?? null,
+    isTurnRunning: (sessionId) => {
+      const sess = getStableSessionForTurnBoundary(sessionId);
+      return isSessionTurnDispatchBoundaryBusy(sessionTurnActivityTracker, sessionId, sess);
+    },
+    getTurnGeneration: (sessionId) =>
+      getStableSessionForTurnBoundary(sessionId)?.getTurnGeneration() ?? null,
+    reconcileTurnIdle: (sessionId) => {
+      // steer 拿到 maker-core 权威 NO_ACTIVE_TURN、或 abort 已让 vendor 停止
+      // 但终态事件丢失时，都走同一条收口路径。
+      return reconcileSessionTurnIdle(sessionId, 'authoritative-idle');
+    },
+    hasPendingInteraction: hasPendingAgentInteractionForSession,
+    getAgentKind: (sessionId) => getStableSessionForTurnBoundary(sessionId)?.agentKind ?? null,
     getSdkSessionId: async (sessionId) => {
       const meta = await maker.getSessionMeta(sessionId).catch(() => null);
       return meta?.sdkSessionId;
@@ -7337,6 +8265,12 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       await drainPersistQueue();
       return hasAssistantProgressAfterMessage(sessionId, userClientId);
     },
+    // retry-supersede:零产出重试的克隆行落库并派发成功后,软删被取代的旧 user 行
+    // 与其后的 error 行(实现与守卫见 localDb/ipc/messages.supersedeRetriedUserTurn)。
+    // 只发 messages:deleted、不额外发 sessions:patched:软删既不改变会话列表的
+    // _count(权威口径不过滤 rewind_at,行本体还在)也不改变 preview(克隆行仍是最新
+    // 可见行),理由与踩过的坑记在 helper 的注释里。
+    supersedeRetriedUserTurn,
     getLastAssistantTranscriptUuid,
     onAcceptedQueuedMessage: (sessionId, item): Promise<void> | undefined => {
       // 已派发 → 该项不会再走 discard,释放 scheduler 的 discard 监听防泄漏。
@@ -7346,6 +8280,17 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       return orcaInterAgentDispatcher.runQueuedOrcaInterAgentAcceptedCallback(sessionId, item);
     },
     onDispatchedUserTurn: async (sessionId, item, preVendorDispatchAt): Promise<void> => {
+      if (
+        item.autoResume &&
+        item.origin?.kind === 'scheduler' &&
+        typeof item.origin.runId === 'string' &&
+        // sendToAgent may synchronously emit the next recoverable terminal error.
+        // In that case the coordinator already owns a renewed auto-resume attempt;
+        // this older dispatch must not clear the same scheduler run's new claim.
+        !inputCoordinator.isAutoResumePending(sessionId)
+      ) {
+        clearSchedulerAutoResumePending(sessionId, item.origin.runId);
+      }
       // 「继续任务」只能在 vendor dispatch 不可逆后 durable ack：
       // - enqueue 时 ack：排队可取消，旧中断横幅回不来；
       // - onAccepted 时 ack：仍可能 cancelled-before-dispatch，且无新 started，
@@ -7363,16 +8308,31 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       }
     },
     noteSessionClearBoundary,
-    // 用户点了错误横幅的「重试」→ hook 侧把这一轮接回渠道那条已收口的消息。
-    // 这是权威来源: 零产出重试重发的是原文, 从文本认不出重试意图(见 deps 注释)。
-    onUiRetry: publishUiContinuation,
+    // 失败 turn 重试 → hook 侧把这一轮接回渠道那条已收口的消息。source 区分
+    // 人工与自动续跑：只有真人接手才作废 scheduler waiter，自动路径不能取消自己。
+    onUiRetry: (sessionId, clientId, source) => {
+      if (source === 'manual') {
+        // UI continuation can dispatch before the scheduler backoff callback.
+        // Retire that pending waiter first so it cannot consume the manual retry.
+        failPendingSchedulerAutoResume(sessionId);
+      }
+      publishUiContinuation(sessionId, clientId);
+    },
     // 新消息进队 → 作废该会话的待续跑记账(渠道那条旧消息已被别的内容取代)。
     // 用 enqueue 入口而不是消息文本: 零产出重试重发的是原文, 文本上无从区分,
     // 而它走 unshift 不经这里, 于是不会把自己的回流作废掉。
-    onUserEnqueue: publishUiSessionIntervention,
+    onUserEnqueue: (sessionId) => {
+      // The user turn can dispatch before the backoff callback observes that its
+      // recovery was superseded. Fail the scheduler waiter synchronously so it
+      // cannot consume that unrelated turn's text/done as this run's result.
+      failPendingSchedulerAutoResume(sessionId);
+      publishUiSessionIntervention(sessionId);
+    },
     // 队列项未派发即被丢弃(stop/remove/clearSession) → 释放暂存的 accepted 副作用, 防回调表泄漏。
-    onDiscardedQueuedMessage: (_sessionId, item) => {
+    onDiscardedQueuedMessage: (sessionId, item) => {
       orcaInterAgentDispatcher.discardQueuedOrcaInterAgentAcceptedCallback(item.clientId);
+      // 持久化中的项在这里被取消后不会再走 onUndispatchedUserTurn，复用同一结算出口。
+      settleUndispatchedAutoResumeOutcome(sessionId, item);
       // 排队心跳被丢弃 → 通知 runner 按 aborted 收尾对应 run,不让 fire 永久挂起。
       const watcher = schedulerQueuedPromptDiscardWatchers.get(item.clientId);
       if (watcher) {
@@ -7385,6 +8345,16 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
             error: err instanceof Error ? err.message : String(err),
           });
         }
+      }
+      if (
+        item.autoResume &&
+        item.origin?.kind === 'scheduler' &&
+        typeof item.origin.runId === 'string'
+      ) {
+        // 续跑还没跨过持久化边界，不会进入 onUndispatchedUserTurn；把普通聊天守卫
+        // 的 pendingResume 一并回滚，避免本次 Stop / block 让后续中断永远失去自愈。
+        interruptedTurnAutoResumeGuard.noteResumeSendFailed(sessionId);
+        notifySchedulerAutoResumeFailed(sessionId, item.origin.runId);
       }
     },
     hasPendingCredentialSwitch: (sessionId) => {
@@ -7418,6 +8388,18 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     onUserMessageRewritten: (sessionId, item, info) =>
       broadcastGhostMessageRewritten({ sessionId, clientId: item.clientId, ...info }),
     beforeDispatchUserTurn: (sessionId, item) => {
+      if (
+        item.autoResume &&
+        item.origin?.kind === 'scheduler' &&
+        typeof item.origin.runId === 'string'
+      ) {
+        // 旧 attempt 的接管标记不能跨进下一次 vendor dispatch：sendToAgent 可能在
+        // 返回前同步发出新的 terminal error。先清旧标记后，可恢复错误会由同一条
+        // onResumableTurnError 链重新 begin；认证/计费等确定性错误则保持未接管，
+        // runner 会立即失败。若在真正 dispatch 前取消，下面的 undispatched 回调
+        // 仍会按 item.origin 精确通知对应 run，不会静默丢失。
+        clearSchedulerAutoResumePending(sessionId, item.origin.runId);
+      }
       // hook 续跑回流的**权威归属点**: 在 vendor dispatch 之前(本回调被 await), 所以
       // 观察器挂上就不丢正文开头, 而 live session 此刻必然已就绪。clientId 对得上的
       // 才是目标续跑轮 —— 绕过 coordinator 的 turn(silent-stop 自动续跑)不走这里,
@@ -7433,11 +8415,17 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       // 它不会产生任何 turn 事件,新加的终态结算路径够不到它,待确认记录于是悬空,被之后
       // 任何一个无关的 text / tool 事件误标成「已重新连接」(codex P1)。
       // 按 clientId 匹配 —— 别的 turn 未派发不该动这条记录。
-      if (autoResumeBookkeeping.isPendingOutcomeClientId(sessionId, item.clientId)) {
-        autoResumeBookkeeping.settleOutcome(sessionId, 'failed');
+      if (settleUndispatchedAutoResumeOutcome(sessionId, item)) {
         // 同时把守卫的 pendingResume 回滚:不回滚会让该会话之后的中断永远被判成
         // 「上一次还在路上」,再也不自愈(不变量 I5)。
         interruptedTurnAutoResumeGuard.noteResumeSendFailed(sessionId);
+      }
+      if (
+        item.autoResume &&
+        item.origin?.kind === 'scheduler' &&
+        typeof item.origin.runId === 'string'
+      ) {
+        notifySchedulerAutoResumeFailed(sessionId, item.origin.runId);
       }
     },
     // Thread 3 fix: called from drain/dispatchCompact failure paths where the item
@@ -7756,7 +8744,11 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     if (!msg.createOpts || typeof msg.createOpts !== 'object') {
       throwIpcError('INVALID_PARAMS', 'queued.createOpts required');
     }
-    if (msg.createOpts.agentKind !== 'claude-code' && msg.createOpts.agentKind !== 'codex') {
+    if (
+      msg.createOpts.agentKind !== 'claude-code'
+      && msg.createOpts.agentKind !== 'codex'
+      && msg.createOpts.agentKind !== 'pi'
+    ) {
       throwIpcError('INVALID_PARAMS', 'queued.createOpts.agentKind invalid');
     }
     const normalized: AgentInputQueuedMessage = { ...msg };
@@ -7919,10 +8911,12 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
 
   ipcMain.handle(MAKER_INVOKE.INPUT_STOP, async (_e, sessionId: unknown, opts?: unknown) => {
     const sid = requireSessionId(sessionId);
-    // 用户 Stop 当前 turn(composer Stop 走这条)→ 先暂停 active 目标(置 paused + 停续跑 +
-    // detach 监听 + 移除 unsubscriber),**再** stop。否则 turn 中止后 idle 兜底
-    // (maybeContinueActiveGoal)会因目标仍 active 把它又续起来。null-safe;无 active goal 时 no-op。
-    await goalStopObserver?.(sid);
+    // 这三类续跑撤销都是同步操作，必须早于 goal/DB await；
+    // 否则退避 timer 能在用户已点 Stop 后抢先发出下一轮。
+    resetAutomaticRecoveryForExplicitStop(sid);
+    // pauseGoal 调用同步 detach listener/timer，持久化可以与 vendor abort 并行；真正的
+    // turn/interrupt 先启动，IPC 回执再等待 paused 落盘。
+    const goalPause = pauseGoalBeforeExplicitStop(sid);
     const result = inputCoordinator.stop(
       sid,
       opts && typeof opts === 'object'
@@ -7935,6 +8929,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     if (!inputCoordinator.hasPendingQueuedWork(sid)) {
       getAgentIslandService()?.notifyQueueEmptied(sid);
     }
+    await goalPause;
     return result;
   });
 
@@ -8047,9 +9042,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       isRemoteInvoke: remoteInvoke,
     });
     const projection = inputCoordinator.clearSession(sid, clearBoundary);
-    silentStopAutoResumeGuard.noteSessionReset(sid);
-    interruptedTurnAutoResumeGuard.noteSessionReset(sid);
-    autoResumeBookkeeping.teardown(sid);
+    resetAutomaticRecoveryForExplicitStop(sid);
     // 丢弃缓存的待注入交接 / fork 来源标记:它们是按 clear 之前的历史算出来的,
     // DB 侧的 cleared_at 抑制拦不住已经落进 registry 内存的那一份(首发被拒后
     // 缓存仍在),下次 send 会把旧血缘灌进用户刚显式清空的上下文。
@@ -8094,18 +9087,53 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   ipcMain.handle(MAKER_INVOKE.ABORT_SESSION, async (_e, sessionId: unknown) => {
     if (typeof sessionId !== 'string') throwIpcError('INVALID_PARAMS', 'sessionId required');
     markWorkerManualInterruptIfKnown(sessionId, 'abort_session');
-    silentStopAutoResumeGuard.noteSessionReset(sessionId);
-    interruptedTurnAutoResumeGuard.noteSessionReset(sessionId);
-    autoResumeBookkeeping.teardown(sessionId);
-    const sess = maker.getSession(sessionId);
-    if (!sess) return;
+    resetAutomaticRecoveryForExplicitStop(sessionId);
+    // 调用本身先同步撤销 Goal 续跑资格；paused 落库与 vendor abort 并行。
+    const goalPause = pauseGoalBeforeExplicitStop(sessionId);
+    const sess = getStableSessionForTurnBoundary(sessionId);
+    if (!sess) {
+      await goalPause;
+      return;
+    }
     handleAgentIslandSessionStopped(sess);
-    // 用户 Stop 当前 turn → 若该会话有 active goal,先暂停目标(置 paused + 停续跑 + detach
-    // 监听),**再** abort。这样 abort 产生的终止事件到来时目标已暂停、监听已摘,不会被误判成
-    // 续跑(原本依赖 error 文案正则判 paused/blocked,不可靠)。null-safe;无 active goal 时 no-op。
-    await goalStopObserver?.(sessionId);
-    await sess.abort();
-    cleanupPendingInteractionsForSession(sessionId, 'session_aborted');
+    const directAbortBoundary = beginDirectAbortReconciliation(sessionId, sess);
+    // Attach the rejection handler immediately: Goal storage can fail while a slow
+    // vendor abort is still settling, and that failure must not become unhandled.
+    const goalPauseResult = goalPause.then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    let abortFailed = false;
+    let abortError: unknown;
+    try {
+      await sess.abort();
+    } catch (error) {
+      abortFailed = true;
+      abortError = error;
+    } finally {
+      // The stable lookup may still be inside an owner-boundary transition;
+      // reconciliation owns its own safe live-state lookup and must run even
+      // when the abort promise rejects or the Session reports a late idle.
+      try {
+        reconcileDirectAbortBoundary(sessionId, directAbortBoundary, 'direct-abort');
+      } finally {
+        cleanupPendingInteractionsForSession(sessionId, 'session_aborted');
+      }
+    }
+    const settledGoalPause = await goalPauseResult;
+    if (abortFailed) {
+      if (!settledGoalPause.ok) {
+        log.error('goal pause persistence also failed after session abort failure', {
+          sessionId,
+          error:
+            settledGoalPause.error instanceof Error
+              ? settledGoalPause.error.message
+              : String(settledGoalPause.error),
+        });
+      }
+      throw abortError;
+    }
+    if (!settledGoalPause.ok) throw settledGoalPause.error;
   });
 
   ipcMain.handle(MAKER_INVOKE.CLOSE_SESSION, async (_e, sessionId: unknown, opts?: unknown) => {
@@ -8148,9 +9176,12 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       throwIpcError('INVALID_PARAMS', 'invalid plugin setup decision');
     }
     // permission / ask / plan and setup cancellation remain remotely
-    // resolvable, but Host-owned setup side effects may only originate from
-    // the trusted local Desktop.
-    assertResolveInteractionOrigin(decision);
+    // resolvable. Host-owned setup side effects and Desktop-only confirmations
+    // may only originate from the trusted local Desktop.
+    assertResolveInteractionOrigin(
+      decision,
+      isPendingDesktopOnlyConfirmation(requestId),
+    );
     let pluginSetupResponseTarget: GhostSetupInteractionResponseTarget | undefined;
     if (isPluginSetupInteractionDecision(decision) && !isDeviceLinkInvoke()) {
       assertTrustedAppRendererEvent(event);
@@ -8198,7 +9229,14 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   // session 不存在(被 close / 还没 send 创建出来)就 no-op 不报错, 让 renderer
   // 可以乐观调用 (UI 更新先行, IPC 失败也不会回滚 UI, 老 agentManager 同语义)。
 
-  ipcMain.handle(MAKER_INVOKE.SET_MODEL, async (_e, sessionId: unknown, model: unknown, providerId?: unknown) => {
+  ipcMain.handle(MAKER_INVOKE.SET_MODEL, async (
+    _e,
+    sessionId: unknown,
+    model: unknown,
+    providerId?: unknown,
+    expectedAgentSwitchRevision?: unknown,
+    selection?: unknown,
+  ) => {
     if (typeof sessionId !== 'string' || typeof model !== 'string') {
       throwIpcError('INVALID_PARAMS', 'sessionId + model required');
     }
@@ -8209,10 +9247,41 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     ) {
       throwIpcError('INVALID_PARAMS', 'providerId must be string, null, or undefined');
     }
+    if (
+      expectedAgentSwitchRevision !== undefined &&
+      (typeof expectedAgentSwitchRevision !== 'number' ||
+        !Number.isSafeInteger(expectedAgentSwitchRevision) ||
+        expectedAgentSwitchRevision < 0)
+    ) {
+      throwIpcError('INVALID_PARAMS', 'expectedAgentSwitchRevision must be a non-negative integer');
+    }
+    if (
+      selection !== undefined &&
+      (
+        selection === null ||
+        typeof selection !== 'object' ||
+        Array.isArray(selection) ||
+        typeof (selection as { effort?: unknown }).effort !== 'string' ||
+        typeof (selection as { fastMode?: unknown }).fastMode !== 'boolean'
+      )
+    ) {
+      throwIpcError('INVALID_PARAMS', 'selection must contain effort + fastMode');
+    }
+    const atomicSelection = selection as
+      | { effort: string; fastMode: boolean }
+      | undefined;
     // 与 send 事务共用 session 锁:发送时刻执行的跨引擎切换必须先落定,
     // 后到的 SET_MODEL 才能写 route。否则切换 DB await 恢复后会用旧 provider
     // 覆盖用户刚选的新 route，形成 DB 与进程内路由分叉。
     return withSendToSessionLock(sessionId, async () => {
+      // 同引擎重选是 switch ack 后的第二段写入。另一控制端若在两段之间更新（含
+      // set→clear ABA），修订号已变化：旧 SET_MODEL 必须在任何 route/DB 副作用前让位。
+      if (
+        typeof expectedAgentSwitchRevision === 'number' &&
+        agentSwitchPending.revision?.(sessionId) !== expectedAgentSwitchRevision
+      ) {
+        return { deferred: false, superseded: true };
+      }
       // 停用轴准入(PR #744 review;第十二轮移入锁内):切换模型是一次新的路由选择,
       // 不得切到用户停用的模型 / 来源(本机选择器已过滤,但本 channel 在 device-link
       // allowlist 内,老控制端可直接点名)。裁决必须在拿到会话锁**之后**执行 ——
@@ -8226,7 +9295,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         const dbAgentKind = getSessionDbAgentKind(sessionId);
         if (dbAgentKind) {
           const reroute = await assertModelRouteUsable(
-            dbAgentKind === 'cc' ? 'claude-code' : 'codex',
+            dbToMakerAgentKind(dbAgentKind),
             model,
             typeof providerId === 'string' ? providerId : null,
           );
@@ -8259,7 +9328,56 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         );
         // deferred = 会话自己在跑,选择已登记、turn 结束自动生效。renderer 据此提示
         // "任务结束后生效"而不是当成已即时切换。
-        return { deferred: result.status === 'deferred' };
+        const response = { deferred: result.status === 'deferred', superseded: false };
+        if (atomicSelection) {
+          // model/provider/effort/fast 是一次选择快照，必须在同一把 session 锁内收敛。
+          // applyRuntimeSetModelChange 可能 close + wake；若 effort/fast 留给 renderer
+          // 后续独立调用，queue drain 会用新 model + 旧偏好重建，跨控制端时还会发生
+          // 旧请求尾写覆盖新选择。
+          setSessionEffort(sessionId, atomicSelection.effort);
+          setSessionFastMode(sessionId, atomicSelection.fastMode);
+          const sess = maker.getSession(sessionId);
+          if (
+            sess &&
+            result.status !== 'deferred' &&
+            !pendingCredentialSwitchHolder?.has(sessionId)
+          ) {
+            await sess.setEffort(
+              atomicSelection.effort as
+                | 'minimal'
+                | 'low'
+                | 'medium'
+                | 'high'
+                | 'xhigh'
+                | 'max'
+                | 'ultra',
+            );
+            if (sess.agentKind === 'codex') {
+              await sess.setFastMode(atomicSelection.fastMode);
+            }
+          }
+        }
+        if (isDeviceLinkInvoke() || atomicSelection) {
+          // device-link 的通用持久化原本发生在 handler 返回、session 锁释放之后；
+          // 本地 renderer 的 sessionService.update 也有同一窗口。凡携带 selection 的
+          // 新调用都由 host 在解锁前一次落定全部字段。
+          const patch: Record<string, unknown> = { model };
+          if (effectiveProviderId !== undefined) {
+            patch.providerId = normalizeSessionProviderId(
+              typeof effectiveProviderId === 'string' ? effectiveProviderId : null,
+            );
+          }
+          if (atomicSelection) {
+            patch.effort = atomicSelection.effort;
+            patch.fastMode = atomicSelection.fastMode;
+          }
+          await persistSessionFields(sessionId, patch);
+          if (isDeviceLinkInvoke()) {
+            // dispatch 继续兼容最小/旧 handler 的锁外回流；标记本结果避免重复写。
+            markRemoteSettingPersistedInsideHandler(response);
+          }
+        }
+        return response;
       } catch (err) {
         if (err instanceof CredentialModeSwitchBusyError) {
           // 兜底(正常路径 busy 已转 deferred):切模型撞上凭证切换忙,独立 code,
@@ -8319,6 +9437,233 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     await sess.setPlanMode(enabled);
   });
 
+  ipcMain.handle(MAKER_INVOKE.EXPORT_SESSION_HTML, async (e, sessionId: unknown) => {
+    // 会弹原生保存对话框并把会话内容落盘:必须来自受信顶层页面,不能让辅助窗口 /
+    // WebView / 子 frame 经隐藏入口导出敏感会话(codex review)。导出非 device-link
+    // 通道(主机端原生对话框),故无条件校验。
+    assertTrustedAppRendererEvent(e as Parameters<typeof assertTrustedAppRendererEvent>[0]);
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      throwIpcError('INVALID_PARAMS', 'sessionId required');
+    }
+    const sess = maker.getSession(sessionId);
+    if (!sess) {
+      log.debug('export-session-html: session not found, no-op', { sessionId });
+      return null;
+    }
+    if (!sess.capabilities.sessionHtmlExport?.supported) {
+      // agent 不支持导出(CC/Codex):调用方应先按 capabilities 隐藏入口,这里兜底 no-op。
+      log.debug('export-session-html: agent does not support export, no-op', {
+        sessionId,
+        agentKind: sess.agentKind,
+      });
+      return null;
+    }
+    // 主进程弹原生保存对话框选落盘位置(renderer 只发起,不碰文件系统)。
+    const parent = BrowserWindow.fromWebContents(e.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined;
+    const defaultPath = path.join(app.getPath('documents'), 'cindy-session.html');
+    const picked = await dialog.showSaveDialog(parent!, {
+      title: 'Export session to HTML',
+      defaultPath,
+      filters: [{ name: 'HTML', extensions: ['html'] }],
+    });
+    if (picked.canceled || !picked.filePath) return null;
+    const written = await sess.exportSessionHtml(picked.filePath);
+    // 导出完成后在文件管理器中高亮该文件(与常见「导出并显示」体验一致)。
+    shell.showItemInFolder(written);
+    return written;
+  });
+
+  ipcMain.handle(MAKER_INVOKE.COMPACT_SESSION, async (event, sessionId: unknown, instructions: unknown) => {
+    // 会启动 Agent turn、产生模型费用:非 device-link 的本机调用必须来自受信顶层页面,
+    // 不能让辅助窗口 / WebView / 子 frame 经隐藏入口触发(codex review)。device-link
+    // 走独立鉴权通道,按既有 dual 模式放行。
+    if (!isDeviceLinkInvoke()) {
+      assertTrustedAppRendererEvent(event as Parameters<typeof assertTrustedAppRendererEvent>[0]);
+    }
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      throwIpcError('INVALID_PARAMS', 'sessionId required');
+    }
+    if (instructions !== undefined && typeof instructions !== 'string') {
+      throwIpcError('INVALID_PARAMS', 'instructions must be a string when provided');
+    }
+    const sess = maker.getSession(sessionId);
+    if (!sess) {
+      log.debug('compact-session: session not found, no-op', { sessionId });
+      return null;
+    }
+    if (!sess.capabilities.manualCompact?.supported) {
+      // 调用方应先按 capabilities 隐藏入口,这里兜底 no-op。
+      log.debug('compact-session: agent does not support manual compact, no-op', {
+        sessionId,
+        agentKind: sess.agentKind,
+      });
+      return null;
+    }
+    return sess.compactSession(instructions);
+  });
+
+  /**
+   * 会话树是历史浏览入口，不能要求用户先发一条消息把旧 Pi 会话唤醒。
+   * 这里按持久化元数据恢复同一原生 session；Maker.createSession 自带 per-id singleflight。
+   */
+  async function getOrResumeSessionTreeSession(sessionId: string) {
+    const live = maker.getSession(sessionId);
+    if (live) return live;
+    const meta = await maker.getSessionMeta(sessionId).catch(() => null);
+    if (!meta || meta.agentKind !== 'pi') return null;
+    const db = getDbClient().drizzle;
+    const [row] = await db
+      .select({
+        providerId: sessions.providerId,
+        effort: sessions.effort,
+        fastMode: sessions.fastMode,
+        permissionMode: sessions.permissionMode,
+        remoteHostId: sessions.remoteHostId,
+        orcaRole: sessions.orcaRole,
+      })
+      .from(sessions)
+      .where(eq(sessions.id, sessionId))
+      .limit(1);
+    if (!row) return null;
+    const createOpts = buildCreateOptsWithStderr({
+      id: sessionId,
+      agentKind: 'pi',
+      workingDir: meta.workDir,
+      model: meta.model,
+      // providerId=null 是显式的 Cindy 默认路由；undefined 才允许 Pi 按同名模型
+      // 反查原生 BYOM。会话树懒恢复必须原样保留 DB 的三态契约。
+      providerId: row.providerId,
+      resumeSessionId: meta.sdkSessionId,
+      effort: row.effort as CreateOpts['effort'],
+      fastMode: !!row.fastMode,
+      permissionMode: permissionModeOrAsk(row.permissionMode),
+      title: meta.title,
+      remoteHostId: row.remoteHostId ?? undefined,
+      orcaRole: row.orcaRole as CreateOpts['orcaRole'],
+    });
+    const workDirReady = await checkWorkDirExists(
+      sessionId,
+      createOpts.workingDir,
+      createOpts.agentKind,
+      createOpts.remoteHostId,
+    );
+    if (!workDirReady) return null;
+    await synthesizeOrcaVendorOptionsFromDb(sessionId, createOpts);
+    const extraDirs = await readSessionExtraDirsFromDb(sessionId).catch(() => []);
+    if (extraDirs.length > 0) createOpts.extraDirs = extraDirs;
+    await ensureRemoteReadyForSessionStart({ createOpts });
+    const { session: resumed } = await bootstrapSession(createOpts);
+    await markOrcaRoleIfNeeded(resumed.id, createOpts.orcaRole);
+    log.info('session-tree: lazily resumed Pi session', {
+      sessionId,
+      sdkSessionId: meta.sdkSessionId ?? null,
+    });
+    return resumed;
+  }
+
+  ipcMain.handle(MAKER_INVOKE.GET_SESSION_TREE, async (event, sessionId: unknown) => {
+    // getOrResumeSessionTreeSession 会 lazy resume(spawn Agent)→ 有副作用。非
+    // device-link 本机调用须受信顶层页面(codex review);device-link 独立鉴权,放行。
+    if (!isDeviceLinkInvoke()) {
+      assertTrustedAppRendererEvent(event as Parameters<typeof assertTrustedAppRendererEvent>[0]);
+    }
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      throwIpcError('INVALID_PARAMS', 'sessionId required');
+    }
+    const sess = await getOrResumeSessionTreeSession(sessionId);
+    if (!sess || !sess.capabilities.sessionTree?.supported) return null;
+    return sess.getSessionTree();
+  });
+
+  ipcMain.handle(
+    MAKER_INVOKE.NAVIGATE_SESSION_TREE,
+    async (event, sessionId: unknown, entryId: unknown, options: unknown) => {
+      // 改写原生分支 + SQLite 投影、可触发 summarize Agent turn:非 device-link 本机
+      // 调用须受信顶层页面(codex review);device-link 独立鉴权,按既有 dual 模式放行。
+      if (!isDeviceLinkInvoke()) {
+        assertTrustedAppRendererEvent(event as Parameters<typeof assertTrustedAppRendererEvent>[0]);
+      }
+      if (typeof sessionId !== 'string' || !sessionId || typeof entryId !== 'string' || !entryId) {
+        throwIpcError('INVALID_PARAMS', 'sessionId + entryId required');
+      }
+      const rawOptions = options == null ? {} : options;
+      if (typeof rawOptions !== 'object' || Array.isArray(rawOptions)) {
+        throwIpcError('INVALID_PARAMS', 'options must be an object');
+      }
+      const parsed = rawOptions as Record<string, unknown>;
+      if (parsed.summarize !== undefined && typeof parsed.summarize !== 'boolean') {
+        throwIpcError('INVALID_PARAMS', 'summarize must be boolean');
+      }
+      if (parsed.customInstructions !== undefined && typeof parsed.customInstructions !== 'string') {
+        throwIpcError('INVALID_PARAMS', 'customInstructions must be string');
+      }
+      const sess = await getOrResumeSessionTreeSession(sessionId);
+      if (!sess || !sess.capabilities.sessionTree?.supported) return null;
+      // 整个「原生分支导航 → 捕获 result.messages → session.treeRehydrate 重建 SQLite」窗口
+      // 必须与 maker:send 走同一把 per-session 锁(acquireSendToSessionLock)。否则另一窗口 /
+      // device-link 在 navigate 捕获 result.messages 之后、rehydrate 之前发一个 turn:Pi 把它
+      // 收进活动 JSONL,而 rehydrate 用导航前捕获的旧 result.messages 重建库,这条新 turn 就
+      // 在 JSONL 里有、SQLite 里被旧快照覆盖/隐藏(hiddenClientIds 只修复 Renderer 删除广播,
+      // 修不了 JSONL 与 DB 的这处分叉,codex review P1)。summarize turn 是 Pi 内部 RPC,不经
+      // maker:send IPC,故不与本锁重入。
+      const { result, hiddenClientIds, now } = await withSendToSessionLock(sessionId, async () => {
+        const result = await sess.navigateSessionTree(entryId, {
+          summarize: parsed.summarize === true,
+          ...(typeof parsed.customInstructions === 'string'
+            ? { customInstructions: parsed.customInstructions }
+            : {}),
+        });
+        const now = Date.now();
+        // hiddenClientIds 由重投影事务原子返回:它是隐藏动作发生那一刻的完整可见集。
+        const { hiddenClientIds } = await getDbClient().tx('session.treeRehydrate', {
+          sessionId,
+          now,
+          contextTokens: result.contextTokens,
+          contextWindow: result.contextWindow,
+          messages: result.messages.map((message) => ({
+            id: createId(),
+            clientId: message.clientId,
+            role: message.role,
+            content: JSON.stringify(message.content),
+            toolUseId: message.toolUseId ?? null,
+            agentMeta: message.agentMeta ? JSON.stringify(message.agentMeta) : null,
+            agentKind: 'pi',
+            createdAt: message.createdAt,
+          })),
+        });
+        return { result, hiddenClientIds, now };
+      });
+      resetTurnPersistState(sessionId);
+
+      // 多窗口与 device-link 控制端先清旧投影，再按 DB 真相补当前活动路径。
+      if (hiddenClientIds.length > 0) {
+        broadcastMessageDeleted({
+          sessionId,
+          clientId: hiddenClientIds[0],
+          clientIds: hiddenClientIds,
+        });
+      }
+      const visibleRows = await getDbClient().drizzle
+        .select()
+        .from(messages)
+        .where(and(eq(messages.sessionId, sessionId), isNull(messages.rewindAt)))
+        .orderBy(messages.createdAt);
+      for (const row of visibleRows) broadcastMessageRow(sessionId, messageToCamel(row));
+      broadcastSessionPatched(sessionId, {
+        clearedAt: null,
+        contextTokens: result.contextTokens,
+        contextWindow: result.contextWindow,
+        updatedAt: new Date(now).toISOString(),
+        _count: { messages: visibleRows.length },
+      });
+      return {
+        tree: result.tree,
+        draftText: result.draftText,
+        cancelled: result.cancelled === true,
+      };
+    },
+  );
+
   ipcMain.handle(MAKER_INVOKE.SET_FAST_MODE, async (_e, sessionId: unknown, enabled: unknown) => {
     if (typeof sessionId !== 'string' || typeof enabled !== 'boolean') {
       throwIpcError('INVALID_PARAMS', 'sessionId + enabled required');
@@ -8329,6 +9674,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     const sess = maker.getSession(sessionId);
     if (!sess) {
       log.debug('set-fast-mode: session not found, no-op', { sessionId });
+      return;
+    }
+    if (sess.agentKind === 'pi') {
+      // Pi 的 ChatGPT 请求不从 pi 请求体携带 Fast，而是由上面的 session store
+      // 在 compat-proxy 决策点闭包进 responses bridge prefs。到这里已经即时生效，
+      // 无需向 pi RPC 再发一份不存在的 set_fast_mode 控制命令。
+      log.debug('set-fast-mode: pi responses bridge state updated', { sessionId, enabled });
       return;
     }
     if (sess.agentKind !== 'codex') {
@@ -8395,15 +9747,15 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   // setMemory 后按 result.effective ('immediate' | 'next-session') 决定是否提示
   // "新会话生效"; reset 前必走 confirm dialog (UI 层负责)。
   ipcMain.handle(MAKER_INVOKE.MEMORY_GET, async (_e, agentKind: unknown) => {
-    if (agentKind !== 'claude-code' && agentKind !== 'codex') {
-      throwIpcError('INVALID_PARAMS', `agentKind required (claude-code | codex), got ${String(agentKind)}`);
+    if (agentKind !== 'claude-code' && agentKind !== 'codex' && agentKind !== 'pi') {
+      throwIpcError('INVALID_PARAMS', `agentKind required (claude-code | codex | pi), got ${String(agentKind)}`);
     }
     return maker.getAgentMemoryStatus(agentKind);
   });
 
   ipcMain.handle(MAKER_INVOKE.MEMORY_SET, async (_e, agentKind: unknown, enabled: unknown) => {
-    if (agentKind !== 'claude-code' && agentKind !== 'codex') {
-      throwIpcError('INVALID_PARAMS', `agentKind required (claude-code | codex), got ${String(agentKind)}`);
+    if (agentKind !== 'claude-code' && agentKind !== 'codex' && agentKind !== 'pi') {
+      throwIpcError('INVALID_PARAMS', `agentKind required (claude-code | codex | pi), got ${String(agentKind)}`);
     }
     if (typeof enabled !== 'boolean') {
       throwIpcError('INVALID_PARAMS', 'enabled required (boolean)');
@@ -8414,7 +9766,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     // 写盘失败不阻塞 — 当前 session 已经 setMemory 成功, 只是下次重启会回默认。
     let settingsState = readMemorySettingsState();
     try {
-      settingsState = writeMemorySetting(agentKind === 'codex' ? 'codex' : 'claudeCode', enabled);
+      const settingKey = agentKind === 'claude-code' ? 'claudeCode' : agentKind;
+      settingsState = writeMemorySetting(settingKey, enabled);
     } catch (err) {
       log.warn('memory:set persistence failed (in-session change still applied)', {
         agentKind,
@@ -8431,8 +9784,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   });
 
   ipcMain.handle(MAKER_INVOKE.MEMORY_RESET, async (_e, agentKind: unknown) => {
-    if (agentKind !== 'claude-code' && agentKind !== 'codex') {
-      throwIpcError('INVALID_PARAMS', `agentKind required (claude-code | codex), got ${String(agentKind)}`);
+    if (agentKind !== 'claude-code' && agentKind !== 'codex' && agentKind !== 'pi') {
+      throwIpcError('INVALID_PARAMS', `agentKind required (claude-code | codex | pi), got ${String(agentKind)}`);
     }
     log.info('memory:reset', { agentKind });
     return maker.resetAgentMemory(agentKind);
@@ -8483,9 +9836,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           await maker.setAgentMemory('codex', persistedSettings.codex);
         }
         // 开关翻转 ⇒ 重建 codex bridge, 理由与约束见
-        // shutdownCodexEnvironmentBestEffort 文档 (review R1 P2)。
+        // shutdownAgentMcpEnvironmentsBestEffort 文档 (review R1 P2)。
         if (wasEnabled !== enabled) {
-          await shutdownCodexEnvironmentBestEffort('maker-memory toggle');
+          await shutdownAgentMcpEnvironmentsBestEffort('maker-memory toggle');
         }
       },
     });
@@ -8515,6 +9868,11 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         } else {
           await maker.setAgentMemory('claude-code', settings.claudeCode);
         }
+        // Pi 的自动记忆以 Cindy Memory 为存储层，不参与“启用 Cindy 时关闭原生记忆”联动；
+        // reset 仍要把存活 Pi runtime 的独立开关恢复成默认值。
+        if (maker.listAvailableAgents().includes('pi')) {
+          await maker.setAgentMemory('pi', settings.pi);
+        }
         return memorySettingsWire();
       },
       applyRuntime: async () => {
@@ -8525,9 +9883,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           await maker.setAgentMemory('codex', resetSettings_.codex);
         }
         // maker 开关随 reset 翻转时同样要重建 codex bridge — 见
-        // shutdownCodexEnvironmentBestEffort 文档 (review R1 P2)。
+        // shutdownAgentMcpEnvironmentsBestEffort 文档 (review R1 P2)。
         if (wasMakerEnabled !== resetSettings_.maker) {
-          await shutdownCodexEnvironmentBestEffort('memory settings reset');
+          await shutdownAgentMcpEnvironmentsBestEffort('memory settings reset');
         }
       },
     });
@@ -8555,12 +9913,39 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   // Read one plugin's enable state by id. Unlike PLUGINS_LIST this does NOT skip
   // hidden (HOSTED_ELSEWHERE) plugins, so a dedicated Settings section (e.g.
   // 「电脑使用」for `browser`) can read its real project-override state.
-  ipcMain.handle(MAKER_INVOKE.PLUGINS_GET_STATE, async (_e, id: unknown, workingDir: unknown) => {
+  ipcMain.handle(MAKER_INVOKE.PLUGINS_GET_STATE, async (
+    _e,
+    id: unknown,
+    workingDir: unknown,
+    workspaceKind: unknown,
+  ) => {
     if (typeof id !== 'string') {
       throwIpcError('INVALID_PARAMS', 'id (string) required');
     }
     const wd = typeof workingDir === 'string' ? workingDir : undefined;
-    return getPluginRegistry().getEnableState(id, wd);
+    // collab 的 app 托管 dialogue cwd 只读取用户/全局级；显式真实目录仍读取项目覆盖。
+    // 这里与 mutation 最终授权共用「dialogue kind + Main 可信路径」判据，device-link
+    // 隧道到被控端后也由被控端自己的 dialogue root 解析，Renderer 无需知道或猜 userData。
+    const policyWorkingDir =
+      id === 'collab' && wd !== undefined
+        ? resolveLocalCollabPolicyWorkingDir(
+            wd,
+            typeof workspaceKind === 'string' ? workspaceKind : null,
+            (candidate) =>
+              matchDialogueWorkspacePath(candidate, dialogueWorkspaceRootDir()) !== null,
+          )
+        : wd;
+    const state = await getPluginRegistry().getEnableState(id, policyWorkingDir);
+    const acceptedWorkspaceKind =
+      id === 'collab' && (workspaceKind === 'project' || workspaceKind === 'dialogue')
+        ? workspaceKind
+        : undefined;
+    // 远端控制端不能只靠 channel 存在判断 dialogue 协同：旧被控端也已有这个 channel，
+    // 但它会忽略第三个参数，且最终授权不接受 dialogue。回显被 Main 接受的 kind 作为
+    // 同一次只读查询的向后兼容握手；旧端缺字段，新端即可 fail-closed。
+    return acceptedWorkspaceKind
+      ? { ...state, collabWorkspaceKind: acceptedWorkspaceKind }
+      : state;
   });
 
   ipcMain.handle(MAKER_INVOKE.PLUGINS_SET_ENABLED, async (_e, id: unknown, enabled: unknown) => {
@@ -8921,7 +10306,7 @@ async function checkWorkDirExists(
   // 或者 agent 真跑起来时由远端 codex 自己报 ENOENT)。这里直接放行。
   if (remoteHostId) return true;
   if (!workingDir?.trim()) return true;
-  const source: AgentKind = agentKind === 'codex' ? 'codex' : 'claude-code';
+  const source: AgentKind = agentKind === 'codex' || agentKind === 'pi' ? agentKind : 'claude-code';
   // suppressMissingBroadcast: 调用方(SEND 事务)手里还有 DB 权威值可兜底时,
   // 首检失败只记日志不广播错误横幅——兜底成功的话用户不该看到假错误。
   const suppress = opts?.suppressMissingBroadcast === true;
@@ -9067,7 +10452,17 @@ function redactEventForRenderer(event: AgentEvent): AgentEvent {
 function broadcastToAllWindows(channel: string, payload: unknown): void {
   // device-link 被控端旁路:命中转发白名单且存在控制链路时,把事件转发给控制端
   // (无 link 时 O(1) no-op,不进 maker-core 热路径成本)
-  tapWindowBroadcast(channel, payload);
+  // 旁路永远不能反向阻断本机生命周期。owner boundary 切换期间远端链路
+  // 可能暂不可用；如果异常冒泡，Session 的 status/terminal listener 会在
+  // 清理前中止，最终留下 tracker busy + 死进程，所有后续消息永久排队。
+  try {
+    tapWindowBroadcast(channel, payload);
+  } catch (err) {
+    log.warn('device-link broadcast tap failed; keeping local broadcast alive', {
+      channel,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed()) continue;
     try {

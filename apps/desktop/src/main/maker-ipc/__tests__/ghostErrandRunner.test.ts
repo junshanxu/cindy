@@ -15,11 +15,19 @@ import {
 import type { AgentEvent } from '@cindy/maker-core';
 
 /** 最小可观察会话替身:测试手动放事件。 */
+type FakeStatus = 'active' | 'aborting' | 'closed' | 'error';
+
 function fakeSession(id: string): {
-  session: { id: string; onEvent(listener: (ev: AgentEvent) => void): () => void };
+  session: {
+    id: string;
+    onEvent(listener: (ev: AgentEvent) => void): () => void;
+    onStatusChange(listener: (status: FakeStatus) => void): () => void;
+  };
   emit: (ev: AgentEvent) => void;
+  setStatus: (status: FakeStatus) => void;
 } {
   const listeners = new Set<(ev: AgentEvent) => void>();
+  const statusListeners = new Set<(status: FakeStatus) => void>();
   return {
     session: {
       id,
@@ -27,8 +35,13 @@ function fakeSession(id: string): {
         listeners.add(listener);
         return () => listeners.delete(listener);
       },
+      onStatusChange(listener) {
+        statusListeners.add(listener);
+        return () => statusListeners.delete(listener);
+      },
     },
     emit: (ev) => listeners.forEach((l) => l(ev)),
+    setStatus: (status) => statusListeners.forEach((l) => l(status)),
   };
 }
 
@@ -71,6 +84,7 @@ function makeDeps(overrides: Partial<GhostErrandRunnerDeps> = {}): {
     getGhostName: () => '帮手',
     getDraftDefaults: () => ({}),
     normalizeWorkingDir: (dir) => dir.replace(/\/+$/, ''),
+    isUserPickedDir: () => false,
     isSessionBusy: () => false,
     dispatch: vi.fn(async () => ({ ok: true as const, wakeKind: 'resumed' as const })),
     getObservableSession: (id) => ensureEmitter(id).session,
@@ -92,6 +106,28 @@ describe('权限档钳制', () => {
     expect(clampErrandPermissionMode('ask')).toBe('plan');
     expect(clampErrandPermissionMode('acceptEdits')).toBe('acceptEdits');
     expect(clampErrandPermissionMode('auto')).toBe('auto');
+  });
+});
+
+describe('Pi 代办路由', () => {
+  it('读取 Pi 草稿默认并创建 Pi 会话', async () => {
+    const createSession = vi.fn(async () => 'sess-pi');
+    const getDraftDefaults = vi.fn(() => ({ model: 'gpt-5.5' }));
+    const { deps, emitters } = makeDeps({
+      readConfig: () => ({ agentKind: 'pi' }),
+      createSession,
+      getDraftDefaults,
+    });
+    const runner = createGhostErrandRunner(deps);
+    const pending = runner(REQUEST);
+    await vi.waitFor(() => expect(emitters.has('sess-pi')).toBe(true));
+    emitters.get('sess-pi')!.emit(doneEvent());
+    await pending;
+
+    expect(getDraftDefaults).toHaveBeenCalledWith('pi');
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ agentKind: 'pi', model: 'gpt-5.5' }),
+    );
   });
 });
 
@@ -163,6 +199,127 @@ describe('专属会话建/复用', () => {
     emitters.get('sess-proj')!.emit(doneEvent());
     await p;
     expect(createSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('插件转述目录(request.workingDir)', () => {
+  it('台账里的目录:建会话带上该目录;归一化后的同目录会话可复用', async () => {
+    const createSession = vi.fn(async () => 'sess-repo');
+    const { deps, emitters } = makeDeps({
+      createSession,
+      isUserPickedDir: (ghostId, dir) => ghostId === 'helper' && dir === '/proj/repo',
+    });
+    const runner = createGhostErrandRunner(deps);
+    const p = runner({ ...REQUEST, workingDir: '/proj/repo/' });
+    await vi.waitFor(() => expect(emitters.has('sess-repo')).toBe(true));
+    emitters.get('sess-repo')!.emit(doneEvent());
+    await p;
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ workingDir: '/proj/repo' }),
+    );
+
+    // 第二单同目录:命中已有 project 间,不再新建。
+    const createAgain = vi.fn(async () => 'should-not-happen');
+    const second = makeDeps({
+      createSession: createAgain,
+      isUserPickedDir: () => true,
+      readSessionId: () => 'sess-repo',
+      getSessionRow: async () => ({
+        ...ACTIVE_ROW,
+        workspaceKind: 'project',
+        workingDir: '/proj/repo',
+      }),
+    });
+    const runner2 = createGhostErrandRunner(second.deps);
+    const p2 = runner2({ ...REQUEST, workingDir: '/proj/repo' });
+    await vi.waitFor(() => expect(second.emitters.has('sess-repo')).toBe(true));
+    second.emitters.get('sess-repo')!.emit(doneEvent());
+    await p2;
+    expect(createAgain).not.toHaveBeenCalled();
+  });
+
+  it('台账里没有的目录 → INVALID_REQUEST,不建会话不投递', async () => {
+    const createSession = vi.fn(async () => 'should-not-happen');
+    const dispatch = vi.fn(async () => ({ ok: true as const, wakeKind: 'resumed' as const }));
+    const { deps } = makeDeps({ createSession, dispatch, isUserPickedDir: () => false });
+    const runner = createGhostErrandRunner(deps);
+    const r = await runner({ ...REQUEST, workingDir: '/anywhere/else' });
+    expect(r).toMatchObject({ ok: false, errorCode: 'INVALID_REQUEST' });
+    expect(createSession).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it('用户在「AI 代办」卡配置了目录 → 用户配置优先,转述字段忽略(不查台账)', async () => {
+    const createSession = vi.fn(async () => 'sess-cfg');
+    const isUserPickedDir = vi.fn(() => false);
+    const { deps, emitters } = makeDeps({
+      readConfig: () => ({ workingDir: '/user/configured' }),
+      createSession,
+      isUserPickedDir,
+    });
+    const runner = createGhostErrandRunner(deps);
+    const p = runner({ ...REQUEST, workingDir: '/ghost/says' });
+    await vi.waitFor(() => expect(emitters.has('sess-cfg')).toBe(true));
+    emitters.get('sess-cfg')!.emit(doneEvent());
+    await p;
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ workingDir: '/user/configured' }),
+    );
+    expect(isUserPickedDir).not.toHaveBeenCalled();
+  });
+});
+
+describe('分会话钥匙(sessionKey)', () => {
+  it('带钥匙:按 ghostId+key 读映射,新建后按同一把钥匙写映射', async () => {
+    const readSessionId = vi.fn(() => null);
+    const keyedWrites: Array<[string, string | null, string | undefined]> = [];
+    const { deps, emitters } = makeDeps({
+      readSessionId,
+      writeSessionId: (ghostId, sessionId, sessionKey) => {
+        keyedWrites.push([ghostId, sessionId, sessionKey]);
+      },
+    });
+    const runner = createGhostErrandRunner(deps);
+    const p = runner({ ...REQUEST, sessionKey: 'pr-123' });
+    await vi.waitFor(() => expect(emitters.has('sess-new')).toBe(true));
+    const e = emitters.get('sess-new')!;
+    e.emit(textEvent('ok'));
+    e.emit(doneEvent());
+    await p;
+    expect(readSessionId).toHaveBeenCalledWith('helper', 'pr-123');
+    expect(keyedWrites).toContainEqual(['helper', 'sess-new', 'pr-123']);
+  });
+
+  it('钥匙间投递失败解除映射时同样带钥匙(不误伤共用间映射)', async () => {
+    const keyedWrites: Array<[string, string | null, string | undefined]> = [];
+    const { deps } = makeDeps({
+      readSessionId: () => 'sess-1',
+      writeSessionId: (ghostId, sessionId, sessionKey) => {
+        keyedWrites.push([ghostId, sessionId, sessionKey]);
+      },
+      dispatch: async () => ({ ok: false as const, errorCode: 'ARCHIVED', message: '归档了' }),
+    });
+    const r = await createGhostErrandRunner(deps)({ ...REQUEST, sessionKey: 'pr-9' });
+    expect(r).toMatchObject({ ok: false, errorCode: 'SESSION_UNAVAILABLE' });
+    expect(keyedWrites).toContainEqual(['helper', null, 'pr-9']);
+  });
+
+  it('不带钥匙:读写映射的 sessionKey 一律是 undefined(旧行为不变)', async () => {
+    const readSessionId = vi.fn(() => null);
+    const keyedWrites: Array<[string, string | null, string | undefined]> = [];
+    const { deps, emitters } = makeDeps({
+      readSessionId,
+      writeSessionId: (ghostId, sessionId, sessionKey) => {
+        keyedWrites.push([ghostId, sessionId, sessionKey]);
+      },
+    });
+    const runner = createGhostErrandRunner(deps);
+    const p = runner(REQUEST);
+    await vi.waitFor(() => expect(emitters.has('sess-new')).toBe(true));
+    emitters.get('sess-new')!.emit(doneEvent());
+    await p;
+    expect(readSessionId).toHaveBeenCalledWith('helper', undefined);
+    expect(keyedWrites).toContainEqual(['helper', 'sess-new', undefined]);
   });
 });
 

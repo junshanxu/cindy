@@ -57,6 +57,10 @@ describe('normalizeConfig(单插件配置清洗)', () => {
     expect(__testing.normalizeConfig({ permissionMode: 'ask' })).toEqual({});
   });
 
+  it('Pi 是合法的代办 agent', () => {
+    expect(__testing.normalizeConfig({ agentKind: 'pi' })).toEqual({ agentKind: 'pi' });
+  });
+
   it('非对象入参 → 空配置', () => {
     expect(__testing.normalizeConfig(null)).toEqual({});
     expect(__testing.normalizeConfig('x')).toEqual({});
@@ -80,8 +84,28 @@ describe('normalize(整文件清洗)', () => {
     });
   });
 
+  it('带钥匙的 sessions 条目(ghostId#key)原样保留', () => {
+    expect(
+      __testing.normalize({
+        errand: {},
+        sessions: { helper: 'sess-1', 'helper#pr-123': 'sess-2' },
+      }),
+    ).toEqual({
+      errand: {},
+      sessions: { helper: 'sess-1', 'helper#pr-123': 'sess-2' },
+    });
+  });
+
   it('非对象/缺区 → 全空', () => {
     expect(__testing.normalize(null)).toEqual({ errand: {}, sessions: {} });
     expect(__testing.normalize({})).toEqual({ errand: {}, sessions: {} });
+  });
+});
+
+describe('sessionMapKey(会话映射键)', () => {
+  it('缺省 = ghostId 本身;带钥匙 = ghostId#key(两侧字符集都不含 #,无歧义)', () => {
+    expect(__testing.sessionMapKey('helper')).toBe('helper');
+    expect(__testing.sessionMapKey('helper', undefined)).toBe('helper');
+    expect(__testing.sessionMapKey('helper', 'pr-123')).toBe('helper#pr-123');
   });
 });

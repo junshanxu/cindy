@@ -8,10 +8,11 @@
  *     把 `:last` 迁入树并清掉全部 fraction key;cleanupSessionLayoutPrefs 保留删除项
  *     只为兜底清理迁移前残留。
  *   - `rightSidebar.fileBrowser.treeWidth:${sid}`    / `rightSidebar.fileBrowser.treeWidth:last`
- *   - `rightSidebar.fileBrowser.treeCollapsed:${sid}`
+ *   - `rightSidebar.fileBrowser.treeCollapsed:${sid}` (无 fallback,默认展开)
  *   - `right-sidebar-collapsed:${sessionId}`         (无 fallback,折叠/展开默认 collapsed=true)
  *
- * **fallback 语义**:per-session key 没值时回退到 `:last`,`:last` 也没值才落硬编码默认。
+ * **fallback 语义**:上面明确带 `:last` 的 per-session key 没值时回退到 `:last`,
+ * `:last` 也没值才落硬编码默认。treeCollapsed 不使用 fallback。
  * 任意 session 的拖动 / setWidth / reset 都顺手把当前值镜像到 `:last`,所以新 session 总是继承"最近一次任意 session 的偏好"。
  *
  * **清理**:session 删除时由调用方 invoke `cleanupSessionLayoutPrefs(id)` 把该 id 的 key

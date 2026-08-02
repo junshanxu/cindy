@@ -52,6 +52,7 @@ import { cn } from '@/lib/utils';
 import { isGlobalDropIntercepted } from '@/lib/globalDropIntercept';
 import { toast } from '@/lib/toast';
 import { Tip } from '@/components/ui/tooltip';
+import { ImageLightbox } from '@/components/chat/ImageLightbox';
 import {
   useSessionScopedTreeWidth,
   TREE_MIN_WIDTH,
@@ -91,6 +92,7 @@ import {
 
 import type { TabKindHostContext } from '../../types';
 import type { FileBrowserState } from './index';
+import { buildFileTreeImagePreviewUrl } from './fileTreeImagePreview';
 import {
   countFileDragItems,
   hasFileDragPayload,
@@ -151,6 +153,7 @@ function FileBrowserBodyWithWorkdir({
   const tree = useFileTree({ workdir, hideMetaFiles: true, remoteHostId, deviceId });
   const fileContent = useFileContent(workdir, state.selectedFilePath, remoteHostId, deviceId);
   const [externalFile, setExternalFile] = useState<ExternalFileSelection | null>(null);
+  const [imageLightboxSrc, setImageLightboxSrc] = useState<string | null>(null);
   const externalFileContent = useFileContent(
     externalFile?.workdir ?? workdir,
     externalFile?.relPath ?? null,
@@ -346,6 +349,23 @@ function FileBrowserBodyWithWorkdir({
       }
     },
     [workdir, t],
+  );
+
+  const handlePreviewImage = useCallback(
+    (entry: DirEntry) => {
+      const src = buildFileTreeImagePreviewUrl({
+        workdir,
+        relPath: entry.relPath,
+        remoteHostId,
+        deviceId,
+      });
+      if (!src) {
+        toast.warning(t('ccAgent.workdirBrowse.unrenderable.remoteNotSupported'));
+        return;
+      }
+      setImageLightboxSrc(src);
+    },
+    [deviceId, remoteHostId, t, workdir],
   );
 
   const handleRevealInFolder = useCallback(
@@ -673,6 +693,7 @@ function FileBrowserBodyWithWorkdir({
                 tree={tree}
                 selectedPath={state.selectedFilePath}
                 onSelectFile={handleSelectFile}
+                onPreviewImage={handlePreviewImage}
                 onCopyFilePath={!isRemote ? handleCopyFilePath : undefined}
                 onRevealInFolder={!isRemote ? handleRevealInFolder : undefined}
                 onOpenInFileBrowser={ctx.sessionId ? handleOpenInFileBrowser : undefined}
@@ -709,6 +730,13 @@ function FileBrowserBodyWithWorkdir({
           aria-hidden="true"
         />
       )}
+      {imageLightboxSrc ? (
+        <ImageLightbox
+          src={imageLightboxSrc}
+          sessionId={ctx.sessionId}
+          onClose={() => setImageLightboxSrc(null)}
+        />
+      ) : null}
     </div>
   );
 }
@@ -800,7 +828,6 @@ function TreeHeader({
             type="button"
             onClick={onCollapseTree}
             aria-label={t('rightSidebar.fileBrowser.collapseTree')}
-            aria-pressed="true"
             className="flex size-5 items-center justify-center rounded-md text-sidebar-action-icon hover:bg-sidebar-item-active hover:text-sidebar-item-active-foreground"
           >
             <ChevronsRight size={14} strokeWidth={2} />
@@ -822,7 +849,6 @@ function CollapsedTreeRail({ onExpand }: { onExpand: () => void }) {
           type="button"
           onClick={onExpand}
           aria-label={label}
-          aria-pressed="false"
           className="flex size-6 items-center justify-center rounded-md text-sidebar-action-icon hover:bg-sidebar-item-active hover:text-sidebar-item-active-foreground"
         >
           <ChevronsLeft size={14} strokeWidth={2} />
