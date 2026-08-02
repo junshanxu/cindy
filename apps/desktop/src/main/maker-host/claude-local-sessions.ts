@@ -396,6 +396,7 @@ async function readScanSummaryFromHead(file: string, mtimeMs: number): Promise<C
   let cwd = projectDirFromClaudeStorageDir(path.basename(path.dirname(file))) ?? '';
   let sawTopLevelEvent = false;
   let removedIdeContextWithoutTitle = false;
+  let hitLineLimitBeforeTitle = false;
   let lineCount = 0;
 
   try {
@@ -407,6 +408,7 @@ async function readScanSummaryFromHead(file: string, mtimeMs: number): Promise<C
         !removedIdeContextWithoutTitle &&
         !isIdeOnlyUserRecord(obj)
       ) {
+        hitLineLimitBeforeTitle = true;
         break;
       }
       if (!obj || obj.isSidechain === true) continue;
@@ -436,7 +438,7 @@ async function readScanSummaryFromHead(file: string, mtimeMs: number): Promise<C
     input.destroy();
   }
 
-  if (!sawTopLevelEvent || !isLikelySessionId(sdkSessionId)) return null;
+  if (!sawTopLevelEvent || hitLineLimitBeforeTitle || !isLikelySessionId(sdkSessionId)) return null;
   return {
     sdkSessionId,
     title: title || 'Claude Code Session',

@@ -1161,6 +1161,47 @@ describe('parseClaudeCodeMessageLine', () => {
     }
   });
 
+  it('does not surface an unresolved candidate when the first real user input is past the line cap', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-scan-unresolved-cap-'));
+    const file = path.join(dir, `${sdkSessionId}.jsonl`);
+    const noiseRows = Array.from({ length: 399 }, (_, index) =>
+      line({
+        type: 'system',
+        subtype: 'noise',
+        cwd: '/tmp/project',
+        seq: index,
+      }),
+    );
+    fs.writeFileSync(
+      file,
+      [
+        line({
+          type: 'user',
+          uuid: 'user-synthetic',
+          cwd: '/tmp/project',
+          message: { role: 'user', content: '<local-command-caveat>ignore</local-command-caveat>' },
+        }),
+        ...noiseRows,
+        line({
+          type: 'user',
+          uuid: 'user-review-after-cap',
+          cwd: '/tmp/project',
+          message: {
+            role: 'user',
+            content: '<channel source="review-session-channel">\nReview this change',
+          },
+        }),
+      ].join('\n'),
+    );
+
+    try {
+      expect(await readClaudeCodeSessionScanSummary(file)).toBeNull();
+      expect(await readClaudeCodeSessionSummary(file)).toBeNull();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('scan summary is cached by (mtime, size) and re-parsed when the file changes', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-scan-cache-'));
     const file = path.join(dir, `${sdkSessionId}.jsonl`);
