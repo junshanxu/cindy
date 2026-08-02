@@ -9,7 +9,7 @@ const chatInputSource = readFileSync(
 );
 
 describe('effort runtime send guard', () => {
-  it('locks all composer mutations while a captured send waits for runtime synchronization', () => {
+  it('only locks composer mutations during the bounded effort preflight', () => {
     expect(chatInputSource).toContain(
       'const composerEditorLocked = disabled || sendDispatchInFlight;',
     );
@@ -19,5 +19,8 @@ describe('effort runtime send guard', () => {
     expect(chatInputSource).toContain('if (composerMutationLocked) return;');
     expect(chatInputSource).toContain('localAttachmentPickerEnabled && !composerMutationLocked ? addFiles : undefined');
     expect(chatInputSource).toContain('disabled={composerMutationLocked}');
+    expect(chatInputSource).toContain('setSendDispatchInFlight(true);');
+    expect(chatInputSource).toContain('setSendDispatchInFlight(false);');
+    expect(chatInputSource).not.toContain('coordinator.markRuntimeDirty(sessionId)');
   });
 });

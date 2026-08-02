@@ -22,10 +22,8 @@ export interface EffortChangeCoordinator {
   adoptExternalEffort(sessionId: string, effort: Effort, applyRuntime: ApplyRuntimeEffort): void;
   publishRuntimeEffort(sessionId: string, effort: Effort, applyRuntime: ApplyRuntimeEffort): void;
   suppressRuntimeEffort(sessionId: string): void;
-  /** runtime 同步是否失败或超时：用户选择已持久化，但引擎实际档位未追上。 */
+  /** runtime 同步失败：用户选择已持久化，但引擎实际档位未追上。 */
   isRuntimeDirty(sessionId: string): boolean;
-  /** 发送侧的超时要记住，避免下一次发送静默绕过仍未落定的 runtime 请求。 */
-  markRuntimeDirty(sessionId: string): void;
   /** 等待排队中的持久化和所有 runtime 投影都稳定下来。 */
   awaitRuntimeSettled(sessionId: string): Promise<void>;
 }
@@ -154,9 +152,6 @@ export function createEffortChangeCoordinator(): EffortChangeCoordinator {
     },
     isRuntimeDirty(sessionId) {
       return getLane(sessionId).runtimeDirty;
-    },
-    markRuntimeDirty(sessionId) {
-      getLane(sessionId).runtimeDirty = true;
     },
     async awaitRuntimeSettled(sessionId) {
       const lane = getLane(sessionId);

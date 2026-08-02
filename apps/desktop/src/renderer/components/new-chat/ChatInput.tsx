@@ -1168,12 +1168,6 @@ export function ChatInput({
     () => !!sessionId && hasPendingAgentSwitchOperation(sessionId),
     () => false,
   );
-  const agentSendDispatchInFlight = useSyncExternalStore(
-    subscribeAgentSwitchPending,
-    () => !!sessionId && hasPendingAgentSendDispatch(sessionId),
-    () => false,
-  );
-
   useEffect(() => {
     setPendingRemoteSwitch(null);
     setRemoteSwitchInFlight(false);
