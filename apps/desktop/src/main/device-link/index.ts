@@ -63,7 +63,7 @@ import {
   handleControllerOffline,
   purgeRevokedController,
 } from './dispatch';
-import { setBusyProbe, helloBusy, pollBusyChange, resetBusyDedupe } from './busyReporter';
+import { setBusyProbe, helloBusy, pollBusyChangeSafely, resetBusyDedupe } from './busyReporter';
 import {
   DL_VOICE_DICTIONARY_SYNC_CHANNEL,
   broadcastDictionaryNow,
@@ -825,7 +825,10 @@ function startBusyReporting(): void {
     pollExternalKeepAwakeChange();
     if (!client) return;
     pollExternalSettingsChange();
-    const busy = pollBusyChange(); // 只在 busy 与 dedupe 基线翻转时返回新值,否则 null
+    // 只在 busy 与 dedupe 基线翻转时返回新值,否则 null。
+    const busy = pollBusyChangeSafely((err) => {
+      log.warn('busy presence probe failed (will retry next tick)', err);
+    });
     if (busy === null) return;
     client.sendPresence({ busy });
   }, 5_000);

@@ -2,12 +2,13 @@
  * busyReporter 单测 —— 被控端 busy presence 的 dedupe 与重连补正(PR #166 review New-F)。
  * 核心:hello 必须报当前真实 busy 并同步 dedupe 基线,否则 turn 进行中重连会让其它设备整轮看成空闲。
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   setBusyProbe,
   currentBusy,
   helloBusy,
   pollBusyChange,
+  pollBusyChangeSafely,
   resetBusyDedupe,
   __testing,
 } from '../device-link/busyReporter';
@@ -28,6 +29,24 @@ describe('busyReporter', () => {
     expect(pollBusyChange()).toBeNull(); // 再探仍 true → 不上报
     busy = false;
     expect(pollBusyChange()).toBe(false); // 翻回 → 上报
+  });
+
+  it('pollBusyChangeSafely:probe 在会话切换期间失败时保留基线,下一轮恢复上报', () => {
+    const switchingError = Object.assign(new Error('App session is switching'), {
+      code: 'PRECONDITION_FAILED',
+    });
+    const onError = vi.fn();
+    setBusyProbe(() => {
+      throw switchingError;
+    });
+
+    expect(pollBusyChangeSafely(onError)).toBeNull();
+    expect(onError).toHaveBeenCalledWith(switchingError);
+    expect(__testing.getLastReported()).toBe(false);
+
+    setBusyProbe(() => true);
+    expect(pollBusyChangeSafely(onError)).toBe(true);
+    expect(__testing.getLastReported()).toBe(true);
   });
 
   it('helloBusy:返回当前 busy 并把它设成 dedupe 基线', () => {

@@ -46,6 +46,19 @@ export function pollBusyChange(): boolean | null {
   return busy;
 }
 
+/**
+ * 定时轮询入口:probe 的瞬态失败不应逃逸到 Electron 主进程。
+ * 失败时保留上一份 dedupe 基线,下一轮会重新读取真实状态并补报变化。
+ */
+export function pollBusyChangeSafely(onError: (error: unknown) => void): boolean | null {
+  try {
+    return pollBusyChange();
+  } catch (error) {
+    onError(error);
+    return null;
+  }
+}
+
 /** 登出 / 断连:重置 dedupe 基线,避免重连后首个真实 busy 状态被旧值压掉。 */
 export function resetBusyDedupe(): void {
   lastReportedBusy = false;
