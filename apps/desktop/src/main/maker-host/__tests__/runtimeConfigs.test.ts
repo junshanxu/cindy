@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 let memorySettings = {
@@ -96,11 +98,11 @@ describe('runtime-configs', () => {
       await import('../runtime-configs.js');
 
     expect(existsSync).not.toHaveBeenCalled();
-    const path = warmUpBundledRipgrep();
+    const ripgrepPath = warmUpBundledRipgrep();
     const probes = existsSync.mock.calls.length;
-    expect(path).toContain('/apps/ripgrep-bin/');
-    expect(desktopCodexRuntimeConfig.pathPrepends).toEqual([path.replace(/\/rg$/, '')]);
-    expect(getRipgrepBinaryPath()).toBe(path);
+    expect(ripgrepPath.replaceAll('\\', '/')).toContain('/apps/ripgrep-bin/');
+    expect(desktopCodexRuntimeConfig.pathPrepends).toEqual([path.dirname(ripgrepPath)]);
+    expect(getRipgrepBinaryPath()).toBe(ripgrepPath);
     expect(existsSync).toHaveBeenCalledTimes(probes);
   });
 
