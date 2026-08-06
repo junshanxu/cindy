@@ -56,6 +56,21 @@ describe('useSessionScopedTreeCollapsed', () => {
     expect(result.current.isTreeCollapsed).toBe(true);
   });
 
+  it('keeps multiple mounted tabs for one session in sync', () => {
+    const first = renderHook(() => useSessionScopedTreeCollapsed('A'));
+    const second = renderHook(() => useSessionScopedTreeCollapsed('A'));
+
+    act(() => first.result.current.toggleTreeCollapsed());
+
+    expect(first.result.current.isTreeCollapsed).toBe(true);
+    expect(second.result.current.isTreeCollapsed).toBe(true);
+
+    act(() => second.result.current.toggleTreeCollapsed());
+
+    expect(first.result.current.isTreeCollapsed).toBe(false);
+    expect(second.result.current.isTreeCollapsed).toBe(false);
+  });
+
   it('removes the preference when the tree is expanded again', () => {
     memStorage.setItem(kSession('A'), 'true');
     const { result } = renderHook(() => useSessionScopedTreeCollapsed('A'));

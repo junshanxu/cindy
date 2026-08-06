@@ -6,12 +6,12 @@
  * useSessionScopedTreeWidth 读取原来的宽度。
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useSyncExternalStore } from 'react';
 
 import { RSB_TREE_COLLAPSED_KEY_PREFIX } from '@/lib/sessionLayoutPrefs';
 
 function readTreeCollapsed(sessionId: string | null): boolean {
-  if (!sessionId) return false;
+  if (!sessionId) return transientTreeCollapsed;
   try {
     return localStorage.getItem(`${RSB_TREE_COLLAPSED_KEY_PREFIX}${sessionId}`) === 'true';
   } catch {
@@ -19,8 +19,28 @@ function readTreeCollapsed(sessionId: string | null): boolean {
   }
 }
 
+// localStorage 的 storage 事件不会在同一个 renderer 内触发；文件浏览器允许同一
+// session 同时挂载多个 tab，因此这里用一个轻量的进程内订阅把主动写入广播给其它
+// hook 实例。这样每个 tab 仍然只维护自己的 React 订阅，不需要把布局状态提升到
+// FileBrowserBody。
+const subscribers = new Set<() => void>();
+let transientTreeCollapsed = false;
+
+function subscribeTreeCollapsed(listener: () => void): () => void {
+  subscribers.add(listener);
+  return () => subscribers.delete(listener);
+}
+
+function notifyTreeCollapsedChanged(): void {
+  for (const listener of subscribers) listener();
+}
+
 function persistTreeCollapsed(sessionId: string | null, collapsed: boolean): void {
-  if (!sessionId) return;
+  if (!sessionId) {
+    transientTreeCollapsed = collapsed;
+    notifyTreeCollapsedChanged();
+    return;
+  }
   try {
     const key = `${RSB_TREE_COLLAPSED_KEY_PREFIX}${sessionId}`;
     if (collapsed) {
@@ -31,40 +51,28 @@ function persistTreeCollapsed(sessionId: string | null, collapsed: boolean): voi
   } catch {
     // localStorage 在 private mode 等环境可能不可用；界面状态仍可在当前运行期切换。
   }
+  notifyTreeCollapsedChanged();
 }
 
 export function useSessionScopedTreeCollapsed(sessionId: string | null) {
-  const [state, setState] = useState(() => ({
-    sessionId,
-    isTreeCollapsed: readTreeCollapsed(sessionId),
-  }));
-
-  // sessionId 更新时先从当前 session 的偏好派生渲染结果，避免 effect 同步前短暂显示
-  // 上一个 session 的状态；effect 仅负责让下一次交互也使用最新 session 的 state。
-  const isTreeCollapsed =
-    state.sessionId === sessionId ? state.isTreeCollapsed : readTreeCollapsed(sessionId);
-
-  // 同一 tab 切换会话时，折叠状态也必须切回对应会话的偏好。
-  useEffect(() => {
-    setState({ sessionId, isTreeCollapsed: readTreeCollapsed(sessionId) });
-  }, [sessionId]);
+  const subscribe = useCallback(subscribeTreeCollapsed, []);
+  const getSnapshot = useCallback(() => readTreeCollapsed(sessionId), [sessionId]);
+  const isTreeCollapsed = useSyncExternalStore(
+    subscribe,
+    getSnapshot,
+    // FileBrowserBody is not rendered during SSR, but keep the hook safe for SSR callers.
+    () => false,
+  );
 
   const setTreeCollapsed = useCallback(
     (collapsed: boolean) => {
-      setState({ sessionId, isTreeCollapsed: collapsed });
       persistTreeCollapsed(sessionId, collapsed);
     },
     [sessionId],
   );
 
   const toggleTreeCollapsed = useCallback(() => {
-    setState((current) => {
-      const currentCollapsed =
-        current.sessionId === sessionId ? current.isTreeCollapsed : readTreeCollapsed(sessionId);
-      const next = !currentCollapsed;
-      persistTreeCollapsed(sessionId, next);
-      return { sessionId, isTreeCollapsed: next };
-    });
+    persistTreeCollapsed(sessionId, !readTreeCollapsed(sessionId));
   }, [sessionId]);
 
   return { isTreeCollapsed, setTreeCollapsed, toggleTreeCollapsed };
