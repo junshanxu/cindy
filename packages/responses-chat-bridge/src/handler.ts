@@ -94,6 +94,15 @@ function responsesError(status: number, code: string, message: string): Record<s
   };
 }
 
+/**
+ * Some OpenAI-compatible text-only providers reject translated image parts as
+ * `image_url` where their schema accepts only `text`. Do not expose that raw
+ * provider JSON to the user when the actionable failure is known.
+ */
+function isUnsupportedImageInputUpstreamError(text: string): boolean {
+  return /\bimage_url\b/i.test(text) && /\bexpected\s+['"]?text\b/i.test(text);
+}
+
 async function readErrorText(upstream: Response): Promise<string> {
   try {
     return (await upstream.text()).slice(0, MAX_ERROR_BODY_CHARS);
@@ -255,10 +264,18 @@ export function createResponsesChatHandler(
         const text = await readErrorText(upstream);
         await reportUpstreamError(upstream.status, text);
         res.off('close', abortUpstream);
+        const unsupportedImageInput =
+          upstream.status === 400 && isUnsupportedImageInputUpstreamError(text);
         writeJson(
           res,
           upstream.status,
-          responsesError(upstream.status, 'upstream_error', text || `provider returned HTTP ${upstream.status}`),
+          responsesError(
+            upstream.status,
+            unsupportedImageInput ? 'unsupported_feature' : 'upstream_error',
+            unsupportedImageInput
+              ? 'This model does not support image input. Remove the image or switch to a vision-capable model.'
+              : text || `provider returned HTTP ${upstream.status}`,
+          ),
         );
         return;
       }
