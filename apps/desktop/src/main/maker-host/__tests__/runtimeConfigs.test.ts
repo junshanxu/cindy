@@ -7,6 +7,11 @@ let memorySettings = {
   pi: false,
 };
 
+const fsMocks = vi.hoisted(() => ({
+  existsSync: vi.fn(() => true),
+  chmodSync: vi.fn(),
+}));
+
 vi.mock('electron', () => ({
   app: {
     isPackaged: false,
@@ -22,12 +27,12 @@ vi.mock('node:fs', async () => {
   const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
   return {
     ...actual,
-    existsSync: vi.fn(() => true),
-    chmodSync: vi.fn(),
+    existsSync: fsMocks.existsSync,
+    chmodSync: fsMocks.chmodSync,
     default: {
       ...actual,
-      existsSync: vi.fn(() => true),
-      chmodSync: vi.fn(),
+      existsSync: fsMocks.existsSync,
+      chmodSync: fsMocks.chmodSync,
     },
   };
 });
@@ -40,8 +45,10 @@ vi.mock('../../model-access/effectiveEndpoint.js', async () => {
 });
 
 describe('runtime-configs', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
+    vi.clearAllMocks();
+    fsMocks.existsSync.mockReturnValue(true);
     memorySettings = {
       maker: true,
       claudeCode: false,
@@ -77,6 +84,33 @@ describe('runtime-configs', () => {
     expect(claudeConfig.makerMemoryEnabled).toBe(false);
     expect(desktopCodexRuntimeConfig.memoryEnabled).toBe(true);
     expect(desktopCodexRuntimeConfig.makerMemoryEnabled).toBe(false);
+  });
+
+  it('warms bundled ripgrep lazily and reuses a successful probe', async () => {
+    vi.doMock('../memory-settings-store.js', () => ({
+      readMemorySettings: () => memorySettings,
+    }));
+
+    const existsSync = fsMocks.existsSync;
+    const { warmUpBundledRipgrep, getRipgrepBinaryPath, desktopCodexRuntimeConfig } =
+      await import('../runtime-configs.js');
+
+    expect(existsSync).not.toHaveBeenCalled();
+    const path = warmUpBundledRipgrep();
+    const probes = existsSync.mock.calls.length;
+    expect(path).toContain('/apps/ripgrep-bin/');
+    expect(desktopCodexRuntimeConfig.pathPrepends).toEqual([path.replace(/\/rg$/, '')]);
+    expect(getRipgrepBinaryPath()).toBe(path);
+    expect(existsSync).toHaveBeenCalledTimes(probes);
+  });
+
+  it('fails during warmup when the bundled ripgrep binary is missing', async () => {
+    vi.doMock('../memory-settings-store.js', () => ({
+      readMemorySettings: () => memorySettings,
+    }));
+    fsMocks.existsSync.mockReturnValue(false);
+    const { warmUpBundledRipgrep } = await import('../runtime-configs.js');
+    expect(() => warmUpBundledRipgrep()).toThrow(/Bundled ripgrep not found/);
   });
 
   it('places generic Cindy-side Skill precedence in Claude and Codex only', async () => {

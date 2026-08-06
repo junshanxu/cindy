@@ -42,7 +42,11 @@ function ripgrepBinaryName(): string {
   return process.platform === 'win32' ? 'rg.exe' : 'rg';
 }
 
+let bundledRipgrepDirCache: string | undefined;
+
 function bundledRipgrepDir(): string {
+  if (bundledRipgrepDirCache) return bundledRipgrepDirCache;
+
   const key = platformKey();
   const file = ripgrepBinaryName();
   const candidates = app.isPackaged
@@ -59,6 +63,7 @@ function bundledRipgrepDir(): string {
     if (process.platform !== 'win32') {
       try { fs.chmodSync(bin, 0o755); } catch { /* ignore */ }
     }
+    bundledRipgrepDirCache = dir;
     return dir;
   }
 
@@ -74,6 +79,11 @@ function bundledRipgrepDir(): string {
  */
 export function getRipgrepBinaryPath(): string {
   return path.join(bundledRipgrepDir(), ripgrepBinaryName());
+}
+
+/** Validate and warm the bundled ripgrep path before constructing an agent. */
+export function warmUpBundledRipgrep(): string {
+  return getRipgrepBinaryPath();
 }
 
 // memorySettings 在 main 启动期已 ready (userData 同步可访问)。
@@ -239,7 +249,11 @@ export const desktopCodexRuntimeConfig: AgentRuntimeConfig = {
   behaviorFlags: (ctx) => (ctx.spawnMode === 'remote' ? {} : toolchainThreadCapEnv()),
   // 产品身份 + Skill 来源优先级 + Codex 专属段。
   systemPrompt: composeHostPrompt(codexSystemPrompt),
-  pathPrepends: [bundledRipgrepDir()],
+  // Keep the runtime config import-safe. The packaged/dev resource probe belongs
+  // to the first Codex agent construction, after desktop bootstrap is complete.
+  get pathPrepends() {
+    return [bundledRipgrepDir()];
+  },
   userDataPath: app.getPath('userData'),
   get memoryEnabled() {
     return readMemorySettings().codex;
