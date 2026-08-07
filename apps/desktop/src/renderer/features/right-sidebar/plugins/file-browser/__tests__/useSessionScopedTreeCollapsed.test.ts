@@ -93,4 +93,24 @@ describe('useSessionScopedTreeCollapsed', () => {
     cleanupSessionLayoutPrefs('A');
     expect(localStorage.getItem(kSession('A'))).toBeNull();
   });
+
+  it('keeps the runtime state when localStorage writes fail', () => {
+    // 配额耗尽 / private mode：写入抛错，但界面状态仍可在运行期切换（内存 override）。
+    vi.spyOn(memStorage, 'setItem').mockImplementation(() => {
+      throw new Error('QuotaExceededError');
+    });
+    vi.spyOn(memStorage, 'removeItem').mockImplementation(() => {
+      throw new Error('QuotaExceededError');
+    });
+
+    const { result } = renderHook(() => useSessionScopedTreeCollapsed('A'));
+    expect(result.current.isTreeCollapsed).toBe(false);
+
+    act(() => result.current.toggleTreeCollapsed());
+    // 持久化失败，但运行期状态经内存 override 仍可切换。
+    expect(result.current.isTreeCollapsed).toBe(true);
+
+    act(() => result.current.toggleTreeCollapsed());
+    expect(result.current.isTreeCollapsed).toBe(false);
+  });
 });
