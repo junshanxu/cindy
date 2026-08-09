@@ -442,6 +442,7 @@ export class PluginMarketService {
     const ledger = this.ledgerForOwner(owner);
     await this.adoptLegacyInstallations(plugins, ledger, owner);
     await this.backfillOfficialCindyGithubTrust(ledger, owner);
+    await this.restoreCorruptedInstallations(plugins, ledger, owner);
     // A snapshot is passive discovery: an empty runtime list can be caused by
     // startup, an owner transition, or a transient filesystem view. Only an
     // explicit uninstall may turn that absence into installed=false/opt-out.
@@ -1465,6 +1466,76 @@ export class PluginMarketService {
       });
     } finally {
       await fs.promises.rm(tempPath, { force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * 0.1.38 could observe the signed-out Ghost root during startup and mark every package in
+   * the stable owner root as removed. Recover only records whose original server provenance,
+   * current visible catalog entry, and on-disk validated manifest all agree. Requiring the
+   * recorded digest deliberately excludes older ambiguous records and genuine uninstalls whose
+   * package directory is gone.
+   */
+  private async restoreCorruptedInstallations(
+    plugins: readonly VisiblePluginSummary[],
+    ledger: PluginMarketLedger,
+    owner: ActiveAppSession,
+  ): Promise<void> {
+    const counts = ghostIdCounts(plugins);
+    const pluginByGhostId = new Map(
+      plugins
+        .filter((plugin) => counts.get(plugin.ghostId) === 1)
+        .map((plugin) => [plugin.ghostId, plugin]),
+    );
+    const installSubject = defaultInstallSubject(owner);
+    const ledgerData = ledger.read();
+    const records = Object.values(ledgerData.installations);
+
+    for (const expected of records) {
+      if (
+        expected.installed ||
+        expected.source !== 'market' ||
+        !expected.manifestDigest ||
+        !ledgerData.defaultInstallOptOuts[installSubject]?.includes(expected.pluginId)
+      ) {
+        continue;
+      }
+      const plugin = pluginByGhostId.get(expected.ghostId);
+      if (
+        !plugin ||
+        plugin.id !== expected.pluginId ||
+        plugin.scope !== expected.scope ||
+        plugin.organizationId !== expected.organizationId
+      ) {
+        continue;
+      }
+
+      await this.withLedgerMutation(owner, () => {
+        const current = ledger.installationForGhost(expected.ghostId);
+        if (
+          !current ||
+          current.installed ||
+          current.source !== 'market' ||
+          current.pluginId !== expected.pluginId ||
+          current.scope !== expected.scope ||
+          current.organizationId !== expected.organizationId ||
+          current.manifestDigest !== expected.manifestDigest ||
+          !ledger.isDefaultInstallSuppressed(installSubject, current.pluginId)
+        ) {
+          return;
+        }
+        const installed = getGhostManager()
+          .list()
+          .find((ghost) => ghost.manifest.id === current.ghostId);
+        if (!installed || installedGhostRawManifestDigest(installed.dir) !== current.manifestDigest) {
+          return;
+        }
+        if (!ledger.restoreInstallation(current.ghostId, installSubject)) return;
+        log.info('corrupted plugin installation ledger restored', {
+          pluginId: current.pluginId,
+          ghostId: current.ghostId,
+        });
+      });
     }
   }
 

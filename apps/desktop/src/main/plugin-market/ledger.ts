@@ -245,6 +245,30 @@ export class PluginMarketLedger {
     this.write(data);
   }
 
+  /**
+   * Repairs a false removal only after the caller has re-established package ownership from
+   * disk and catalog evidence. Unlike a fresh install, this preserves the original provenance
+   * record and removes only the matching opt-out written by the corrupted removal.
+   */
+  restoreInstallation(ghostId: string, userId: string): boolean {
+    const data = this.read();
+    const record = data.installations[ghostId];
+    const optOuts = data.defaultInstallOptOuts[userId] ?? [];
+    if (!record || record.installed || !optOuts.includes(record.pluginId)) return false;
+    data.installations[ghostId] = {
+      ...record,
+      installed: true,
+      updatedAt: new Date().toISOString(),
+    };
+    const remainingOptOuts = optOuts.filter(
+      (pluginId) => pluginId !== record.pluginId,
+    );
+    if (remainingOptOuts.length > 0) data.defaultInstallOptOuts[userId] = remainingOptOuts;
+    else delete data.defaultInstallOptOuts[userId];
+    this.write(data);
+    return true;
+  }
+
   isDefaultInstallSuppressed(userId: string, pluginId: string): boolean {
     return this.read().defaultInstallOptOuts[userId]?.includes(pluginId) ?? false;
   }

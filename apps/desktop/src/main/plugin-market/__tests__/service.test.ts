@@ -1675,6 +1675,49 @@ describe('PluginMarketService migration and defaultInstall', () => {
     expect(h.ledger.isDefaultInstallSuppressed('user-1', item.id)).toBe(false);
   });
 
+  it('restores a 0.1.38 false removal when catalog, owner, and disk digest agree', async () => {
+    const item = summary({ defaultInstall: true });
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-recovery-'));
+    roots.push(installDir);
+    const rawManifest = manifest();
+    fs.writeFileSync(path.join(installDir, 'ghost.json'), JSON.stringify(rawManifest));
+    runtime.ghosts = [{ manifest: rawManifest, dir: installDir, enabled: true }];
+    const h = harness([item]);
+    h.ledger.upsertInstallation(
+      recordForTest(item, { manifestDigest: ghostManifestDigest(rawManifest) }),
+    );
+    h.ledger.markRemoved(item.ghostId, 'user-1');
+
+    const snapshot = await h.service.snapshot();
+
+    expect(snapshot.items[0]).toMatchObject({ installState: 'installed', enabled: true });
+    expect(h.ledger.installationForGhost(item.ghostId)?.installed).toBe(true);
+    expect(h.ledger.isDefaultInstallSuppressed('user-1', item.id)).toBe(false);
+    expect(runtime.install).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing digest', undefined],
+    ['mismatched digest', 'f'.repeat(64)],
+  ] as const)('does not restore a false removal with %s', async (_label, manifestDigest) => {
+    const item = summary({ defaultInstall: true });
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-market-recovery-skip-'));
+    roots.push(installDir);
+    const rawManifest = manifest();
+    fs.writeFileSync(path.join(installDir, 'ghost.json'), JSON.stringify(rawManifest));
+    runtime.ghosts = [{ manifest: rawManifest, dir: installDir, enabled: true }];
+    const h = harness([item]);
+    h.ledger.upsertInstallation(recordForTest(item, { manifestDigest }));
+    h.ledger.markRemoved(item.ghostId, 'user-1');
+
+    const snapshot = await h.service.snapshot();
+
+    expect(snapshot.items[0]?.installState).toBe('conflict');
+    expect(h.ledger.installationForGhost(item.ghostId)?.installed).toBe(false);
+    expect(h.ledger.isDefaultInstallSuppressed('user-1', item.id)).toBe(true);
+    expect(runtime.install).not.toHaveBeenCalled();
+  });
+
   it('records an opt-out only after a tracked local uninstall succeeds', async () => {
     const item = summary({ defaultInstall: true });
     const h = harness([item]);

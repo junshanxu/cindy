@@ -70,6 +70,24 @@ describe('PluginMarketLedger', () => {
     ).toBe(false);
   });
 
+  it('restores one installation and removes only its matching opt-out', () => {
+    const { ledger } = harness();
+    const first = record();
+    const second = record({ pluginId: `c${'b'.repeat(24)}`, ghostId: 'cindy-other' });
+    ledger.upsertInstallation(first);
+    ledger.upsertInstallation(second);
+    ledger.markRemoved(first.ghostId, 'user-a');
+    ledger.markRemoved(second.ghostId, 'user-a');
+
+    expect(ledger.restoreInstallation(first.ghostId, 'user-a')).toBe(true);
+
+    expect(ledger.installationForGhost(first.ghostId)?.installed).toBe(true);
+    expect(ledger.installationForGhost(second.ghostId)?.installed).toBe(false);
+    expect(ledger.isDefaultInstallSuppressed('user-a', first.pluginId)).toBe(false);
+    expect(ledger.isDefaultInstallSuppressed('user-a', second.pluginId)).toBe(true);
+    expect(ledger.restoreInstallation(first.ghostId, 'user-a')).toBe(false);
+  });
+
   it('fails closed to an empty ledger for malformed or future data', () => {
     const { filePath, ledger } = harness();
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
