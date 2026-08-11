@@ -5318,6 +5318,7 @@ export function registerGhostIpc(): void {
             error: error instanceof Error ? error.message : String(error),
           });
           throwIpcError('INTERNAL', 'Unable to verify the installed Plugin source');
+        }
         // 用户已在本地包确认流程中明确选择了这份真实包：同 id 可以原位替换，
         // 市场来源不是永久所有权。替换前先切断旧市场更新路由；落位失败再恢复，
         // 全程不清理 Secret、KV、偏好或其它按 ghostId 保存的用户状态。
@@ -5356,6 +5357,7 @@ export function registerGhostIpc(): void {
             });
             throwIpcError('INTERNAL', 'Unable to detach the installed Plugin source');
           }
+        }
         getGhostAgentSlot().clearGhost(inspected.manifest.id);
         getGhostErrandSlot().clearGhost(inspected.manifest.id);
         let result: Awaited<ReturnType<typeof manager.update>>;

@@ -80,6 +80,9 @@ describe('market Ghost session boundary', () => {
       'const detachMarketRecord = Boolean(marketRecord?.installed)',
     );
     const runtimeStopIndex = body.indexOf('runtime.stop(inspected.manifest.id)');
+    const stopAndWaitIndex = body.indexOf(
+      'await getGhostNodeRuntimeBroker().stopAndWait(inspected.manifest.id);',
+    );
     const managerUpdateIndex = body.indexOf('result = await manager.update(');
     const detachIndex = body.indexOf(
       'marketLedger.markRemoved(inspected.manifest.id, marketInstallSubject)',
@@ -91,9 +94,12 @@ describe('market Ghost session boundary', () => {
     expect(leaseIndex).toBeGreaterThan(inspectIndex);
     expect(ledgerReadIndex).toBeGreaterThan(leaseIndex);
     expect(detachDecisionIndex).toBeGreaterThan(ledgerReadIndex);
-    expect(detachIndex).toBeGreaterThan(detachDecisionIndex);
-    expect(runtimeStopIndex).toBeGreaterThan(detachIndex);
-    expect(managerUpdateIndex).toBeGreaterThan(runtimeStopIndex);
+    expect(runtimeStopIndex).toBeGreaterThan(leaseIndex);
+    expect(stopAndWaitIndex).toBeGreaterThan(runtimeStopIndex);
+    // 只有确认旧进程退出，才切断旧市场的自动更新路由；等待失败时保留原路由，
+    // 也不会尝试恢复第二份 resident 进程。
+    expect(detachIndex).toBeGreaterThan(stopAndWaitIndex);
+    expect(managerUpdateIndex).toBeGreaterThan(detachIndex);
     expect(body).toContain('marketLedger.isDefaultInstallSuppressed(');
     expect(body).toContain('marketLedger.restoreInstallation(');
     expect(body).toContain('suppressed: marketRecordWasSuppressed');
