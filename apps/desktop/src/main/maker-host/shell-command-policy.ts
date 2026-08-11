@@ -1096,6 +1096,30 @@ function containsInterpreterHeredocBypass(command: string): boolean {
   return false;
 }
 
+/**
+ * Heredoc bodies are program text, not shell segments. They have already been
+ * checked for literal Simulator executors above; blank them before the general
+ * shell parser runs so Python/Node syntax cannot be mistaken for a shell
+ * executable or an unresolved expansion.
+ */
+function redactHeredocBodiesForShellParsing(command: string): string {
+  const lines = command.split(/\r?\n/);
+  let delimiter: string | null = null;
+
+  return lines
+    .map((line) => {
+      if (delimiter !== null) {
+        if (line.replace(/^\t+/, '').trim() === delimiter) delimiter = null;
+        return '';
+      }
+
+      const marker = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/.exec(line);
+      if (marker) delimiter = marker[2]!;
+      return line;
+    })
+    .join('\n');
+}
+
 /** A here-string is executable stdin just like a heredoc or producer pipeline. */
 function containsInterpreterHereStringBypass(command: string): boolean {
   for (const clause of shellClauses(command)) {
@@ -1322,7 +1346,10 @@ export function getDesktopShellCommandPolicy(
   // POSIX shells remove an unquoted backslash-newline before tokenization.
   // Mirror that expansion so the policy cannot be bypassed with continuations.
   const expandedCommand = command.replace(/\\\r?\n/g, '');
-  if (containsSimulatorBypass(expandedCommand)) {
+  if (
+    containsInterpreterHeredocBypass(expandedCommand) ||
+    containsSimulatorBypass(redactHeredocBodiesForShellParsing(expandedCommand))
+  ) {
     return { decision: 'deny', reason: IOS_SIMULATOR_SHELL_DENIAL };
   }
   return undefined;

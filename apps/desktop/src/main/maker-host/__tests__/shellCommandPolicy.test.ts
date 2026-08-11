@@ -202,6 +202,11 @@ PY`,
     'osascript -e \'tell application "Simulator" to quit\'',
     `python3 -c 'print("ordinary project build")'`,
     `python3 -c 'print("Simulator")'`,
+    `python3 - <<'PY'
+import json
+__import__("json")
+print(json.dumps({"ok": True}))
+PY`,
     `node -e 'console.log("ordinary project build")'`,
     'swift test --filter IOSSimulatorTests',
     'swift build --product IOSSimulatorRuntime',
