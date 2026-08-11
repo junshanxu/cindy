@@ -58,8 +58,10 @@ const MANAGED_CDP_PORT = 18800;
  *  - Only the fake-IP ranges used by system proxies are exempted from the SSRF
  *    guard. This prevents Surge/Clash/sing-box DNS answers (198.18.0.0/15 or
  *    IPv6 ULA) from making ordinary public sites look like SSRF attempts while
- *    localhost, RFC1918, metadata, link-local, and other special-use addresses
- *    remain blocked.
+ *    RFC1918, metadata, link-local, and other special-use addresses remain
+ *    blocked. `localhost` is the sole local-preview exception, so an agent can
+ *    open a developer's local web app without gaining access to the LAN or a
+ *    raw loopback IP address.
  *  - Page-context `evaluate` (and recipe `evaluate` steps) run author/agent JS in
  *    Chromium, whose network stack is NOT subject to the Node SSRF guard — a
  *    same-origin `fetch` there can reach any host the browser can. This residual
@@ -75,6 +77,7 @@ export function buildManagedConfig(): BrowserRuntimeConfig {
       ssrfPolicy: {
         allowRfc2544BenchmarkRange: true,
         allowIpv6UniqueLocalRange: true,
+        allowedHostnames: ['localhost'],
       },
       profiles: {
         [MANAGED_PROFILE]: {
