@@ -5290,11 +5290,11 @@ export function registerGhostIpc(): void {
     return withGhostInstallLock(inspected.manifest.id, async () => {
       const releaseMutation = beginGhostMutation(mutationOwner);
       const previousGhost = manager.list().find((g) => g.manifest.id === inspected.manifest.id);
-      runtime.stop(inspected.manifest.id);
-      // 等待失败表示旧进程仍可能存活；此时不能恢复 resident，否则会产生
-      // 两份后台进程。仅在确认退出后的更新阶段失败时恢复旧版本。
-      await getGhostNodeRuntimeBroker().stopAndWait(inspected.manifest.id);
       try {
+        runtime.stop(inspected.manifest.id);
+        // 等待失败表示旧进程仍可能存活；此时不能恢复 resident，否则会产生
+        // 两份后台进程。仅在确认退出后的更新阶段失败时恢复旧版本。
+        await getGhostNodeRuntimeBroker().stopAndWait(inspected.manifest.id);
         let marketRecord: PluginMarketInstallationRecord | null;
         let marketInstallSubject: string | null = null;
         let marketRecordWasSuppressed = false;
@@ -5313,6 +5313,7 @@ export function registerGhostIpc(): void {
               : false;
           }
         } catch (error) {
+          if (previousGhost) spawnIfResident(previousGhost);
           log.warn('failed to verify Plugin provenance before local update', {
             ghostId: inspected.manifest.id,
             error: error instanceof Error ? error.message : String(error),
@@ -5351,6 +5352,7 @@ export function registerGhostIpc(): void {
             marketLedger.markRemoved(inspected.manifest.id, marketInstallSubject);
           } catch (error) {
             restoreMarketRecord();
+            if (previousGhost) spawnIfResident(previousGhost);
             log.warn('failed to detach Plugin market provenance before local update', {
               ghostId: inspected.manifest.id,
               error: error instanceof Error ? error.message : String(error),

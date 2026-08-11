@@ -141,7 +141,7 @@ describe('market Ghost session boundary', () => {
     expect(restoreIndex).toBeGreaterThan(updateIndex);
   });
 
-  it('only restores a resident local-update plugin after shutdown was confirmed', () => {
+  it('releases the mutation lease for shutdown failures and restores only after confirmed shutdown', () => {
     const updateStart = source.indexOf("ipcMain.handle('ghosts:update'");
     const updateEnd = source.indexOf("ipcMain.handle('ghosts:pick-file'", updateStart);
     const body = source.slice(updateStart, updateEnd);
@@ -149,13 +149,19 @@ describe('market Ghost session boundary', () => {
     const waitIndex = body.indexOf(
       'await getGhostNodeRuntimeBroker().stopAndWait(inspected.manifest.id);',
     );
+    const tryIndex = body.indexOf('try {\n        runtime.stop(inspected.manifest.id);');
     const updateIndex = body.indexOf('result = await manager.update(lizFilePath');
     const restoreIndex = body.indexOf(
       'if (previousGhost) spawnIfResident(previousGhost);',
     );
 
+    expect(tryIndex).toBeGreaterThan(-1);
+    expect(tryIndex).toBeLessThan(waitIndex);
     expect(waitIndex).toBeGreaterThan(-1);
     expect(waitIndex).toBeLessThan(updateIndex);
-    expect(restoreIndex).toBeGreaterThan(updateIndex);
+    expect(restoreIndex).toBeGreaterThan(waitIndex);
+    expect(body).toContain('finally {\n        releaseMutation();');
+    expect(body).toContain("throwIpcError('INTERNAL', 'Unable to verify the installed Plugin source');");
+    expect(body).toContain("throwIpcError('INTERNAL', 'Unable to detach the installed Plugin source');");
   });
 });
