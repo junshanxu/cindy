@@ -1842,6 +1842,32 @@ function createXaiResponsesCompatTransform(): RequestTransform {
 }
 
 /**
+ * The XD Gateway also exposes Grok models under the `x-ai/` namespace. They
+ * stay on the gateway route (unlike the first-party `xai/` OAuth provider),
+ * but the upstream Grok Responses schema still rejects Codex namespace tools.
+ * Keep this transform deliberately narrow: gateway routing and the model
+ * namespace must both match before applying the same tool-shape cleanup.
+ */
+function createGatewayGrokResponsesCompatTransform(): RequestTransform {
+  return (body, ctx) => {
+    if (!isPlainObject(body)) return null;
+    const sessionId = sessionIdFromTransformCtx(ctx);
+    const explicitProviderId = sessionId ? getSessionProvider(sessionId) : null;
+    const inferredProviderId =
+      explicitProviderId ?? (typeof body.model === 'string' ? inferProviderIdForModel(body.model, 'codex') : null);
+    const wireModel = typeof body.model === 'string' ? body.model : undefined;
+    if (
+      inferredProviderId !== 'xd'
+      || !wireModel?.startsWith('x-ai/grok')
+      || !providerRoutingServesWireModel('xd', 'codex', wireModel)
+    ) {
+      return null;
+    }
+    return sanitizeXaiTools(body);
+  };
+}
+
+/**
  * 跨来源恢复的加密压缩历史兼容(Greptile P1, PR #265):
  *
  * OpenAI 远端压缩会把早期历史替换成加密 compaction 块(只有 ChatGPT 后端能解)。
@@ -2438,6 +2464,7 @@ function createTransformRequestChain(
     createXaiModelInputSanitizeTransform(),
     sanitizeDeepSeekV4CustomTools,
     createXaiResponsesCompatTransform(),
+    createGatewayGrokResponsesCompatTransform(),
     createByteDanceSeedResponsesCompatTransform(),
     createMiniMaxResponsesCompatTransform(),
     createProviderModelRewriteTransform(),
