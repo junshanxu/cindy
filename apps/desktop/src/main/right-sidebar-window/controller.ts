@@ -60,6 +60,7 @@ export interface RsbWindowControllerDeps {
 /** ensureOpenForAutomation 等 renderer ready 握手的超时。 */
 const READY_TIMEOUT_MS = 8000;
 const MAX_DEFERRED_SESSIONS = 8;
+const MAX_DEFERRED_COMMANDS_PER_SESSION = 8;
 
 /**
  * command 的宿主桶 session —— 裁决可见性与 deferred 排队都以它为准。
@@ -82,8 +83,8 @@ export class RsbWindowController {
     timeout: NodeJS.Timeout;
   }> = [];
   private lastContext: RsbWindowContext | null = null;
-  /** allowOpen=false 时每个 session 只保留最终有效命令，避免 remote memory intent 丢失。 */
-  private deferredCommands = new Map<string, RsbWindowCommand>();
+  /** allowOpen=false 时按宿主 session 保留有界、有序的 deferred 命令。 */
+  private deferredCommands = new Map<string, RsbWindowCommand[]>();
   private closeWaiters: Array<() => void> = [];
 
   constructor(private readonly deps: RsbWindowControllerDeps) {}
@@ -283,10 +284,10 @@ export class RsbWindowController {
     // 按宿主桶排队:跨会话 open-turn-review 属于 lead 的桶,须由 lead 上下文
     // flush;按 worker sessionId 入队会在 context 保持 lead 时永远刷不出来。
     const hostSessionId = commandHostSessionId(command);
-    const previous = this.deferredCommands.get(hostSessionId);
+    const queued = this.deferredCommands.get(hostSessionId);
     if (
       command.type === 'ensure-orca-workers-tab' &&
-      previous?.type === 'ensure-orca-workers-tab' &&
+      queued?.some((previous) => previous.type === 'ensure-orca-workers-tab') &&
       command.focusWorkerSessionId === undefined &&
       command.searchJump === undefined
     ) {
@@ -299,7 +300,10 @@ export class RsbWindowController {
       const oldest = this.deferredCommands.keys().next().value as string | undefined;
       if (oldest) this.deferredCommands.delete(oldest);
     }
-    this.deferredCommands.set(hostSessionId, command);
+    const next = queued ?? [];
+    if (next.length >= MAX_DEFERRED_COMMANDS_PER_SESSION) next.shift();
+    next.push(command);
+    this.deferredCommands.set(hostSessionId, next);
   }
 
   private flushDeferredCommandsToDetachedHost(): void {
@@ -314,22 +318,26 @@ export class RsbWindowController {
     }
     const sessionId = this.lastContext?.available ? this.lastContext.sessionId : null;
     if (!sessionId) return;
-    const command = this.deferredCommands.get(sessionId);
-    if (!command) return;
+    const commands = this.deferredCommands.get(sessionId);
+    if (!commands) return;
     this.deferredCommands.delete(sessionId);
-    this.deps.sendToWindow(this.winRef, this.deps.commandChannel, command);
+    for (const command of commands) {
+      this.deps.sendToWindow(this.winRef, this.deps.commandChannel, command);
+    }
   }
 
   private flushDeferredCommandsToAttachedHost(): void {
     if (this.deps.settings.read().detached) return;
     const sessionId = this.lastContext?.available ? this.lastContext.sessionId : null;
     if (!sessionId) return;
-    const command = this.deferredCommands.get(sessionId);
-    if (!command) return;
+    const commands = this.deferredCommands.get(sessionId);
+    if (!commands) return;
     const main = this.deps.getMainWindow();
     if (!main || main.isDestroyed()) return;
     this.deferredCommands.delete(sessionId);
-    this.deps.sendToWindow(main, this.deps.commandChannel, command);
+    for (const command of commands) {
+      this.deps.sendToWindow(main, this.deps.commandChannel, command);
+    }
   }
 
   private waitUntilClosed(): Promise<void> {

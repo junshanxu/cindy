@@ -607,6 +607,23 @@ describe('setContext / routeCommand', () => {
     expect(h.sendTargets.at(-1)).toBe(h.mainWin.webContents.id);
   });
 
+  it('flushes every queued passive command for the current session in order', async () => {
+    const h = makeHarness({ detached: true });
+    h.controller.setContext(ctx);
+    const first = { type: 'ensure-orca-workers-tab' as const, sessionId: 's1', focusTab: false };
+    const second = { type: 'close-orca-workers-tab' as const, sessionId: 's1' };
+    await h.controller.routeCommand({ command: first, allowOpen: false });
+    await h.controller.routeCommand({ command: second, allowOpen: false });
+
+    h.controller.open();
+    h.controller.markReady();
+
+    expect(h.sends.filter((entry) => entry.channel === 'cmd-channel')).toEqual([
+      { channel: 'cmd-channel', payload: first },
+      { channel: 'cmd-channel', payload: second },
+    ]);
+  });
+
   it('passive ensure 不覆盖已排队的显式 worker intent', async () => {
     const h = makeHarness({ detached: true });
     h.controller.setContext(ctx);
