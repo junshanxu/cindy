@@ -333,4 +333,41 @@ describe('desktop MCP approval policy', () => {
       }),
     ).toBe('auto-approve');
   });
+
+  it('requires approval before a trusted browser call can enter localhost', () => {
+    expect(
+      getDesktopMcpToolApprovalPolicy({
+        serverName: 'cindy_browser',
+        toolName: 'call_tool',
+        toolParams: {
+          name: 'browser',
+          args: { action: 'navigate', url: 'http://localhost:3000/' },
+        },
+      }),
+    ).toBe('prompt-each-time');
+    expect(
+      getDesktopMcpToolApprovalPolicy({
+        serverName: 'cindy_browser',
+        toolName: 'call_tool',
+        toolParams: {
+          name: 'browser',
+          args: { action: 'open', targetUrl: 'https://localhost:5173/' },
+        },
+      }),
+    ).toBe('prompt-each-time');
+    expect(
+      getDesktopMcpToolApprovalPolicy({
+        serverName: 'cindy_browser',
+        toolName: 'call_tool',
+        toolParams: { name: 'browser', args: { action: 'recipe', recipeId: 'local-preview' } },
+      }),
+    ).toBe('prompt-each-time');
+    expect(
+      getDesktopMcpToolApprovalPolicy({
+        serverName: 'cindy_browser',
+        toolName: 'call_tool',
+        toolParams: { name: 'browser', args: { action: 'navigate', url: 'https://example.com/' } },
+      }),
+    ).toBe('auto-approve');
+  });
 });

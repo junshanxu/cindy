@@ -167,6 +167,44 @@ function skipsRoutelessDeviceApproval(args: unknown): boolean {
   return !hasIOSSimulatorInstanceRoute(parsed);
 }
 
+/**
+ * Localhost is allowed by the managed browser's navigation guard only for the
+ * developer-preview use case. Keep that broad host exception behind a user
+ * approval so a trusted browser MCP server cannot silently probe an arbitrary
+ * local service or port.
+ *
+ * Uses `readJsonObject` so the approval sees the same shape the Host will
+ * actually execute, even if the bridge stringified the nested payload
+ * (issue #350).
+ */
+function isLocalhostBrowserNavigation(context: McpToolApprovalContext): boolean {
+  if (context.serverName !== 'cindy_browser' || context.toolName !== 'call_tool') return false;
+  const toolParams = readJsonObject(context.toolParams);
+  const args = readJsonObject(toolParams?.args) ?? toolParams;
+  if (!args) return false;
+
+  const action = args.action;
+  if (action === 'recipe') {
+    // Recipe inputs can resolve to a URL only after the MCP layer expands
+    // them, so the approval must happen before dispatch rather than relying
+    // on the caller's current input shape.
+    return true;
+  }
+  if (action !== 'navigate' && action !== 'open') return false;
+
+  const rawUrl = action === 'open' ? (args.url ?? args.targetUrl) : args.url;
+  if (typeof rawUrl !== 'string') return false;
+  try {
+    const parsed = new URL(rawUrl);
+    return (
+      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+      parsed.hostname.toLowerCase() === 'localhost'
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** Claude SDK 工具名格式固定为 `mcp__<server>__<tool>`。 */
 function toClaudeToolName(key: string): string {
   const [serverName, toolName] = key.split('::');
@@ -196,6 +234,9 @@ export function getDesktopMcpToolApprovalPolicy(
     return canAutoApproveContactsMcpTool({ toolName, toolParams })
       ? 'auto-approve'
       : 'prompt-each-time';
+  }
+  if (isLocalhostBrowserNavigation(context)) {
+    return 'prompt-each-time';
   }
   const iosSimulatorCall = readIOSSimulatorInnerCall(context);
   if (iosSimulatorCall) {

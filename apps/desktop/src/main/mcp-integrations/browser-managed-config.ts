@@ -59,9 +59,9 @@ const MANAGED_CDP_PORT = 18800;
  *    guard. This prevents Surge/Clash/sing-box DNS answers (198.18.0.0/15 or
  *    IPv6 ULA) from making ordinary public sites look like SSRF attempts while
  *    RFC1918, metadata, link-local, and other special-use addresses remain
- *    blocked. `localhost` is the sole local-preview exception, so an agent can
- *    open a developer's local web app without gaining access to the LAN or a
- *    raw loopback IP address.
+ *    blocked. `localhost` is the sole local-preview exception. The MCP approval
+ *    policy still requires a user approval for every localhost navigation, so
+ *    this broad hostname exception cannot silently probe arbitrary local ports.
  *  - Page-context `evaluate` (and recipe `evaluate` steps) run author/agent JS in
  *    Chromium, whose network stack is NOT subject to the Node SSRF guard — a
  *    same-origin `fetch` there can reach any host the browser can. This residual
