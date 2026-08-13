@@ -1347,6 +1347,18 @@ const XAI_SUPPORTED_TOOL_TYPES = new Set([
   'shell',
 ]);
 
+function xaiToolChoiceReferencesRemovedTool(
+  toolChoice: unknown,
+  tools: readonly unknown[],
+): boolean {
+  if (!isPlainObject(toolChoice) || typeof toolChoice.type !== 'string') return false;
+  return !tools.some((tool) => {
+    if (!isPlainObject(tool) || tool.type !== toolChoice.type) return false;
+    if (toolChoice.type !== 'function') return true;
+    return typeof toolChoice.name === 'string' && tool.name === toolChoice.name;
+  });
+}
+
 function sanitizeXaiTools(body: Record<string, unknown>): Record<string, unknown> | null {
   if (!Array.isArray(body.tools)) return null;
 
@@ -1358,6 +1370,12 @@ function sanitizeXaiTools(body: Record<string, unknown>): Record<string, unknown
       continue;
     }
     if (tool.type === 'web_search') {
+      // A cache-only request must not silently become a live web-search request
+      // just because xAI/Grok cannot represent external_web_access=false.
+      if (tool.external_web_access === false) {
+        changed = true;
+        continue;
+      }
       const nextTool: Record<string, unknown> = { type: 'web_search' };
       for (const key of ['filters', 'enable_image_understanding', 'enable_image_search']) {
         if (key in tool) nextTool[key] = tool[key];
@@ -1371,8 +1389,14 @@ function sanitizeXaiTools(body: Record<string, unknown>): Record<string, unknown
   if (!changed) return null;
 
   const next: Record<string, unknown> = { ...body };
-  if (tools.length > 0) next.tools = tools;
-  else delete next.tools;
+  if (tools.length > 0) {
+    next.tools = tools;
+    if (xaiToolChoiceReferencesRemovedTool(next.tool_choice, tools)) next.tool_choice = 'auto';
+  } else {
+    delete next.tools;
+    delete next.tool_choice;
+    delete next.parallel_tool_calls;
+  }
   return next;
 }
 

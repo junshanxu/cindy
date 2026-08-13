@@ -4149,6 +4149,8 @@ describe('codex proxy host', () => {
           { type: 'namespace', name: 'multi_agent_v1', tools: [] },
           { type: 'web_search', external_web_access: true },
         ],
+        tool_choice: { type: 'namespace', name: 'multi_agent_v1' },
+        parallel_tool_calls: false,
       };
       const ctx = {
         method: 'POST',
@@ -4166,9 +4168,95 @@ describe('codex proxy host', () => {
           { type: 'function', name: 'exec_command' },
           { type: 'web_search' },
         ],
+        tool_choice: 'auto',
+        parallel_tool_calls: false,
       });
     } finally {
       clearSessionProvider('session-xd-grok');
+      setXdGatewayModels([]);
+    }
+  });
+
+  it('drops Grok search when live web access is explicitly disabled', async () => {
+    const host = await freshCodexProxyHost();
+    const { setXdGatewayModels } = await import('../active-catalog.js');
+    const { setSessionProvider, clearSessionProvider } = await import('../session-provider-store.js');
+    setXdGatewayModels([{ id: 'x-ai/grok-4.5', agents: ['codex'] }]);
+    mockState.createAnthropicCompatProxy.mockResolvedValueOnce({
+      url: 'http://127.0.0.1:43210',
+      dispose: vi.fn(async () => undefined),
+    });
+    await host.ensureCodexProxyReady();
+    host.registerComposed('session-xd-grok-no-live-search', 'thread-xd-grok-no-live-search', 'PRODUCT_PROMPT');
+    setSessionProvider('session-xd-grok-no-live-search', 'xd');
+
+    try {
+      const transforms = mockState.createAnthropicCompatProxy.mock.calls[0]?.[0]?.transformRequest ?? [];
+      let current: unknown = {
+        model: 'x-ai/grok-4.5',
+        tools: [
+          { type: 'function', name: 'exec_command' },
+          { type: 'web_search', external_web_access: false },
+        ],
+        tool_choice: { type: 'web_search' },
+        parallel_tool_calls: true,
+      };
+      const ctx = {
+        method: 'POST',
+        url: '/responses',
+        headers: { 'thread-id': 'thread-xd-grok-no-live-search' },
+      };
+      for (const transform of transforms) {
+        const next = transform(current, ctx);
+        if (next !== null && next !== undefined) current = next;
+      }
+
+      expect(current).toEqual({
+        model: 'x-ai/grok-4.5',
+        tools: [{ type: 'function', name: 'exec_command' }],
+        tool_choice: 'auto',
+        parallel_tool_calls: true,
+      });
+    } finally {
+      clearSessionProvider('session-xd-grok-no-live-search');
+      setXdGatewayModels([]);
+    }
+  });
+
+  it('removes Grok tool controls when every declared tool is unsupported', async () => {
+    const host = await freshCodexProxyHost();
+    const { setXdGatewayModels } = await import('../active-catalog.js');
+    const { setSessionProvider, clearSessionProvider } = await import('../session-provider-store.js');
+    setXdGatewayModels([{ id: 'x-ai/grok-4.5', agents: ['codex'] }]);
+    mockState.createAnthropicCompatProxy.mockResolvedValueOnce({
+      url: 'http://127.0.0.1:43210',
+      dispose: vi.fn(async () => undefined),
+    });
+    await host.ensureCodexProxyReady();
+    host.registerComposed('session-xd-grok-no-tools', 'thread-xd-grok-no-tools', 'PRODUCT_PROMPT');
+    setSessionProvider('session-xd-grok-no-tools', 'xd');
+
+    try {
+      const transforms = mockState.createAnthropicCompatProxy.mock.calls[0]?.[0]?.transformRequest ?? [];
+      let current: unknown = {
+        model: 'x-ai/grok-4.5',
+        tools: [{ type: 'namespace', name: 'multi_agent_v1', tools: [] }],
+        tool_choice: { type: 'namespace', name: 'multi_agent_v1' },
+        parallel_tool_calls: false,
+      };
+      const ctx = {
+        method: 'POST',
+        url: '/responses',
+        headers: { 'thread-id': 'thread-xd-grok-no-tools' },
+      };
+      for (const transform of transforms) {
+        const next = transform(current, ctx);
+        if (next !== null && next !== undefined) current = next;
+      }
+
+      expect(current).toEqual({ model: 'x-ai/grok-4.5' });
+    } finally {
+      clearSessionProvider('session-xd-grok-no-tools');
       setXdGatewayModels([]);
     }
   });
