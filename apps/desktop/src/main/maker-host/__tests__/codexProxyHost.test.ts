@@ -3542,6 +3542,20 @@ describe('codex proxy host', () => {
       expect(out.tools).toEqual([{ type: 'x_search' }]);
     });
 
+    it('first-party xAI 过滤空工具后仍保留 tool_choice:none,避免重新注入的 x_search 被调用', async () => {
+      const out = (await runXaiTransforms('none-after-filter', {
+        model: 'xai/grok-4.5',
+        tools: [{ type: 'namespace', name: 'multi_agent_v1', tools: [] }],
+        tool_choice: 'none',
+        parallel_tool_calls: false,
+        input: [{ role: 'user', content: 'hi' }],
+      })) as Record<string, unknown>;
+
+      expect(out.tools).toEqual([{ type: 'x_search' }]);
+      expect(out.tool_choice).toBe('none');
+      expect(out).not.toHaveProperty('parallel_tool_calls');
+    });
+
     it('上游已声明 x_search 时不重复注入,也不覆盖其参数', async () => {
       const out = (await runXaiTransforms('already-declared', {
         model: 'xai/grok-4.5',
@@ -4241,7 +4255,7 @@ describe('codex proxy host', () => {
       let current: unknown = {
         model: 'x-ai/grok-4.5',
         tools: [{ type: 'namespace', name: 'multi_agent_v1', tools: [] }],
-        tool_choice: { type: 'namespace', name: 'multi_agent_v1' },
+        tool_choice: 'none',
         parallel_tool_calls: false,
       };
       const ctx = {

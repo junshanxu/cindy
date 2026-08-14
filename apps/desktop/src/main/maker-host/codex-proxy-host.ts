@@ -1359,7 +1359,10 @@ function xaiToolChoiceReferencesRemovedTool(
   });
 }
 
-function sanitizeXaiTools(body: Record<string, unknown>): Record<string, unknown> | null {
+function sanitizeXaiTools(
+  body: Record<string, unknown>,
+  options: { preserveNoneToolChoice?: boolean } = {},
+): Record<string, unknown> | null {
   if (!Array.isArray(body.tools)) return null;
 
   let changed = false;
@@ -1394,7 +1397,9 @@ function sanitizeXaiTools(body: Record<string, unknown>): Record<string, unknown
     if (xaiToolChoiceReferencesRemovedTool(next.tool_choice, tools)) next.tool_choice = 'auto';
   } else {
     delete next.tools;
-    delete next.tool_choice;
+    if (!(options.preserveNoneToolChoice && next.tool_choice === 'none')) {
+      delete next.tool_choice;
+    }
     delete next.parallel_tool_calls;
   }
   return next;
@@ -1830,7 +1835,7 @@ function createXaiResponsesCompatTransform(): RequestTransform {
     if (current) changed = true;
     else current = body;
 
-    const withSanitizedTools = sanitizeXaiTools(current);
+    const withSanitizedTools = sanitizeXaiTools(current, { preserveNoneToolChoice: true });
     if (withSanitizedTools) {
       current = withSanitizedTools;
       changed = true;
