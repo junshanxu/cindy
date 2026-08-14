@@ -381,21 +381,22 @@ function providerAwareGuardianReviewerModel(
     : mainModel;
 }
 
-const GUARDIAN_PROVIDER_SEARCH_TOOL_TYPES = new Set(['web_search', 'x_search']);
+const PROVIDER_SEARCH_TOOL_TYPES = new Set(['web_search', 'x_search']);
 
 function providerSearchToolChoiceReferencesRemovedTool(
   toolChoice: unknown,
   tools: readonly unknown[],
 ): boolean {
   if (!isPlainObject(toolChoice) || typeof toolChoice.type !== 'string') return false;
-  if (!GUARDIAN_PROVIDER_SEARCH_TOOL_TYPES.has(toolChoice.type)) return false;
+  if (!PROVIDER_SEARCH_TOOL_TYPES.has(toolChoice.type)) return false;
   return !tools.some((tool) => isPlainObject(tool) && tool.type === toolChoice.type);
 }
 
 /**
- * Guardian decides whether another action may run. Provider-hosted search
- * tools must not let that reviewer initiate an unrelated upstream network
- * action with the approval context.
+ * Responses-native search tools are not valid on Chat Completions bridges and
+ * must not be forwarded to provider-hosted requests. Guardian review requests
+ * also need the same stripping so the reviewer cannot initiate an unrelated
+ * upstream network action with the approval context.
  */
 function stripProviderSearchTools(
   body: Record<string, unknown>,
@@ -405,7 +406,7 @@ function stripProviderSearchTools(
     (tool) =>
       !isPlainObject(tool) ||
       typeof tool.type !== 'string' ||
-      !GUARDIAN_PROVIDER_SEARCH_TOOL_TYPES.has(tool.type),
+      !PROVIDER_SEARCH_TOOL_TYPES.has(tool.type),
   );
   if (tools.length === body.tools.length) return body;
 
@@ -2566,8 +2567,7 @@ export async function ensureCodexControlPlaneProxyReady(
   if (existing) return existing;
 
   const generation = _disposeGeneration;
-  let start!: Promise<void>;
-  start = (async () => {
+  const start = (async () => {
     try {
       const handle = await createCodexProxyHandle(authInjection);
       if (generation !== _disposeGeneration) {

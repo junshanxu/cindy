@@ -2544,6 +2544,65 @@ describe('codex proxy host', () => {
     setCustomProviders([]);
   });
 
+  it('removes search-only Chat bridge controls when no function tool remains', async () => {
+    const host = await freshCodexProxyHost();
+    const { buildUserProvider } = await import('@cindy/model-providers');
+    const { setCustomProviders } = await import('../active-catalog.js');
+    const { setCustomProviderKeyReader } = await import('../provider-route.js');
+    const { setSessionProvider, clearSessionProvider } = await import('../session-provider-store.js');
+    setCustomProviders([
+      buildUserProvider({
+        id: 'search-only-chat-provider',
+        name: 'Search-only Chat Provider',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://chat-provider.example/v1',
+            wireProtocol: 'openai-chat',
+            models: [{ id: 'chat-search-model', name: 'Chat Search Model' }],
+          },
+        },
+      }),
+    ]);
+    setCustomProviderKeyReader(() => 'chat-search-key');
+    host.registerComposed('session-search-only-chat', 'thread-search-only-chat', 'PRODUCT_PROMPT');
+    setSessionProvider('session-search-only-chat', 'search-only-chat-provider');
+
+    const parsedBody = {
+      model: 'chat-search-model',
+      tools: [{ type: 'web_search' }],
+      tool_choice: { type: 'web_search' },
+      parallel_tool_calls: true,
+      input: [{ role: 'user', content: 'hello' }],
+    };
+    const ctx = {
+      reqId: 1,
+      method: 'POST',
+      url: '/responses',
+      headers: { 'thread-id': 'thread-search-only-chat' },
+    };
+    const decision = await Promise.resolve(host.createModelRoutingTransform()(parsedBody, ctx));
+    expect(decision).toEqual(expect.objectContaining({ localHandler: expect.any(Function) }));
+    if (!decision?.localHandler) throw new Error('expected Chat bridge local handler');
+
+    const res = {} as never;
+    await decision.localHandler({ rawBody: Buffer.from(JSON.stringify(parsedBody)), parsedBody, ctx, res });
+    const bridge = mockState.createResponsesChatHandler.mock.results.at(-1)?.value as
+      | { handle: ReturnType<typeof vi.fn> }
+      | undefined;
+    expect(bridge?.handle).toHaveBeenCalledWith({
+      parsedBody: {
+        model: 'chat-search-model',
+        input: [{ role: 'user', content: 'hello' }],
+        instructions: 'PRODUCT_PROMPT',
+      },
+      res,
+    });
+
+    clearSessionProvider('session-search-only-chat');
+    setCustomProviderKeyReader(() => null);
+    setCustomProviders([]);
+  });
+
   it('passes the parent session model into a Guardian request handled by the Anthropic bridge', async () => {
     const host = await freshCodexProxyHost();
     const { buildUserProvider } = await import('@cindy/model-providers');
