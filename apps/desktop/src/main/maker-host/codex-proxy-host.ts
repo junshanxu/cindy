@@ -388,8 +388,26 @@ function providerSearchToolChoiceReferencesRemovedTool(
   tools: readonly unknown[],
 ): boolean {
   if (!isPlainObject(toolChoice) || typeof toolChoice.type !== 'string') return false;
-  if (!PROVIDER_SEARCH_TOOL_TYPES.has(toolChoice.type)) return false;
-  return !tools.some((tool) => isPlainObject(tool) && tool.type === toolChoice.type);
+  // Direct provider-hosted tool type: { type: 'web_search' } / { type: 'x_search' }.
+  if (PROVIDER_SEARCH_TOOL_TYPES.has(toolChoice.type)) {
+    return !tools.some((tool) => isPlainObject(tool) && tool.type === toolChoice.type);
+  }
+  // Named function/custom form: { type: 'function', name: 'web_search' }
+  // or { type: 'function', function: { name: 'web_search' } }. Mirrors
+  // explicitlySelectsDroppedWebSearch in the responses-chat-bridge so a
+  // function-style selection of a stripped provider search tool is also reset.
+  if (toolChoice.type !== 'function' && toolChoice.type !== 'custom') return false;
+  const nestedFunction = isPlainObject(toolChoice.function) ? toolChoice.function : undefined;
+  const name = typeof toolChoice.name === 'string'
+    ? toolChoice.name
+    : (typeof nestedFunction?.name === 'string' ? nestedFunction.name : undefined);
+  if (typeof name !== 'string' || !PROVIDER_SEARCH_TOOL_TYPES.has(name)) return false;
+  return !tools.some(
+    (tool) =>
+      isPlainObject(tool)
+      && (tool.type === 'function' || tool.type === 'custom')
+      && tool.name === name,
+  );
 }
 
 /**
@@ -409,6 +427,12 @@ function stripProviderSearchTools(
       !PROVIDER_SEARCH_TOOL_TYPES.has(tool.type),
   );
   if (tools.length === body.tools.length) return body;
+
+  // If stripping removes every tool while the caller demands `required`, leave
+  // the body untouched so the responses-chat-bridge fail-closed check rejects
+  // the request with unsupported_feature instead of silently relaxing the
+  // requirement and answering as though no tool were requested.
+  if (tools.length === 0 && body.tool_choice === 'required') return body;
 
   const next = { ...body };
   if (tools.length > 0) {
@@ -2567,7 +2591,8 @@ export async function ensureCodexControlPlaneProxyReady(
   if (existing) return existing;
 
   const generation = _disposeGeneration;
-  const start = (async () => {
+  let start!: Promise<void>;
+  start = (async () => {
     try {
       const handle = await createCodexProxyHandle(authInjection);
       if (generation !== _disposeGeneration) {

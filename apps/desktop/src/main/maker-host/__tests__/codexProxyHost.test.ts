@@ -2603,6 +2603,175 @@ describe('codex proxy host', () => {
     setCustomProviders([]);
   });
 
+  it('strips function-style tool_choice selecting web_search when other tools remain', async () => {
+    const host = await freshCodexProxyHost();
+    const { buildUserProvider } = await import('@cindy/model-providers');
+    const { setCustomProviders } = await import('../active-catalog.js');
+    const { setCustomProviderKeyReader } = await import('../provider-route.js');
+    const { setSessionProvider, clearSessionProvider } = await import('../session-provider-store.js');
+    setCustomProviders([
+      buildUserProvider({
+        id: 'fn-choice-chat-provider',
+        name: 'Function-choice Chat Provider',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://fn-choice.example/v1',
+            wireProtocol: 'openai-chat',
+            models: [{ id: 'fn-choice-model', name: 'FN Choice Model' }],
+          },
+        },
+      }),
+    ]);
+    setCustomProviderKeyReader(() => 'fn-choice-key');
+    host.registerComposed('session-fn-choice', 'thread-fn-choice', 'PRODUCT_PROMPT');
+    setSessionProvider('session-fn-choice', 'fn-choice-chat-provider');
+
+    const parsedBody = {
+      model: 'fn-choice-model',
+      tools: [{ type: 'function', name: 'shell' }, { type: 'web_search' }],
+      tool_choice: { type: 'function', name: 'web_search' },
+      input: [{ role: 'user', content: 'hello' }],
+    };
+    const ctx = { reqId: 1, method: 'POST', url: '/responses', headers: { 'thread-id': 'thread-fn-choice' } };
+    const decision = await Promise.resolve(host.createModelRoutingTransform()(parsedBody, ctx));
+    expect(decision).toEqual(expect.objectContaining({ localHandler: expect.any(Function) }));
+    if (!decision?.localHandler) throw new Error('expected Chat bridge local handler');
+
+    const res = {} as never;
+    await decision.localHandler({ rawBody: Buffer.from(JSON.stringify(parsedBody)), parsedBody, ctx, res });
+    const bridge = mockState.createResponsesChatHandler.mock.results.at(-1)?.value as
+      | { handle: ReturnType<typeof vi.fn> }
+      | undefined;
+    expect(bridge?.handle).toHaveBeenCalledWith({
+      parsedBody: {
+        ...parsedBody,
+        instructions: 'PRODUCT_PROMPT',
+        tools: [{ type: 'function', name: 'shell' }],
+        tool_choice: 'auto',
+      },
+      res,
+    });
+
+    clearSessionProvider('session-fn-choice');
+    setCustomProviderKeyReader(() => null);
+    setCustomProviders([]);
+  });
+
+  it('strips nested-function tool_choice selecting web_search when other tools remain', async () => {
+    const host = await freshCodexProxyHost();
+    const { buildUserProvider } = await import('@cindy/model-providers');
+    const { setCustomProviders } = await import('../active-catalog.js');
+    const { setCustomProviderKeyReader } = await import('../provider-route.js');
+    const { setSessionProvider, clearSessionProvider } = await import('../session-provider-store.js');
+    setCustomProviders([
+      buildUserProvider({
+        id: 'nested-fn-choice-provider',
+        name: 'Nested-function Chat Provider',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://nested-fn.example/v1',
+            wireProtocol: 'openai-chat',
+            models: [{ id: 'nested-fn-model', name: 'Nested FN Model' }],
+          },
+        },
+      }),
+    ]);
+    setCustomProviderKeyReader(() => 'nested-fn-key');
+    host.registerComposed('session-nested-fn', 'thread-nested-fn', 'PRODUCT_PROMPT');
+    setSessionProvider('session-nested-fn', 'nested-fn-choice-provider');
+
+    const parsedBody = {
+      model: 'nested-fn-model',
+      tools: [{ type: 'function', name: 'shell' }, { type: 'web_search' }],
+      tool_choice: { type: 'function', function: { name: 'web_search' } },
+      input: [{ role: 'user', content: 'hello' }],
+    };
+    const ctx = { reqId: 1, method: 'POST', url: '/responses', headers: { 'thread-id': 'thread-nested-fn' } };
+    const decision = await Promise.resolve(host.createModelRoutingTransform()(parsedBody, ctx));
+    expect(decision).toEqual(expect.objectContaining({ localHandler: expect.any(Function) }));
+    if (!decision?.localHandler) throw new Error('expected Chat bridge local handler');
+
+    const res = {} as never;
+    await decision.localHandler({ rawBody: Buffer.from(JSON.stringify(parsedBody)), parsedBody, ctx, res });
+    const bridge = mockState.createResponsesChatHandler.mock.results.at(-1)?.value as
+      | { handle: ReturnType<typeof vi.fn> }
+      | undefined;
+    expect(bridge?.handle).toHaveBeenCalledWith({
+      parsedBody: {
+        ...parsedBody,
+        instructions: 'PRODUCT_PROMPT',
+        tools: [{ type: 'function', name: 'shell' }],
+        tool_choice: 'auto',
+      },
+      res,
+    });
+
+    clearSessionProvider('session-nested-fn');
+    setCustomProviderKeyReader(() => null);
+    setCustomProviders([]);
+  });
+
+  it('does not strip search-only tools when tool_choice is required so the bridge fail-closed check runs', async () => {
+    const host = await freshCodexProxyHost();
+    const { buildUserProvider } = await import('@cindy/model-providers');
+    const { setCustomProviders } = await import('../active-catalog.js');
+    const { setCustomProviderKeyReader } = await import('../provider-route.js');
+    const { setSessionProvider, clearSessionProvider } = await import('../session-provider-store.js');
+    setCustomProviders([
+      buildUserProvider({
+        id: 'required-search-provider',
+        name: 'Required Search Provider',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://required-search.example/v1',
+            wireProtocol: 'openai-chat',
+            models: [{ id: 'required-search-model', name: 'Required Search Model' }],
+          },
+        },
+      }),
+    ]);
+    setCustomProviderKeyReader(() => 'required-search-key');
+    host.registerComposed('session-required-search', 'thread-required-search', 'PRODUCT_PROMPT');
+    setSessionProvider('session-required-search', 'required-search-provider');
+
+    const parsedBody = {
+      model: 'required-search-model',
+      tools: [{ type: 'web_search' }],
+      tool_choice: 'required',
+      parallel_tool_calls: true,
+      input: [{ role: 'user', content: 'hello' }],
+    };
+    const ctx = {
+      reqId: 1,
+      method: 'POST',
+      url: '/responses',
+      headers: { 'thread-id': 'thread-required-search' },
+    };
+    const decision = await Promise.resolve(host.createModelRoutingTransform()(parsedBody, ctx));
+    expect(decision).toEqual(expect.objectContaining({ localHandler: expect.any(Function) }));
+    if (!decision?.localHandler) throw new Error('expected Chat bridge local handler');
+
+    const res = {} as never;
+    await decision.localHandler({ rawBody: Buffer.from(JSON.stringify(parsedBody)), parsedBody, ctx, res });
+    const bridge = mockState.createResponsesChatHandler.mock.results.at(-1)?.value as
+      | { handle: ReturnType<typeof vi.fn> }
+      | undefined;
+    // The body must be forwarded with web_search and tool_choice:'required' intact
+    // so the bridge's fail-closed check rejects it with unsupported_feature rather
+    // than silently relaxing the requirement after the strip.
+    expect(bridge?.handle).toHaveBeenCalledWith({
+      parsedBody: {
+        ...parsedBody,
+        instructions: 'PRODUCT_PROMPT',
+      },
+      res,
+    });
+
+    clearSessionProvider('session-required-search');
+    setCustomProviderKeyReader(() => null);
+    setCustomProviders([]);
+  });
+
   it('passes the parent session model into a Guardian request handled by the Anthropic bridge', async () => {
     const host = await freshCodexProxyHost();
     const { buildUserProvider } = await import('@cindy/model-providers');
