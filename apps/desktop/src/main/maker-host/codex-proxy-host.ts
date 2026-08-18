@@ -1347,21 +1347,31 @@ const XAI_SUPPORTED_TOOL_TYPES = new Set([
   'shell',
 ]);
 
-function xaiToolChoiceReferencesRemovedTool(
+function xaiToolChoiceAfterSanitize(
   toolChoice: unknown,
   tools: readonly unknown[],
-): boolean {
-  if (!isPlainObject(toolChoice) || typeof toolChoice.type !== 'string') return false;
-  return !tools.some((tool) => {
-    if (!isPlainObject(tool) || tool.type !== toolChoice.type) return false;
-    if (toolChoice.type !== 'function') return true;
-    return typeof toolChoice.name === 'string' && tool.name === toolChoice.name;
+): unknown {
+  if (!isPlainObject(toolChoice) || typeof toolChoice.type !== 'string') return toolChoice;
+
+  const referencesSurvivingTool = (choice: Record<string, unknown>) => tools.some((tool) => {
+    if (!isPlainObject(tool) || tool.type !== choice.type) return false;
+    if (choice.type !== 'function') return true;
+    return typeof choice.name === 'string' && tool.name === choice.name;
   });
+
+  if (toolChoice.type === 'allowed_tools' && Array.isArray(toolChoice.tools)) {
+    const allowedTools = toolChoice.tools.filter(
+      (choice): choice is Record<string, unknown> => isPlainObject(choice) && referencesSurvivingTool(choice),
+    );
+    return allowedTools.length > 0 ? { ...toolChoice, tools: allowedTools } : 'auto';
+  }
+
+  return referencesSurvivingTool(toolChoice) ? toolChoice : 'auto';
 }
 
 function sanitizeXaiTools(
   body: Record<string, unknown>,
-  options: { preserveNoneToolChoice?: boolean } = {},
+  options: { preserveNoneToolChoice?: boolean; preserveSerialToolCalls?: boolean } = {},
 ): Record<string, unknown> | null {
   if (!Array.isArray(body.tools)) return null;
 
@@ -1375,13 +1385,14 @@ function sanitizeXaiTools(
     if (tool.type === 'web_search') {
       // A cache-only request must not silently become a live web-search request
       // just because xAI/Grok cannot represent external_web_access=false.
-      if (tool.external_web_access === false) {
+      const toolRecord = tool as Record<string, unknown>;
+      if (toolRecord.external_web_access === false) {
         changed = true;
         continue;
       }
       const nextTool: Record<string, unknown> = { type: 'web_search' };
       for (const key of ['filters', 'enable_image_understanding', 'enable_image_search']) {
-        if (key in tool) nextTool[key] = tool[key];
+        if (key in tool) nextTool[key] = toolRecord[key];
       }
       if (Object.keys(nextTool).length !== Object.keys(tool).length) changed = true;
       tools.push(nextTool);
@@ -1394,13 +1405,15 @@ function sanitizeXaiTools(
   const next: Record<string, unknown> = { ...body };
   if (tools.length > 0) {
     next.tools = tools;
-    if (xaiToolChoiceReferencesRemovedTool(next.tool_choice, tools)) next.tool_choice = 'auto';
+    next.tool_choice = xaiToolChoiceAfterSanitize(next.tool_choice, tools);
   } else {
     delete next.tools;
     if (!(options.preserveNoneToolChoice && next.tool_choice === 'none')) {
       delete next.tool_choice;
     }
-    delete next.parallel_tool_calls;
+    if (!options.preserveSerialToolCalls) {
+      delete next.parallel_tool_calls;
+    }
   }
   return next;
 }
@@ -1432,11 +1445,25 @@ function narrowXaiForcedToolChoice(
   return { ...body, tool_choice: { type: 'function', name: only.name } };
 }
 
+function hasCacheOnlySearchProhibition(body: Record<string, unknown>): boolean {
+  if (!Array.isArray(body.tools)) return false;
+  return body.tools.some(
+    (tool) => {
+      if (!isPlainObject(tool) || tool.type !== 'web_search') return false;
+      return (tool as Record<string, unknown>).external_web_access === false;
+    },
+  );
+}
+
 function ensureXaiServerSideTools(body: Record<string, unknown>): Record<string, unknown> | null {
   const realModel = xaiRealModelId(body.model);
   if (!realModel) return null;
   const serverTools = xaiServerSideTools(realModel);
   if (serverTools.length === 0) return null;
+  // A cache-only web_search (external_web_access: false) must not be silently
+  // upgraded to a live x_search. xAI cannot represent the prohibition, so we
+  // dropped the web_search in sanitizeXaiTools; do not re-add a live search.
+  if (hasCacheOnlySearchProhibition(body)) return null;
 
   const existing = Array.isArray(body.tools) ? body.tools : [];
   const declaredTypes = new Set(
@@ -1835,7 +1862,21 @@ function createXaiResponsesCompatTransform(): RequestTransform {
     if (current) changed = true;
     else current = body;
 
-    const withSanitizedTools = sanitizeXaiTools(current, { preserveNoneToolChoice: true });
+    // Preserve tool_choice:'none' / parallel_tool_calls only when server-side
+    // x_search will be re-injected afterwards. For Guardian requests and
+    // cache-only search prohibitions (external_web_access:false) no x_search
+    // is added, so leaving control fields on a now-empty tools list produces
+    // an invalid request. Clean them instead.
+    // Detect cache-only on the ORIGINAL body because sanitizeXaiTools removes
+    // the web_search descriptor before we inspect the result.
+    const isGuardian = Boolean(guardianParentThreadIdFromHeaders(ctx.headers));
+    const willReinjectTools =
+      !isGuardian && !hasCacheOnlySearchProhibition(body);
+
+    const withSanitizedTools = sanitizeXaiTools(current, {
+      preserveNoneToolChoice: willReinjectTools,
+      preserveSerialToolCalls: willReinjectTools,
+    });
     if (withSanitizedTools) {
       current = withSanitizedTools;
       changed = true;
@@ -1845,7 +1886,9 @@ function createXaiResponsesCompatTransform(): RequestTransform {
     // 保证注入项不会被同一轮的裁剪逻辑改形或丢掉。
     // Guardian must retain xAI's schema/input compatibility, but it must not
     // gain provider-hosted search tools while reviewing another action.
-    if (!guardianParentThreadIdFromHeaders(ctx.headers)) {
+    // Cache-only search (external_web_access:false) must not silently become
+    // a live x_search — skip injection on that path too.
+    if (willReinjectTools) {
       const withServerSideTools = ensureXaiServerSideTools(current);
       if (withServerSideTools) {
         current = withServerSideTools;
@@ -1882,16 +1925,20 @@ function createGatewayGrokResponsesCompatTransform(): RequestTransform {
     if (!isPlainObject(body)) return null;
     const sessionId = sessionIdFromTransformCtx(ctx);
     const explicitProviderId = sessionId ? getSessionProvider(sessionId) : null;
-    const inferredProviderId =
-      explicitProviderId ?? (typeof body.model === 'string' ? inferProviderIdForModel(body.model, 'codex') : null);
     const wireModel = typeof body.model === 'string' ? body.model : undefined;
-    if (
-      inferredProviderId !== 'xd'
-      || !wireModel?.startsWith('x-ai/grok')
-      || !providerRoutingServesWireModel('xd', 'codex', wireModel)
-    ) {
-      return null;
-    }
+    if (!wireModel?.startsWith('x-ai/grok')) return null;
+    // The session's explicit provider takes priority when it is xd. For a
+    // subagent frozen to an x-ai/grok model while the parent session belongs
+    // to a different provider, the session provider check would miss the
+    // route: detect it by confirming the xd catalog actually serves this
+    // wire model (same check the routing transform uses to claim it).
+    const isXdRoute =
+      explicitProviderId === 'xd'
+      || (
+        explicitProviderId !== 'xd'
+        && providerRoutingServesWireModel('xd', 'codex', wireModel)
+      );
+    if (!isXdRoute) return null;
     return sanitizeXaiTools(body);
   };
 }

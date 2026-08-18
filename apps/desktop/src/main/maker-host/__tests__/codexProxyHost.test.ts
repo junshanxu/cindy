@@ -3553,6 +3553,24 @@ describe('codex proxy host', () => {
 
       expect(out.tools).toEqual([{ type: 'x_search' }]);
       expect(out.tool_choice).toBe('none');
+      // x_search will be re-injected on this path, so preserve the serial
+      // tool-call setting to keep the injected search serial.
+      expect(out.parallel_tool_calls).toBe(false);
+    });
+
+    it('first-party xAI cache-only search + tool_choice:none 不注入 x_search 且清理控制字段', async () => {
+      const out = (await runXaiTransforms('cache-only-none', {
+        model: 'xai/grok-4.5',
+        tools: [{ type: 'web_search', external_web_access: false }],
+        tool_choice: 'none',
+        parallel_tool_calls: false,
+        input: [{ role: 'user', content: 'hi' }],
+      })) as Record<string, unknown>;
+
+      // cache-only prohibition means x_search must NOT be re-injected, and
+      // without re-injected tools the control fields must be cleaned.
+      expect(out).not.toHaveProperty('tools');
+      expect(out).not.toHaveProperty('tool_choice');
       expect(out).not.toHaveProperty('parallel_tool_calls');
     });
 
@@ -4271,6 +4289,108 @@ describe('codex proxy host', () => {
       expect(current).toEqual({ model: 'x-ai/grok-4.5' });
     } finally {
       clearSessionProvider('session-xd-grok-no-tools');
+      setXdGatewayModels([]);
+    }
+  });
+
+  it('preserves surviving allowed_tools choices after Grok sanitization', async () => {
+    const host = await freshCodexProxyHost();
+    const { setXdGatewayModels } = await import('../active-catalog.js');
+    const { setSessionProvider, clearSessionProvider } = await import('../session-provider-store.js');
+    setXdGatewayModels([{ id: 'x-ai/grok-4.5', agents: ['codex'] }]);
+    mockState.createAnthropicCompatProxy.mockResolvedValueOnce({
+      url: 'http://127.0.0.1:43210',
+      dispose: vi.fn(async () => undefined),
+    });
+    await host.ensureCodexProxyReady();
+    host.registerComposed('session-xd-grok-allowed-tools', 'thread-xd-grok-allowed-tools', 'PRODUCT_PROMPT');
+    setSessionProvider('session-xd-grok-allowed-tools', 'xd');
+
+    try {
+      const transforms = mockState.createAnthropicCompatProxy.mock.calls[0]?.[0]?.transformRequest ?? [];
+      let current: unknown = {
+        model: 'x-ai/grok-4.5',
+        tools: [
+          { type: 'function', name: 'read_file' },
+          { type: 'namespace', name: 'multi_agent_v1', tools: [] },
+        ],
+        tool_choice: {
+          type: 'allowed_tools',
+          mode: 'required',
+          tools: [
+            { type: 'function', name: 'read_file' },
+            { type: 'namespace', name: 'multi_agent_v1' },
+          ],
+        },
+      };
+      const ctx = {
+        method: 'POST',
+        url: '/responses',
+        headers: { 'thread-id': 'thread-xd-grok-allowed-tools' },
+      };
+      for (const transform of transforms) {
+        const next = transform(current, ctx);
+        if (next !== null && next !== undefined) current = next;
+      }
+
+      expect(current).toMatchObject({
+        tools: [{ type: 'function', name: 'read_file' }],
+        tool_choice: {
+          type: 'allowed_tools',
+          mode: 'required',
+          tools: [{ type: 'function', name: 'read_file' }],
+        },
+      });
+    } finally {
+      clearSessionProvider('session-xd-grok-allowed-tools');
+      setXdGatewayModels([]);
+    }
+  });
+
+  it('sanitizes XD Gateway Grok namespace tools when parent session is on a different provider', async () => {
+    // A subagent can be frozen to x-ai/grok via the catalog even though its
+    // parent session belongs to the default ChatGPT provider. The routing
+    // transform claims this request for xd; the compat transform must match.
+    const host = await freshCodexProxyHost();
+    const { setXdGatewayModels } = await import('../active-catalog.js');
+    const { setSessionProvider, clearSessionProvider } = await import('../session-provider-store.js');
+    setXdGatewayModels([{ id: 'x-ai/grok-4.5', agents: ['codex'] }]);
+    mockState.createAnthropicCompatProxy.mockResolvedValueOnce({
+      url: 'http://127.0.0.1:43210',
+      dispose: vi.fn(async () => undefined),
+    });
+    await host.ensureCodexProxyReady();
+    // Deliberately do NOT set session provider to xd — simulate parent on
+    // default provider while subagent targets Grok.
+    host.registerComposed('session-default', 'thread-default', 'PRODUCT_PROMPT');
+
+    try {
+      const transforms = mockState.createAnthropicCompatProxy.mock.calls[0]?.[0]?.transformRequest ?? [];
+      let current: unknown = {
+        model: 'x-ai/grok-4.5',
+        tools: [
+          { type: 'function', name: 'read_file' },
+          { type: 'namespace', name: 'multi_agent_v1', tools: [] },
+        ],
+        tool_choice: 'auto',
+      };
+      const ctx = {
+        method: 'POST',
+        url: '/responses',
+        headers: { 'thread-id': 'thread-default' },
+      };
+      for (const transform of transforms) {
+        const next = transform(current, ctx);
+        if (next !== null && next !== undefined) current = next;
+      }
+
+      // namespace tool must be stripped even though session provider is not xd,
+      // because the xd catalog claims this wire model.
+      expect(current).toMatchObject({
+        tools: [{ type: 'function', name: 'read_file' }],
+      });
+    } finally {
+      clearSessionProvider('session-default');
       setXdGatewayModels([]);
     }
   });
