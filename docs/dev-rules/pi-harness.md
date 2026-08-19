@@ -102,7 +102,12 @@ Cindy 显式设置:models.json、`--append-system-prompt`、`--session-dir`、�
    的 exact temporary/local provenance 证明。approval 真源缺失、异常、撤销、失效、路径消失
    或快照失败时，新会话
    一律不带项目 `--skill`，并在 per-session runtime manifest 记录诊断原因。
-9. **Pi 会话 spawn env 稳定性(轮 41,2026-08-12)**:同一 `sessionId` 的重建(断链重连 /
+9. **Pi bash bounded timeout**:Cindy 覆盖的模型可调 `bash` 在 execute 入口强制默认
+   `300s`、上限 `1800s`。缺省或非正数用默认;大于上限或非有限数字 fail-fast(参数错误,
+   不是 `Command timed out`);合法秒数原样交给 Pi 原生执行器。不另起 timer / AbortController。
+   覆盖范围是 Cindy 当前可达的模型 bash 路径(本地新进程、SSH 新进程、ask/auto/Full access)。
+   Pi RPC `{type:'bash'}` 与 MCP 工具不在此契约内。tool schema / description 必须与上述语义一致。
+10. **Pi 会话 spawn env 稳定性(轮 41,2026-08-12)**:同一 `sessionId` 的重建(断链重连 /
    恢复 / 重启挂回)spawn env 必须**逐字节稳定**(除显式换代)。远端 daemon 的
    `pi/ensure` 以 envHash 全量对比判定条件 restart——**任何 per-call 随机值
    (`randomBytes` / 时间戳 / 计数器)进入 spawn env 都会让 envHash 必变 → 重连即
@@ -111,7 +116,10 @@ Cindy 显式设置:models.json、`--append-system-prompt`、`--session-dir`、�
    新增 spawn env 键前先问「同 session 重建时这个值变不变?」——会变就必须确定性派生
    (如 `HMAC(进程级key, sessionId)`),或走非 env 通道(文件 / RPC 参数)。由
    `piEnvironment.test.ts` 的 token 稳定性断言守;`session-registry` 的 envHash
-   机制测试只守「mismatch 会 restart」,守不住「env 不会自己 mismatch」。
+   机制测试只守「mismatch 会 restart」,守不住「env 不会自己 mismatch」。远端 Cindy-owned
+   extension(`cindy-bridge` / `cindy-subagent`)源码字节必须进入 launch identity:
+   `CINDY_PI_EXTENSION_BUNDLE_HASH` 只由源码确定,禁止随机数或时间戳;字节不变可 reattach,
+   字节变化必须 restart。
 
 ## 5. 已交付(2026-07 里程碑)
 
@@ -172,8 +180,10 @@ Cindy 显式设置:models.json、`--append-system-prompt`、`--session-dir`、�
       每个真实模型(chatgpt/、xai/、glm、deepseek、kimi…)仍建议在 release candidate 上
       anthropic-compat 下至少跑一轮**带工具调用**的回合,逐个确认 thinking 格式 / tool
       streaming / redacted thinking 正确；这是额度/账号发布 smoke，不再是功能缺口。
-- [x] **compaction**:启动显式开启 auto-compaction；手动 compact、boundary/usage 翻译、
-      compaction digest 写入与缓存命中均有测试。长上下文压力仍属于 RC soak。
+- [x] **compaction**:启动显式开启原生 auto-compaction；host 另按与 Claude Code 共用的
+      百分比阈值在 turn 结束或 setModel 窗口变化后调 compact RPC（默认 75%），原生
+      `window - reserve` 仍作顶满抢救。手动 compact、boundary/usage 翻译、compaction
+      digest 写入与缓存命中均有测试。长上下文压力仍属于 RC soak。
 - [x] **无人值守**:scheduler 对 `agentKind=pi` 使用 Pi 默认模型与
       `bypassPermissions` 的契约测试已补；Pi bridge 的 auto allow/deny 也用真二进制覆盖。
 - [x] **resume 边界**:已用 Pi v0.82.1 真二进制创建 JSONL，再由 v0.83.0 恢复；

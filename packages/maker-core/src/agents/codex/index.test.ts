@@ -375,8 +375,9 @@ function installFakeHost(
     subagentRoute?: {
       providerId: string;
       catalogModel: string;
-      runtimeModel: string;
+      reasoningEffort: import('./app-server/protocol.js').ReasoningEffort | null;
     };
+    openAiWebSocketsEnabled?: boolean;
     userAgent?: string;
     codexHome?: string;
     buildSessionMcpConfig?: (sessionInstanceId?: string) => Record<string, unknown>;
@@ -449,6 +450,7 @@ function installFakeHost(
   );
   const getSubagentModelFallback = vi.fn(() => opts.subagentModelFallback);
   const getSubagentRoute = vi.fn(() => opts.subagentRoute);
+  const getOpenAiWebSocketsEnabled = vi.fn(() => opts.openAiWebSocketsEnabled !== false);
   const host = {
     ensureStarted,
     // startSession 的 initialize 直调走限时变体 (codex R13 P1): fake 里
@@ -465,6 +467,7 @@ function installFakeHost(
     getSessionMcpConfig,
     getSubagentModelFallback,
     getSubagentRoute,
+    getOpenAiWebSocketsEnabled,
     getConnectionId: () => 'test-connection',
     getThreadHandlers: () => threadHandlers,
     // 0.145 不给 spawn 子线程发 thread/started,session 层改为从 spawn item 主动
@@ -3665,7 +3668,7 @@ describe('CodexAgent.startSession developerInstructions', () => {
       subagentRoute: {
         providerId: 'xd',
         catalogModel: 'codex/gpt-5.6-terra',
-        runtimeModel: 'gpt-5.6-terra',
+        reasoningEffort: 'high',
       },
     });
 
@@ -3692,12 +3695,60 @@ describe('CodexAgent.startSession developerInstructions', () => {
       subagentRoute: {
         providerId: 'xd',
         catalogModel: 'codex/gpt-5.6-terra',
-        runtimeModel: 'gpt-5.6-terra',
+        reasoningEffort: 'high',
       },
     });
     expect(handle.codexProductPromptDelivery).toEqual({
       threadId: 'start-thread-id',
       historyHasProductPrompt: true,
+    });
+    await handle.close();
+  });
+
+  it('uses HTTP prompt injection when OpenAI WebSocket is disabled for subagent routing', async () => {
+    const registerCodexSystemPromptForThread = vi.fn();
+    const agent = new CodexAgent(createDeps(
+      { systemPrompt: 'HOST PRODUCT PROMPT' },
+      { registerCodexSystemPromptForThread },
+    ));
+    const host = installFakeHost(agent, undefined, {
+      codexProxyActive: true,
+      remoteCompactionProviderId: 'cindy_openai',
+      openAiWebSocketsEnabled: false,
+      subagentRoute: {
+        providerId: 'xd',
+        catalogModel: 'codex/gpt-5.6-terra',
+        reasoningEffort: 'high',
+      },
+    });
+
+    const handle = await agent.startSession({
+      sessionId: 'session-http-for-subagent-route',
+      model: 'gpt-5.4',
+      providerId: 'openai',
+      workingDir: '/repo',
+      userPrompt: 'USER PROMPT',
+    });
+    const params = host.request.mock.calls.find(([method]) => method === Method.ThreadStart)?.[1] as {
+      developerInstructions?: string;
+      modelProvider?: string;
+    };
+
+    expect(params.modelProvider).toBe('cindy_openai');
+    expect(params.developerInstructions).toBeUndefined();
+    expect(registerCodexSystemPromptForThread).toHaveBeenCalledWith({
+      sessionId: 'session-http-for-subagent-route',
+      threadId: 'start-thread-id',
+      text: expect.stringContaining('HOST PRODUCT PROMPT'),
+      subagentRoute: {
+        providerId: 'xd',
+        catalogModel: 'codex/gpt-5.6-terra',
+        reasoningEffort: 'high',
+      },
+    });
+    expect(handle.codexProductPromptDelivery).toEqual({
+      threadId: 'start-thread-id',
+      historyHasProductPrompt: false,
     });
     await handle.close();
   });
@@ -5968,6 +6019,37 @@ describe('CodexAgent MCP thread context hooks', () => {
     });
 
     await xaiHandle.close();
+    await agent.dispose();
+  });
+
+  it('restarts a provider OAuth host with the credential mode required by locked routing', async () => {
+    const prepareCodexExtraSpawnConfig = vi.fn(async (_providers, ctx) => ({
+      extraArgs: [],
+      extraEnv: {},
+      codexProxyActive: true,
+      ...(ctx.credentialMode === 'provider-oauth'
+        ? { requiredSpawnCredentialMode: 'oauth-bearer' as const }
+        : {}),
+    }));
+    const agent = new CodexAgent(createDeps({}, { prepareCodexExtraSpawnConfig }));
+
+    const handle = await agent.startSession({
+      sessionId: 'session-provider-oauth-locked-openai',
+      providerId: 'xai',
+      model: 'xai/grok-4.3',
+      workingDir: '/repo-xai',
+    });
+
+    expect(createdTransports).toHaveLength(1);
+    expect(prepareCodexExtraSpawnConfig).toHaveBeenNthCalledWith(1, [], {
+      remoteHostId: undefined,
+      credentialMode: 'provider-oauth',
+    });
+    expect(prepareCodexExtraSpawnConfig).toHaveBeenNthCalledWith(2, [], {
+      remoteHostId: undefined,
+      credentialMode: 'oauth-bearer',
+    });
+    await handle.close();
     await agent.dispose();
   });
 
@@ -19096,7 +19178,7 @@ describe('CodexAgent turn lifecycle', () => {
     });
     expect(await nextEvent(iterator)).toMatchObject({
       type: 'agent_task_update',
-      data: { taskId: 'collab-normal', status: 'running' },
+      data: { taskId: 'collab-normal', status: 'completed' },
     });
     expect(await nextEvent(iterator)).toMatchObject({
       type: 'status',
@@ -22642,6 +22724,84 @@ describe('CodexAgent context window reporting', () => {
     expect(last?.usage?.totalTokens).toBe(4_242);
     expect(last?.model).toBe('codex/gpt-5.6-sol');
     expect(last?.status).toBe('running');
+
+    await handle.close();
+  });
+
+  it('projects the locked V1 proxy route instead of the inherited parent model', async () => {
+    const agent = new CodexAgent(createDeps());
+    const host = installFakeHost(agent, undefined, {
+      subagentModelFallback: 'z-ai/glm-5.2',
+      subagentRoute: {
+        providerId: 'xd',
+        catalogModel: 'z-ai/glm-5.2',
+        reasoningEffort: 'max',
+      },
+    });
+    const handle = await agent.startSession({
+      sessionId: 'session-subagent-locked-v1',
+      model: 'deepseek/deepseek-v4-pro',
+      workingDir: '/repo',
+    });
+    const events: AgentEvent[] = [];
+    void (async () => {
+      for await (const event of handle.events()) events.push(event);
+    })();
+
+    const handlers = host.getThreadHandlers();
+    if (!handlers?.itemStarted || !handlers.descendantThreadStarted || !handlers.descendantNotification) {
+      throw new Error('expected item/descendant handlers');
+    }
+    handlers.turnStarted?.({ threadId: 'start-thread-id', turn: { id: 'turn-locked-v1' } });
+    handlers.itemStarted({
+      threadId: 'start-thread-id',
+      turnId: 'turn-locked-v1',
+      item: {
+        id: 'spawn-locked-v1',
+        type: 'collabAgentToolCall',
+        tool: 'spawnAgent',
+        senderThreadId: 'start-thread-id',
+        receiverThreadIds: ['child-locked-v1'],
+        status: 'inProgress',
+        model: 'deepseek/deepseek-v4-pro',
+        reasoningEffort: 'high',
+        agentsStates: [],
+      },
+    });
+    handlers.descendantThreadStarted({
+      thread: {
+        id: 'child-locked-v1',
+        parentThreadId: 'start-thread-id',
+        model: 'deepseek/deepseek-v4-pro',
+      },
+    });
+    handlers.descendantNotification('child-locked-v1', 'turn/completed', {
+      threadId: 'child-locked-v1',
+      turn: { id: 'child-turn-locked-v1', status: 'completed' },
+    });
+
+    await vi.waitFor(() => {
+      const updates = events
+        .filter((event) => event.type === 'agent_task_update')
+        .map((event) => event.data as {
+          taskId?: string;
+          model?: string | null;
+          reasoningEffort?: string;
+          status?: string;
+        })
+        .filter((update) => update.taskId === 'spawn-locked-v1');
+      expect(updates.length).toBeGreaterThan(0);
+      expect(updates[0]).toMatchObject({
+        model: 'z-ai/glm-5.2',
+        reasoningEffort: 'max',
+        status: 'running',
+      });
+      expect(updates.at(-1)).toMatchObject({
+        model: 'z-ai/glm-5.2',
+        status: 'completed',
+      });
+      expect(updates.some((update) => update.model === 'deepseek/deepseek-v4-pro')).toBe(false);
+    });
 
     await handle.close();
   });
