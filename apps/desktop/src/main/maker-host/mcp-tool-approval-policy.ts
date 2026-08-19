@@ -25,6 +25,7 @@ import type {
 import { canAutoApproveContactsMcpTool, canonicalIOSSimulatorToolName } from '@cindy/mcps';
 
 import { t } from '../i18n.js';
+import { inspectLocalhostUrl } from '../mcp-integrations/browser-localhost-guard.js';
 
 /**
  * 精确到工具的只读放行表，键为 `<server>::<tool>`。
@@ -176,9 +177,23 @@ function skipsRoutelessDeviceApproval(args: unknown): boolean {
  * Uses `readJsonObject` so the approval sees the same shape the Host will
  * actually execute, even if the bridge stringified the nested payload
  * (issue #350).
+ *
+ * Bypass defenses (all P1 review findings):
+ *  - Codex 0.142.5 / 0.144.1 may omit the outer `tool_name` while retaining the
+ *    validated progressive `tool_params`; an omitted name is treated as
+ *    `call_tool` so a localhost navigate cannot fall through to the trusted-
+ *    server auto-approve.
+ *  - Hostnames are normalized like the SSRF layer (`localhost.` → `localhost`,
+ *    bracketed IPv6 unwrapped, lowercased), so `http://localhost./` no longer
+ *    slips past the literal `=== 'localhost'` comparison.
+ *  - The full loopback set (`127.0.0.0/8`, `::1`, `0.0.0.0`, `.localhost`) is
+ *    recognized, not just the bare `localhost` literal.
  */
 function isLocalhostBrowserNavigation(context: McpToolApprovalContext): boolean {
-  if (context.serverName !== 'cindy_browser' || context.toolName !== 'call_tool') return false;
+  if (context.serverName !== 'cindy_browser') return false;
+  // Codex sometimes omits the outer tool name; treat that as the progressive
+  // `call_tool` envelope rather than bailing to the server-level auto-approve.
+  if (context.toolName !== 'call_tool' && context.toolName !== undefined) return false;
   const toolParams = readJsonObject(context.toolParams);
   const args = readJsonObject(toolParams?.args) ?? toolParams;
   if (!args) return false;
@@ -194,15 +209,9 @@ function isLocalhostBrowserNavigation(context: McpToolApprovalContext): boolean 
 
   const rawUrl = action === 'open' ? (args.url ?? args.targetUrl) : args.url;
   if (typeof rawUrl !== 'string') return false;
-  try {
-    const parsed = new URL(rawUrl);
-    return (
-      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
-      parsed.hostname.toLowerCase() === 'localhost'
-    );
-  } catch {
-    return false;
-  }
+  // `inspectLocalhostUrl` normalizes the hostname (trailing dot / brackets /
+  // case) and recognizes every loopback form, matching the SSRF guard.
+  return inspectLocalhostUrl(rawUrl).isLoopback;
 }
 
 /** Claude SDK 工具名格式固定为 `mcp__<server>__<tool>`。 */

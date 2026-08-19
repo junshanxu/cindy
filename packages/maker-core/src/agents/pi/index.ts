@@ -3789,6 +3789,41 @@ export class PiAgent extends BaseAgent {
         }
       })();
       /**
+       * Host MCP approval policy, resolved synchronously BEFORE the Full access
+       * short-circuit below. A `prompt-each-time` result (e.g. a trusted
+       * `cindy_browser` navigating to localhost) is a per-call consent boundary
+       * that Full access must NOT auto-confirm — otherwise selecting "Full
+       * access" silently bypasses localhost preview approval. It is hoisted here
+       * (rather than inside the async IIFE) so the bypass check at the top of the
+       * IIFE can see it. A thrown classifier fails closed to prompt-each-time,
+       * matching the in-IIFE handling.
+       */
+      const mcpPolicy: 'auto-approve' | 'prompt' | 'prompt-each-time' | null = (() => {
+        const classifier = this.deps.getMcpToolApprovalPolicy;
+        if (!classifier || !mcpTarget) return null;
+        try {
+          const policy = classifier({
+            serverName: mcpTarget.serverName,
+            toolName: mcpTarget.toolName,
+            toolParams: input,
+          });
+          if (policy === 'auto-approve' || policy === 'prompt' || policy === 'prompt-each-time') {
+            return policy;
+          }
+          this.deps.logger.error('invalid MCP approval policy -> user confirmation', {
+            serverName: mcpTarget.serverName,
+            policy,
+          });
+        } catch (err) {
+          this.deps.logger.error('MCP approval policy threw -> user confirmation', {
+            serverName: mcpTarget.serverName,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+        return 'prompt-each-time';
+      })();
+      const mcpForcePrompt = mcpPolicy === 'prompt-each-time';
+      /**
        * 向用户要一次表态。`decided` 区分「用户明确表态」与「压根拿不到决策」(无 resolver /
        * resolver 抛错 / kind 不匹配) —— 调用方对后者才允许按 Full access 语义放行,
        * 不能把用户的明确拒绝也一并翻转。
@@ -3905,7 +3940,11 @@ export class PiAgent extends BaseAgent {
         // 本轮策略命中时不吃 Full Access 短路:policy + bypassPermissions 已在 send 预检
         // 拒绝、且 policy turn 持 host lease 堵死热切到 bypass,故此处 turnPolicyForcePrompt
         // 为真本不可达;仍显式 fail-closed,避免任一上游闸门被绕过就静默放行破坏性调用。
-        if (isFullAccessNow() && !turnPolicyForcePrompt) {
+        //
+        // MCP prompt-each-time (e.g. localhost browser preview) 同样不吃 Full Access 短路:
+        // 它是逐次同意的安全边界,Full access 语义是「别再问我」而非「连 localhost 访问也
+        // 静默放行」。不识别这层,用户切到 Full access 就绕过了 localhost 逐次确认(P1)。
+        if (isFullAccessNow() && !turnPolicyForcePrompt && !mcpForcePrompt) {
           proc.send({ type: 'extension_ui_response', id, confirmed: true });
           return;
         }
@@ -3927,31 +3966,8 @@ export class PiAgent extends BaseAgent {
         // 接策略之前完全一致:host 没提供 classifier,或工具名对不上任何本会话已注册的
         // server(认不出归属就不敢按第一方放行)。策略抛错或返回非法值则不回落 ——
         // 那是策略本身故障,按 prompt-each-time fail-closed 收口。
-        const mcpPolicy = ((): 'auto-approve' | 'prompt' | 'prompt-each-time' | null => {
-          const classifier = this.deps.getMcpToolApprovalPolicy;
-          if (!classifier) return null;
-          if (!mcpTarget) return null;
-          try {
-            const policy = classifier({
-              serverName: mcpTarget.serverName,
-              toolName: mcpTarget.toolName,
-              toolParams: input,
-            });
-            if (policy === 'auto-approve' || policy === 'prompt' || policy === 'prompt-each-time') {
-              return policy;
-            }
-            this.deps.logger.error('invalid MCP approval policy -> user confirmation', {
-              serverName: mcpTarget.serverName,
-              policy,
-            });
-          } catch (err) {
-            this.deps.logger.error('MCP approval policy threw -> user confirmation', {
-              serverName: mcpTarget.serverName,
-              message: err instanceof Error ? err.message : String(err),
-            });
-          }
-          return 'prompt-each-time';
-        })();
+        // mcpPolicy 已在 IIFE 之前同步求出(见上方定义),以便 Full access 短路也能识别
+        // prompt-each-time 的 localhost 策略。
         if (mcpPolicy !== null) {
           // Pi 的权限门只有放行/拒绝两态,没有会话级持久化规则,因此 prompt 与
           // prompt-each-time 在这里收敛成同一个动作:每次都问用户。本轮策略命中时
