@@ -1363,7 +1363,7 @@ function xaiToolChoiceAfterSanitize(
     const allowedTools = toolChoice.tools.filter(
       (choice): choice is Record<string, unknown> => isPlainObject(choice) && referencesSurvivingTool(choice),
     );
-    return allowedTools.length > 0 ? { ...toolChoice, tools: allowedTools } : 'auto';
+    return allowedTools.length > 0 ? { ...toolChoice, tools: allowedTools } : 'none';
   }
 
   return referencesSurvivingTool(toolChoice) ? toolChoice : 'auto';
@@ -1870,8 +1870,11 @@ function createXaiResponsesCompatTransform(): RequestTransform {
     // Detect cache-only on the ORIGINAL body because sanitizeXaiTools removes
     // the web_search descriptor before we inspect the result.
     const isGuardian = Boolean(guardianParentThreadIdFromHeaders(ctx.headers));
+    const realModelId = xaiRealModelId(requestModel);
+    const canInjectServerTools =
+      realModelId !== null && xaiServerSideTools(realModelId).length > 0;
     const willReinjectTools =
-      !isGuardian && !hasCacheOnlySearchProhibition(body);
+      !isGuardian && canInjectServerTools && !hasCacheOnlySearchProhibition(body);
 
     const withSanitizedTools = sanitizeXaiTools(current, {
       preserveNoneToolChoice: willReinjectTools,
@@ -1914,6 +1917,19 @@ function createXaiResponsesCompatTransform(): RequestTransform {
 }
 
 /**
+ * The XD Gateway claims this wire model for its codex routing when the active
+ * catalog exposes it under `xd.models.codex`. We use the catalog membership
+ * (not `providerRoutingServesWireModel`, which only consults routing
+ * descriptors and is universal for `xd`) so that a non-xd provider that also
+ * lists the same id stays authoritative for its own compat transform.
+ */
+function xdProviderClaimsWireModel(wireModel: string): boolean {
+  if (!wireModel.startsWith('x-ai/grok')) return false;
+  const xdProvider = getActiveCatalog().providers.find((provider) => provider.id === 'xd');
+  return xdProvider?.models.codex?.some((candidate) => candidate.id === wireModel) ?? false;
+}
+
+/**
  * The XD Gateway also exposes Grok models under the `x-ai/` namespace. They
  * stay on the gateway route (unlike the first-party `xai/` OAuth provider),
  * but the upstream Grok Responses schema still rejects Codex namespace tools.
@@ -1923,22 +1939,31 @@ function createXaiResponsesCompatTransform(): RequestTransform {
 function createGatewayGrokResponsesCompatTransform(): RequestTransform {
   return (body, ctx) => {
     if (!isPlainObject(body)) return null;
-    const sessionId = sessionIdFromTransformCtx(ctx);
-    const explicitProviderId = sessionId ? getSessionProvider(sessionId) : null;
-    const wireModel = typeof body.model === 'string' ? body.model : undefined;
-    if (!wireModel?.startsWith('x-ai/grok')) return null;
-    // The session's explicit provider takes priority when it is xd. For a
-    // subagent frozen to an x-ai/grok model while the parent session belongs
-    // to a different provider, the session provider check would miss the
-    // route: detect it by confirming the xd catalog actually serves this
-    // wire model (same check the routing transform uses to claim it).
-    const isXdRoute =
-      explicitProviderId === 'xd'
-      || (
-        explicitProviderId !== 'xd'
-        && providerRoutingServesWireModel('xd', 'codex', wireModel)
-      );
-    if (!isXdRoute) return null;
+    const requestModel = typeof body.model === 'string' ? body.model : '';
+    if (!requestModel.startsWith('x-ai/grok')) return null;
+    // Use providerContextForRequest so subagent-frozen routes resolve to xd
+    // even when the parent session belongs to a different provider. Only
+    // clean tools when the effective provider for THIS request is xd.
+    const providerContext = providerContextForRequest(ctx.headers, requestModel);
+    if (providerContext.providerId === 'xd') return sanitizeXaiTools(body);
+    // The session provider is not xd but the routing layer may still claim
+    // this wire model for xd (subagent locked to an x-ai/grok model, parent
+    // session belongs to a different provider). Only clean when xd is the
+    // exclusive catalog owner of this wire model — if a non-xd provider also
+    // serves it, leave the request untouched so that provider's compat
+    // transform stays authoritative.
+    if (providerContext.providerId !== null) return null;
+    // The session provider is not xd but the routing layer may still claim
+    // this wire model for xd (subagent locked to an x-ai/grok model, parent
+    // session belongs to a different provider). Only clean when xd is the
+    // catalog owner of this wire model — if any non-xd provider also lists
+    // it under its codex models, leave the request untouched so that
+    // provider's compat transform stays authoritative.
+    if (!xdProviderClaimsWireModel(requestModel)) return null;
+    const nonXdHandoff = getActiveCatalog().providers.some(
+      (provider) => provider.id !== 'xd' && provider.models.codex?.some((candidate) => candidate.id === requestModel),
+    );
+    if (nonXdHandoff) return null;
     return sanitizeXaiTools(body);
   };
 }
