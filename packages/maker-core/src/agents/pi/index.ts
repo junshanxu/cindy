@@ -4976,6 +4976,14 @@ export class PiAgent extends BaseAgent {
                 ? true
                 : await requestUserConfirmation({
                     forcePrompt: turnPolicyForcePrompt || mcpPolicy === 'prompt-each-time',
+                    // prompt-each-time is a per-call consent boundary (e.g.
+                    // localhost browser navigation): Full access must still
+                    // surface a real prompt rather than silently denying via
+                    // the forcePrompt Full-access early-return. Reuse the
+                    // explicit-decision path so the resolver is actually
+                    // invoked and the user's choice is honored (fail-closed
+                    // when no resolver is available) (PR #2445 Codex P1).
+                    requireExplicitDecision: mcpPolicy === 'prompt-each-time',
                   }),
           });
           return;
