@@ -3628,6 +3628,27 @@ describe('codex proxy host', () => {
       expect(out.tool_choice).toBe('auto');
     });
 
+    it('强制选择被过滤的 namespace 工具时收敛为 none,不放宽为 auto(即使补了 x_search)', async () => {
+      const out = await runXaiTransforms('forced-filtered', {
+        model: 'xai/grok-4.5',
+        tools: [
+          { type: 'function', name: 'exec_command' },
+          { type: 'namespace', name: 'multi_agent_v1', tools: [] },
+        ],
+        tool_choice: { type: 'namespace', name: 'multi_agent_v1' },
+        input: [{ role: 'user', content: 'hi' }],
+      }) as Record<string, unknown>;
+
+      // The forced namespace choice references a removed tool. Fail closed to
+      // 'none' even though x_search gets re-injected and exec_command survives —
+      // widening to 'auto' would let Grok call tools the caller never selected.
+      expect(out.tools).toEqual([
+        { type: 'function', name: 'exec_command' },
+        { type: 'x_search' },
+      ]);
+      expect(out.tool_choice).toBe('none');
+    });
+
     it.each(['xai/grok-code-fast', 'xai/grok-build-preview'])(
       '编码模型 %s 不注入(该系列没有 agentic 搜索工具面,带上会被上游拒)',
       async (model) => {
@@ -4200,7 +4221,10 @@ describe('codex proxy host', () => {
           { type: 'function', name: 'exec_command' },
           { type: 'web_search' },
         ],
-        tool_choice: 'auto',
+        // The forced namespace choice references a removed tool; fail closed to
+        // 'none' rather than widening to 'auto' (which would let Grok call the
+        // surviving exec_command/web_search the caller never selected).
+        tool_choice: 'none',
         parallel_tool_calls: false,
       });
     } finally {
@@ -4246,7 +4270,10 @@ describe('codex proxy host', () => {
       expect(current).toEqual({
         model: 'x-ai/grok-4.5',
         tools: [{ type: 'function', name: 'exec_command' }],
-        tool_choice: 'auto',
+        // The forced web_search choice was dropped (cache-only prohibition);
+        // collapsing to 'none' keeps exec_command uncallable instead of
+        // silently widening the request to auto-selected tool calls.
+        tool_choice: 'none',
         parallel_tool_calls: true,
       });
     } finally {
@@ -4391,6 +4418,70 @@ describe('codex proxy host', () => {
       });
     } finally {
       clearSessionProvider('session-default');
+      setXdGatewayModels([]);
+    }
+  });
+
+  it('still cleans XD Gateway Grok tools on an implicit session even when a non-xd provider lists the same id', async () => {
+    // Regression: when providerId is null (implicit session) and a custom
+    // provider also declares x-ai/grok-* in its catalog, the old nonXdHandoff
+    // check skipped cleanup — but merely listing the id does not route THIS
+    // request there (an explicit selection would set a non-null providerId).
+    // The implicit default/env-key route still lands on the xd gateway, so the
+    // namespace tools must be stripped.
+    const host = await freshCodexProxyHost();
+    const { buildUserProvider } = await import('@cindy/model-providers');
+    const { setCustomProviders, setXdGatewayModels } = await import('../active-catalog.js');
+    const { setCustomProviderKeyReader } = await import('../provider-route.js');
+    setXdGatewayModels([{ id: 'x-ai/grok-4.5', agents: ['codex'] }]);
+    setCustomProviders([
+      buildUserProvider({
+        id: 'grok-alias-provider',
+        name: 'Grok Alias Provider',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://grok-alias.example/v1',
+            wireProtocol: 'openai-responses',
+            models: [{ id: 'x-ai/grok-4.5', name: 'Grok 4.5' }],
+          },
+        },
+      }),
+    ]);
+    setCustomProviderKeyReader(() => null);
+    mockState.createAnthropicCompatProxy.mockResolvedValueOnce({
+      url: 'http://127.0.0.1:43210',
+      dispose: vi.fn(async () => undefined),
+    });
+    await host.ensureCodexProxyReady();
+    host.registerComposed('session-implicit-alias', 'thread-implicit-alias', 'PRODUCT_PROMPT');
+
+    try {
+      const transforms = mockState.createAnthropicCompatProxy.mock.calls[0]?.[0]?.transformRequest ?? [];
+      let current: unknown = {
+        model: 'x-ai/grok-4.5',
+        tools: [
+          { type: 'function', name: 'read_file' },
+          { type: 'namespace', name: 'multi_agent_v1', tools: [] },
+        ],
+        tool_choice: { type: 'namespace', name: 'multi_agent_v1' },
+      };
+      const ctx = {
+        method: 'POST',
+        url: '/responses',
+        headers: { 'thread-id': 'thread-implicit-alias' },
+      };
+      for (const transform of transforms) {
+        const next = transform(current, ctx);
+        if (next !== null && next !== undefined) current = next;
+      }
+
+      expect(current).toMatchObject({
+        tools: [{ type: 'function', name: 'read_file' }],
+        tool_choice: 'none',
+      });
+    } finally {
+      setCustomProviders([]);
+      setCustomProviderKeyReader(() => null);
       setXdGatewayModels([]);
     }
   });
