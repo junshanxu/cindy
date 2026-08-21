@@ -3558,6 +3558,24 @@ describe('codex proxy host', () => {
       expect(out.parallel_tool_calls).toBe(false);
     });
 
+    it('全量过滤后,对象形态的强制 tool_choice 收敛为 none(不删除、不放宽)', async () => {
+      // Every declared tool is unsupported and filtered, while an object-form
+      // forced choice still references one of them. The empty-tools branch
+      // must collapse the now-dangling forced choice to 'none' (x_search is
+      // re-injected afterwards) rather than deleting it — a missing choice
+      // would let Grok auto-call the injected search and widen the caller's
+      // authorization (PR #2444 Codex P1).
+      const out = (await runXaiTransforms('forced-choice-after-full-filter', {
+        model: 'xai/grok-4.5',
+        tools: [{ type: 'namespace', name: 'multi_agent_v1', tools: [] }],
+        tool_choice: { type: 'function', name: 'multi_agent_v1' },
+        input: [{ role: 'user', content: 'hi' }],
+      })) as Record<string, unknown>;
+
+      expect(out.tools).toEqual([{ type: 'x_search' }]);
+      expect(out.tool_choice).toBe('none');
+    });
+
     it('first-party xAI cache-only search + tool_choice:none 不注入 x_search 且清理控制字段', async () => {
       const out = (await runXaiTransforms('cache-only-none', {
         model: 'xai/grok-4.5',

@@ -1412,7 +1412,22 @@ function sanitizeXaiTools(
     next.tool_choice = xaiToolChoiceAfterSanitize(next.tool_choice, tools);
   } else {
     delete next.tools;
-    if (!(options.preserveNoneToolChoice && next.tool_choice === 'none')) {
+    // All tools were filtered out. When server-side x_search is re-injected
+    // afterwards, any surviving tool_choice now refers to a removed tool (an
+    // object forced choice, an emptied allowed_tools, 'required', or 'auto').
+    // Collapse it to 'none' so the model cannot auto-call the injected search
+    // tool and widen the caller's authorization; a request that had no
+    // tool_choice stays without one. When nothing is re-injected (Guardian /
+    // cache-only search), drop the control field entirely — a 'none' with no
+    // tools is still an invalid xAI request (PR #2444 Codex P1/P2).
+    if (options.preserveNoneToolChoice) {
+      // An explicit (but now-dangling) forced choice collapses to 'none'; a
+      // request that had no tool_choice stays without one so the re-injected
+      // x_search remains auto-selectable.
+      if (next.tool_choice !== undefined && next.tool_choice !== 'none') {
+        next.tool_choice = 'none';
+      }
+    } else {
       delete next.tool_choice;
     }
     if (!options.preserveSerialToolCalls) {
