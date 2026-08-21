@@ -1687,7 +1687,8 @@ function deepSeekToolChoiceReferencesRemovedCustomTool(
  * reaches the model, while accepting `apply_patch`. Filter only that custom
  * tool dialect so function/MCP declarations keep their existing semantics.
  */
-function sanitizeDeepSeekV4CustomTools(body: Record<string, unknown>): Record<string, unknown> | null {
+function sanitizeDeepSeekV4CustomTools(body: unknown): Record<string, unknown> | null {
+  if (!isPlainObject(body)) return null;
   if (!DEEPSEEK_V4_MODELS.has(typeof body.model === 'string' ? body.model : '')) return null;
   if (!Array.isArray(body.tools)) return null;
 
