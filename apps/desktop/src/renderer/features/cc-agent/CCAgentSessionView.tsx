@@ -1229,10 +1229,14 @@ export function CCAgentSessionView({
     if (!sessionId) return;
     if (session?.status !== 'archived') return;
     if (!isSecondaryWindow()) return;
-    log.info('archived session in secondary window, closing window', { sessionId });
     splitGroupStore.removeSession(sessionId);
+    if (!ownsWindowRoute) {
+      log.info('archived session removed from embedded secondary-window pane', { sessionId });
+      return;
+    }
+    log.info('archived route-owning session in secondary window, closing window', { sessionId });
     window.electronAPI?.windowClose();
-  }, [session?.status, sessionId]);
+  }, [session?.status, sessionId, ownsWindowRoute]);
 
   const vendorAuthGate = useVendorAuthGate();
 
