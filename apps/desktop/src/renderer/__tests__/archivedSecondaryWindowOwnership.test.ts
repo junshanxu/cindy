@@ -45,8 +45,8 @@ describe('archived secondary-window ownership', () => {
     expect(closePreflight).toBeGreaterThan(ownerGateEnd);
     expect(cancelGate).toBeGreaterThan(closePreflight);
     expect(closeWindow).toBeGreaterThan(cancelGate);
-    expect(sessionViewSource).toContain(
-      '}, [session?.status, sessionId, ownsWindowRoute, onBeforeSecondaryWindowClose]);',
+    expect(sessionViewSource).toMatch(
+      /\}, \[\s*session\?\.status,\s*sessionId,\s*ownsWindowRoute,\s*onBeforeSecondaryWindowClose,\s*secondaryWindowArchiveOwner,\s*\]\);/,
     );
   });
 
@@ -66,12 +66,40 @@ describe('archived secondary-window ownership', () => {
     expect(orcaSplitViewSource).toContain(
       'onBeforeSecondaryWindowClose={onBeforeSecondaryWindowClose}',
     );
+    expect(orcaSplitViewSource).toContain('secondaryWindowArchiveOwner="host"');
+  });
+
+  it('keeps the Orca host subscribed to archived leads and closes after the dirty-file preflight', () => {
+    expect(orcaSplitViewSource).toContain("useCCSessions({ includeArchived: 'all' })");
+    const archivedLeadGuard = orcaSplitViewSource.indexOf(
+      "if (leadSession?.status !== 'archived') return;",
+    );
+    const secondaryWindowGuard = orcaSplitViewSource.indexOf(
+      'if (!isSecondaryWindow()) return;',
+      archivedLeadGuard,
+    );
+    const closePreflight = orcaSplitViewSource.indexOf(
+      'await onBeforeSecondaryWindowClose()',
+      secondaryWindowGuard,
+    );
+    const cancelGate = orcaSplitViewSource.indexOf(
+      'if (!allowClose || cancelled) return;',
+      closePreflight,
+    );
+    const closeWindow = orcaSplitViewSource.indexOf(
+      'window.electronAPI?.windowCloseSelf();',
+      cancelGate,
+    );
+
+    expect(archivedLeadGuard).toBeGreaterThan(-1);
+    expect(secondaryWindowGuard).toBeGreaterThan(archivedLeadGuard);
+    expect(closePreflight).toBeGreaterThan(secondaryWindowGuard);
+    expect(cancelGate).toBeGreaterThan(closePreflight);
+    expect(closeWindow).toBeGreaterThan(cancelGate);
   });
 
   it('lets the workdir route protect dirty files before either route-owning chat closes', () => {
-    expect(workdirBrowseRouteSource).toContain(
-      '() => confirmSwitchAway(selectedPath, null)',
-    );
+    expect(workdirBrowseRouteSource).toContain('() => confirmSwitchAway(selectedPath, null)');
     expect(
       workdirBrowseRouteSource.match(
         /onBeforeSecondaryWindowClose=\{confirmSecondaryWindowClose\}/g,

@@ -457,6 +457,8 @@ interface CCAgentSessionViewProps {
   disableAutofocus?: boolean;
   /** 副窗口因当前任务被归档而自动关闭前，由路由宿主保护尚未保存的界面状态。 */
   onBeforeSecondaryWindowClose?: () => Promise<boolean>;
+  /** Orca 等常驻路由宿主接管归档关窗时，视图本身只负责收敛 pane 与禁用输入。 */
+  secondaryWindowArchiveOwner?: 'self' | 'host';
 }
 
 /**
@@ -703,6 +705,7 @@ export function CCAgentSessionView({
   sidebarTargetSessionId,
   disableAutofocus = false,
   onBeforeSecondaryWindowClose,
+  secondaryWindowArchiveOwner = 'self',
 }: CCAgentSessionViewProps = {}) {
   const { t } = useTranslation();
   const { sessionId: paramSessionId } = useParams<{ sessionId: string }>();
@@ -1239,6 +1242,10 @@ export function CCAgentSessionView({
       log.info('archived session removed from embedded secondary-window pane', { sessionId });
       return;
     }
+    if (secondaryWindowArchiveOwner === 'host') {
+      log.info('archived route-owning session delegated to secondary-window host', { sessionId });
+      return;
+    }
     let cancelled = false;
     void (async () => {
       let allowClose = true;
@@ -1257,7 +1264,13 @@ export function CCAgentSessionView({
     return () => {
       cancelled = true;
     };
-  }, [session?.status, sessionId, ownsWindowRoute, onBeforeSecondaryWindowClose]);
+  }, [
+    session?.status,
+    sessionId,
+    ownsWindowRoute,
+    onBeforeSecondaryWindowClose,
+    secondaryWindowArchiveOwner,
+  ]);
 
   const vendorAuthGate = useVendorAuthGate();
 
