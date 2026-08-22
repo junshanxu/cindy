@@ -7,6 +7,14 @@ const sessionViewSource = readFileSync(
   resolve(__dirname, '..', 'features', 'cc-agent', 'CCAgentSessionView.tsx'),
   'utf8',
 );
+const orcaSplitViewSource = readFileSync(
+  resolve(__dirname, '..', 'features', 'cc-agent', 'OrcaSplitView.tsx'),
+  'utf8',
+);
+const workdirBrowseRouteSource = readFileSync(
+  resolve(__dirname, '..', 'features', 'cc-agent', 'workdir-browse', 'WorkdirBrowseRoute.tsx'),
+  'utf8',
+);
 
 describe('archived secondary-window ownership', () => {
   it('removes embedded split panes without letting them close the route-owning window', () => {
@@ -17,16 +25,77 @@ describe('archived secondary-window ownership', () => {
     );
     const ownerGate = sessionViewSource.indexOf('if (!ownsWindowRoute) {', removePane);
     const ownerGateEnd = sessionViewSource.indexOf('\n    }', ownerGate);
-    const closeWindow = sessionViewSource.indexOf(
-      'window.electronAPI?.windowClose();',
+    const closePreflight = sessionViewSource.indexOf(
+      'await onBeforeSecondaryWindowClose()',
       ownerGateEnd,
+    );
+    const cancelGate = sessionViewSource.indexOf(
+      'if (!allowClose || cancelled) return;',
+      closePreflight,
+    );
+    const closeWindow = sessionViewSource.indexOf(
+      'window.electronAPI?.windowCloseSelf();',
+      cancelGate,
     );
 
     expect(archivedEffect).toBeGreaterThan(-1);
     expect(removePane).toBeGreaterThan(archivedEffect);
     expect(ownerGate).toBeGreaterThan(removePane);
     expect(ownerGateEnd).toBeGreaterThan(ownerGate);
-    expect(closeWindow).toBeGreaterThan(ownerGateEnd);
-    expect(sessionViewSource).toContain('}, [session?.status, sessionId, ownsWindowRoute]);');
+    expect(closePreflight).toBeGreaterThan(ownerGateEnd);
+    expect(cancelGate).toBeGreaterThan(closePreflight);
+    expect(closeWindow).toBeGreaterThan(cancelGate);
+    expect(sessionViewSource).toContain(
+      '}, [session?.status, sessionId, ownsWindowRoute, onBeforeSecondaryWindowClose]);',
+    );
+  });
+
+  it('marks the Orca lead as route owner and the worker as embedded', () => {
+    const leadView = orcaSplitViewSource.indexOf('sessionIdProp={leadSessionId}');
+    const leadOwner = orcaSplitViewSource.indexOf('navigationMode="route-owner"', leadView);
+    const workerView = orcaSplitViewSource.indexOf('sessionIdProp={workerSession.id}', leadOwner);
+    const workerEmbedded = orcaSplitViewSource.indexOf(
+      'navigationMode="sidebar-embedded"',
+      workerView,
+    );
+
+    expect(leadView).toBeGreaterThan(-1);
+    expect(leadOwner).toBeGreaterThan(leadView);
+    expect(workerView).toBeGreaterThan(leadOwner);
+    expect(workerEmbedded).toBeGreaterThan(workerView);
+    expect(orcaSplitViewSource).toContain(
+      'onBeforeSecondaryWindowClose={onBeforeSecondaryWindowClose}',
+    );
+  });
+
+  it('lets the workdir route protect dirty files before either route-owning chat closes', () => {
+    expect(workdirBrowseRouteSource).toContain(
+      '() => confirmSwitchAway(selectedPath, null)',
+    );
+    expect(
+      workdirBrowseRouteSource.match(
+        /onBeforeSecondaryWindowClose=\{confirmSecondaryWindowClose\}/g,
+      ),
+    ).toHaveLength(2);
+  });
+
+  it('blocks both the composer and send path for archived secondary-window sessions', () => {
+    const guardDeclaration = sessionViewSource.indexOf(
+      'const blocksArchivedSecondaryWindowInput =',
+    );
+    const sendGuard = sessionViewSource.indexOf(
+      'if (blocksArchivedSecondaryWindowInput) return false;',
+      guardDeclaration,
+    );
+    const composerDisabled = sessionViewSource.indexOf('disabled={', sendGuard);
+    const composerGuard = sessionViewSource.indexOf(
+      'blocksArchivedSecondaryWindowInput',
+      composerDisabled,
+    );
+
+    expect(guardDeclaration).toBeGreaterThan(-1);
+    expect(sendGuard).toBeGreaterThan(guardDeclaration);
+    expect(composerDisabled).toBeGreaterThan(sendGuard);
+    expect(composerGuard).toBeGreaterThan(composerDisabled);
   });
 });

@@ -39,12 +39,15 @@ export interface OrcaSplitViewProps {
   workerEmptyLabel?: string;
   /** 当前 OrcaSplitView 是否应代表屏幕可见内容上报给 Agent Island。 */
   reportAgentIslandVisibility?: boolean;
+  /** Lead 作为副窗口路由所有者自动关窗前的宿主预检。 */
+  onBeforeSecondaryWindowClose?: () => Promise<boolean>;
 }
 
 export function OrcaSplitView({
   leadSessionId,
   workerEmptyLabel,
   reportAgentIslandVisibility = true,
+  onBeforeSecondaryWindowClose,
 }: OrcaSplitViewProps) {
   const { t } = useTranslation();
   const [togglePane, setTogglePane] = useState<TogglePane>('lead');
@@ -192,6 +195,8 @@ export function OrcaSplitView({
               orcaMode
               showRsbToggle
               viewVisible={reportAgentIslandVisibility}
+              navigationMode="route-owner"
+              onBeforeSecondaryWindowClose={onBeforeSecondaryWindowClose}
             />
           ) : (
             <div className="flex h-full w-full items-center justify-center px-6 text-center text-sm text-muted-foreground">
@@ -206,6 +211,7 @@ export function OrcaSplitView({
             orcaMode
             showRsbToggle
             viewVisible={reportAgentIslandVisibility}
+            navigationMode="sidebar-embedded"
           />
         ) : (
           <div className="flex h-full w-full items-center justify-center px-6 text-center text-sm text-muted-foreground">

@@ -455,6 +455,8 @@ interface CCAgentSessionViewProps {
   sidebarTargetSessionId?: string;
   /** 禁止该常驻视图在挂载时抢占键盘焦点（例如非 owner 的分屏 pane）。 */
   disableAutofocus?: boolean;
+  /** 副窗口因当前任务被归档而自动关闭前，由路由宿主保护尚未保存的界面状态。 */
+  onBeforeSecondaryWindowClose?: () => Promise<boolean>;
 }
 
 /**
@@ -700,6 +702,7 @@ export function CCAgentSessionView({
   onSessionNavigate,
   sidebarTargetSessionId,
   disableAutofocus = false,
+  onBeforeSecondaryWindowClose,
 }: CCAgentSessionViewProps = {}) {
   const { t } = useTranslation();
   const { sessionId: paramSessionId } = useParams<{ sessionId: string }>();
@@ -899,6 +902,8 @@ export function CCAgentSessionView({
       ? sessionSnapshotPatchBufferRef.current.merge(sessionId, sessionBase)
       : null;
   const isOrcaLeadSessionView = session?.orcaRole === 'lead';
+  const blocksArchivedSecondaryWindowInput =
+    isSecondaryWindow() && session?.status === 'archived';
 
   // worktree-parallel-sessions:订阅当前 session 的 worktree 创建态(creating/failed)。
   // 触发源:NewMakerDraftRoute 的 worktree 异步创建路径。
@@ -1234,9 +1239,25 @@ export function CCAgentSessionView({
       log.info('archived session removed from embedded secondary-window pane', { sessionId });
       return;
     }
-    log.info('archived route-owning session in secondary window, closing window', { sessionId });
-    window.electronAPI?.windowClose();
-  }, [session?.status, sessionId, ownsWindowRoute]);
+    let cancelled = false;
+    void (async () => {
+      let allowClose = true;
+      try {
+        allowClose = onBeforeSecondaryWindowClose
+          ? await onBeforeSecondaryWindowClose()
+          : true;
+      } catch (err) {
+        log.error('secondary-window close preflight failed', err);
+        return;
+      }
+      if (!allowClose || cancelled) return;
+      log.info('archived route-owning session in secondary window, closing window', { sessionId });
+      window.electronAPI?.windowCloseSelf();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.status, sessionId, ownsWindowRoute, onBeforeSecondaryWindowClose]);
 
   const vendorAuthGate = useVendorAuthGate();
 
@@ -3302,6 +3323,7 @@ export function CCAgentSessionView({
         onDeferredAccepted?: () => void;
       },
     ) => {
+      if (blocksArchivedSecondaryWindowInput) return false;
       const deliveryMode = opts?.deliveryMode ?? 'queue';
       const navigationRequestVersion =
         deliveryMode !== 'steer' && matchNavigationCommandName(message)
@@ -3544,6 +3566,7 @@ export function CCAgentSessionView({
       vendorAuthGate,
       remoteDeviceId,
       sessionHandoffPreparing,
+      blocksArchivedSecondaryWindowInput,
     ],
   );
 
@@ -5010,7 +5033,11 @@ export function CCAgentSessionView({
                   isAgentBusy={isAgentBusy}
                   onStop={handleStopSession}
                   pendingQueue={pendingQueue}
-                  disabled={remoteHandoffPreparing || session?.source === 'review'}
+                  disabled={
+                    remoteHandoffPreparing ||
+                    session?.source === 'review' ||
+                    blocksArchivedSecondaryWindowInput
+                  }
                   settingsLocked={session?.source === 'review'}
                   queuePaused={queuePaused}
                   queueExpanded={queueExpanded}
