@@ -12,12 +12,26 @@ function ok(action: string, data: Record<string, unknown>): BrowserControlResult
   return { ok: true, action: action as BrowserControlResult['action'], data };
 }
 
-function makeInner(): { inner: BrowserControlRuntime; calls: BrowserControlRequest[] } {
+function failed(action: string, message: string): BrowserControlResult {
+  return {
+    ok: false,
+    action: action as BrowserControlResult['action'],
+    errorCode: 'BROWSER_RUNTIME_ACTION_FAILED',
+    message,
+  };
+}
+
+function makeInner(options?: {
+  closeFails?: boolean;
+}): { inner: BrowserControlRuntime; calls: BrowserControlRequest[] } {
   const calls: BrowserControlRequest[] = [];
   const inner: BrowserControlRuntime = {
     async call(request) {
       calls.push(request);
-      if (request.action === 'close') return ok('close', {});
+      if (request.action === 'close') {
+        if (options?.closeFails) return failed('close', 'CDP hiccup');
+        return ok('close', {});
+      }
       if (request.action === 'navigate') {
         const data: Record<string, unknown> = {};
         if (typeof request.targetId === 'string') data.targetId = request.targetId;
@@ -201,5 +215,45 @@ describe('LocalhostGuardedRuntime', () => {
       const res = await rt.call({ action });
       expect(res.ok).toBe(true);
     }
+  });
+
+  it('keeps the target blocked when the closing tab returns ok:false (PR #2445 Codex P1)', async () => {
+    // close can fail softly (e.g. CDP hiccup) with { ok: false }. The
+    // wrapper previously treated that as success, dropping tracking while
+    // the tab stayed loaded — any subsequent snapshot/scrape on it would
+    // leak localhost content. Park the target on soft-fail close so
+    // every later read returns a failure result.
+    //
+    // Trigger a post-result guard violation: navigate to a public URL that
+    // 30x-redirects to localhost (the marker URL `redirect-to-localhost`
+    // in makeInner is recognized). This drives the wrapper through its
+    // post-result close path, so closeTab runs and — with closeFails —
+    // soft-fails to add the target to blockedTargets.
+    const { inner, calls } = makeInner({ closeFails: true });
+    const rt = makeRuntime(inner);
+    const targetId = 'tab-soft-fail';
+
+    const nav = await rt.call({
+      action: 'navigate',
+      url: 'https://evil.example/redirect-to-localhost',
+      targetId,
+    });
+    expect(nav.ok).toBe(false);
+    expect(nav.message).toContain('localhost');
+    // The wrapper attempted to close the tab (post-result violation); close
+    // soft-failed (ok:false) so the target should now be parked.
+    expect(calls.some((c) => c.action === 'close' && c.targetId === targetId)).toBe(true);
+
+    // A subsequent read on the same target must be refused without
+    // dispatching to the inner runtime.
+    const callsBefore = calls.length;
+    const snap = await rt.call({
+      action: 'navigate',
+      url: 'https://example.com/anything',
+      targetId,
+    });
+    expect(snap.ok).toBe(false);
+    expect(snap.message).toMatch(/could not be closed/);
+    expect(calls.length).toBe(callsBefore); // wrapper short-circuited
   });
 });

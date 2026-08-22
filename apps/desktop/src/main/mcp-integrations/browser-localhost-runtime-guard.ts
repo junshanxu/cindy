@@ -108,6 +108,10 @@ export function createLocalhostGuardedRuntime(
   // navigate/open). Acts on these tabs may stay on / move among localhost URLs;
   // acts on public tabs may not.
   const loopbackTabs = new Set<string>();
+  // Tabs whose violating tab-close attempt failed (CDP hiccup, browser gone,
+  // etc). They may still be on a sensitive localhost page — block all
+  // further reads on them until the surface is cleared another way.
+  const blockedTargets = new Set<string>();
 
   const rememberTab = (targetId: string | undefined, url: string | undefined): void => {
     if (!targetId) return;
@@ -120,19 +124,60 @@ export function createLocalhostGuardedRuntime(
 
   const closeTab = async (targetId: string | undefined): Promise<void> => {
     if (!targetId) return;
+    let closedOk = true;
     try {
-      await inner.call({ action: 'close', targetId });
+      const closeResult = await inner.call({ action: 'close', targetId });
+      // `close` can fail softly (e.g. CDP hiccup) with { ok: false } — that
+      // is NOT an exception and would otherwise leave the violating tab loaded
+      // while the guard drops its tracking. Treat any non-ok result as a
+      // failed close and park the target id so subsequent snapshot/scrape
+      // reads are still blocked (PR #2445 Codex P1).
+      if (closeResult && closeResult.ok === false) closedOk = false;
     } catch (err) {
+      closedOk = false;
       logger.warn('localhost guard: failed to close violating tab', {
         targetId,
         error: err instanceof Error ? err.message : String(err),
       });
-    } finally {
-      loopbackTabs.delete(targetId);
+    }
+    loopbackTabs.delete(targetId);
+    if (!closedOk) {
+      // Park the target id: any further read on this tab stays blocked until
+      // the user closes the surface another way (restart, manual close).
+      blockedTargets.add(targetId);
+      logger.warn('localhost guard: close failed — keeping read block on target', {
+        targetId,
+      });
     }
   };
 
   const call = async (request: BrowserControlRequest): Promise<BrowserControlResult> => {
+    // A previously parked target (close of a violating tab failed and the tab
+    // is still loaded) stays blocked for every read action: the wrapper never
+    // observed the page being torn down, so any further snapshot/scrape on
+    // it would leak localhost content (PR #2445 Codex P1).
+    const reqTid =
+      typeof request.targetId === 'string' && request.targetId !== ''
+        ? request.targetId
+        : undefined;
+    if (reqTid && blockedTargets.has(reqTid)) {
+      logger.warn('localhost guard: blocked read on a target whose close failed', {
+        action: request.action,
+        targetId: reqTid,
+      });
+      return failedResult(
+        request.action,
+        `Blocked: target ${reqTid} could not be closed after a localhost-policy ` +
+          'violation; no further reads are permitted on it until the surface is cleared.',
+      );
+    }
+    if (request.action === 'close' && reqTid && blockedTargets.has(reqTid)) {
+      // A retry that succeeds unblocks the target.
+      const retry = await inner.call(request);
+      if (retry.ok !== false) blockedTargets.delete(reqTid);
+      return retry;
+    }
+
     // Pre-dispatch rejection for direct navigations/opens to a sensitive
     // loopback port. The post-result check below closes the tab after the fact,
     // but by then Chromium has already issued the request and a state-changing
