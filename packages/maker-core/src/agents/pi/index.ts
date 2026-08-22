@@ -3038,9 +3038,12 @@ export class PiAgent extends BaseAgent {
         // pending approvals, and this session's Auto reviewer must not rule on
         // them either. Always ask the user explicitly; denial stays fail-closed.
         if (adopted) return requestUserDecision({ forcePrompt: true });
-        if (permissionMode === 'bypassPermissions') {
-          return turnPolicyForcePrompt ? 'system-deny' : 'allow';
-        }
+        // Resolve the MCP approval policy BEFORE the Full Access short-circuit:
+        // a `prompt-each-time` result (e.g. localhost browser navigation) is a
+        // per-call consent boundary that even Full Access must honor, so the
+        // subagent cannot bypass it the way a plain tool call does. The policy
+        // classifier failing/returning null falls through to normal handling
+        // (PR #2445 Codex P1).
         const mcpTarget = resolveMcpToolTarget(toolName, registeredMcpServerNames);
         const mcpPolicy = (() => {
           const classifier = this.deps.getMcpToolApprovalPolicy;
@@ -3071,6 +3074,9 @@ export class PiAgent extends BaseAgent {
           return requestUserDecision({
             forcePrompt: turnPolicyForcePrompt || mcpPolicy === 'prompt-each-time',
           });
+        }
+        if (permissionMode === 'bypassPermissions') {
+          return turnPolicyForcePrompt ? 'system-deny' : 'allow';
         }
         if (permissionMode !== 'auto') {
           return requestUserDecision({ forcePrompt: turnPolicyForcePrompt });
