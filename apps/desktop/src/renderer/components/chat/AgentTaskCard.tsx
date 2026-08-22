@@ -619,6 +619,7 @@ export function AgentTaskCard({
                   type="button"
                   onClick={openSubagentPanel}
                   className="mt-1 inline-flex items-center gap-1 text-12 leading-4 underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
+>>>>>>> 588e120bc (fix(desktop): 普通 Subagent 卡展开区加「查看 Subagent 详情」入口 (#3154))
                 >
                   <PanelRight size={12} aria-hidden="true" />
                   {t('chat.agentTask.viewSubagentDetails')}
