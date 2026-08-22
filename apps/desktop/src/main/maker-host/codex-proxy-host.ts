@@ -1416,19 +1416,24 @@ function sanitizeXaiTools(
     next.tool_choice = xaiToolChoiceAfterSanitize(next.tool_choice, tools);
   } else {
     delete next.tools;
-    // All tools were filtered out. When server-side x_search is re-injected
-    // afterwards, any surviving tool_choice now refers to a removed tool (an
-    // object forced choice, an emptied allowed_tools, 'required', or 'auto').
-    // Collapse it to 'none' so the model cannot auto-call the injected search
-    // tool and widen the caller's authorization; a request that had no
-    // tool_choice stays without one. When nothing is re-injected (Guardian /
-    // cache-only search), drop the control field entirely — a 'none' with no
-    // tools is still an invalid xAI request (PR #2444 Codex P1/P2).
+    // All declared tools were filtered out. When server-side x_search is
+    // re-injected afterwards, a tool_choice that *references a removed tool*
+    // (an object forced choice, an emptied allowed_tools, or 'required') must
+    // collapse to 'none' so the model cannot widen the caller's authorization
+    // by auto-calling the injected search. 'auto' does NOT reference a
+    // specific tool — it means "choose any available tool" — so it stays,
+    // letting Grok use the re-injected x_search as the caller intended; a
+    // request that had no tool_choice (or already 'none') is left untouched.
+    // When nothing is re-injected (Guardian / cache-only search), drop the
+    // control field entirely — a 'none' with no tools is still an invalid xAI
+    // request (PR #2444 Codex P1/P2).
     if (options.preserveNoneToolChoice) {
-      // An explicit (but now-dangling) forced choice collapses to 'none'; a
-      // request that had no tool_choice stays without one so the re-injected
-      // x_search remains auto-selectable.
-      if (next.tool_choice !== undefined && next.tool_choice !== 'none') {
+      const choice = next.tool_choice;
+      if (
+        choice !== undefined
+        && choice !== 'none'
+        && choice !== 'auto'
+      ) {
         next.tool_choice = 'none';
       }
     } else {

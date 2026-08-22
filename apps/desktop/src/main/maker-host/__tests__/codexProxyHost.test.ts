@@ -3576,6 +3576,23 @@ describe('codex proxy host', () => {
       expect(out.tool_choice).toBe('none');
     });
 
+    it('全量过滤后保留 tool_choice:auto(不收敛为 none),让重新注入的 x_search 可被自动选择', async () => {
+      // 'auto' is a generic "choose any available tool" — it does not reference
+      // a specific (now-filtered) tool. Collapsing it to 'none' would
+      // wrongly prevent Grok from auto-calling the re-injected x_search.
+      // Distinguish it from forced choices that DO reference removed tools
+      // (PR #2444 Codex P2).
+      const out = (await runXaiTransforms('auto-after-full-filter', {
+        model: 'xai/grok-4.5',
+        tools: [{ type: 'namespace', name: 'multi_agent_v1', tools: [] }],
+        tool_choice: 'auto',
+        input: [{ role: 'user', content: 'hi' }],
+      })) as Record<string, unknown>;
+
+      expect(out.tools).toEqual([{ type: 'x_search' }]);
+      expect(out.tool_choice).toBe('auto');
+    });
+
     it('first-party xAI cache-only search + tool_choice:none 不注入 x_search 且清理控制字段', async () => {
       const out = (await runXaiTransforms('cache-only-none', {
         model: 'xai/grok-4.5',
