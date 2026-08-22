@@ -152,14 +152,23 @@ export function createLocalhostGuardedRuntime(
   };
 
   const call = async (request: BrowserControlRequest): Promise<BrowserControlResult> => {
-    // A previously parked target (close of a violating tab failed and the tab
-    // is still loaded) stays blocked for every read action: the wrapper never
-    // observed the page being torn down, so any further snapshot/scrape on
-    // it would leak localhost content (PR #2445 Codex P1).
     const reqTid =
       typeof request.targetId === 'string' && request.targetId !== ''
         ? request.targetId
         : undefined;
+    // A close retry on a parked target must run BEFORE the generic block so a
+    // transient CDP failure can be cleared by an immediate retry; otherwise the
+    // block below also intercepted close and left the target permanently parked
+    // with no way to recover except restart (PR #2445 Codex P2).
+    if (request.action === 'close' && reqTid && blockedTargets.has(reqTid)) {
+      const retry = await inner.call(request);
+      if (retry.ok !== false) blockedTargets.delete(reqTid);
+      return retry;
+    }
+    // A previously parked target (close of a violating tab failed and the tab
+    // is still loaded) stays blocked for every other action: the wrapper never
+    // observed the page being torn down, so any further snapshot/scrape on it
+    // would leak localhost content (PR #2445 Codex P1).
     if (reqTid && blockedTargets.has(reqTid)) {
       logger.warn('localhost guard: blocked read on a target whose close failed', {
         action: request.action,
@@ -170,12 +179,6 @@ export function createLocalhostGuardedRuntime(
         `Blocked: target ${reqTid} could not be closed after a localhost-policy ` +
           'violation; no further reads are permitted on it until the surface is cleared.',
       );
-    }
-    if (request.action === 'close' && reqTid && blockedTargets.has(reqTid)) {
-      // A retry that succeeds unblocks the target.
-      const retry = await inner.call(request);
-      if (retry.ok !== false) blockedTargets.delete(reqTid);
-      return retry;
     }
 
     // Pre-dispatch rejection for direct navigations/opens to a sensitive
