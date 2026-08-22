@@ -3070,7 +3070,16 @@ export class PiAgent extends BaseAgent {
           return 'prompt-each-time' as const;
         })();
         if (mcpPolicy !== null) {
-          if (mcpPolicy === 'auto-approve' && !turnPolicyForcePrompt) return 'allow';
+          // Mirror the root handler's Full-Access semantics for subagent MCP:
+          // `auto-approve` and `prompt` are honored by Full Access (the
+          // session's "don't ask again" contract), only `prompt-each-time` is a
+          // per-call consent boundary (e.g. localhost browser navigation) that
+          // Full Access must NOT bypass — route it through requestUserDecision
+          // so the resolver is actually invoked. Ask/Auto modes always ask
+          // (PR #2445 Codex P1/P2).
+          if (permissionMode === 'bypassPermissions' && mcpPolicy !== 'prompt-each-time') {
+            return 'allow';
+          }
           return requestUserDecision({
             forcePrompt: turnPolicyForcePrompt || mcpPolicy === 'prompt-each-time',
           });
