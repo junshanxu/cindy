@@ -11,12 +11,19 @@ import path from 'node:path';
 import { ipcMain, app, BrowserWindow } from 'electron';
 import { eq, ne, and, desc, count, inArray, isNotNull, isNull, sql, type SQL } from 'drizzle-orm';
 
+import {
+  clearPiSubagentDeletedTombstone,
+  piSubagentRunRoot,
+  stopAndRemovePiSubagentRuns,
+  writePiSubagentDeletedTombstone,
+} from '@cindy/maker-core/pi-subagent-runs';
 import { DEFAULT_DRAFT_SESSION_TITLE, normalizeAutoTitle } from '@cindy/maker-shared/session-title';
 
 import { getDbClient } from '../client/current';
 import type { DbClient } from '../client/DbClient';
 import { sessions, messages } from '../schema';
 import { throwIpcError, requireString, requireObject } from '../../utils/ipcValidate';
+import { bindDeletedPiSubagentCleanupCancel } from './piSubagentDeletion';
 import { resolveBusinessSessionId } from '../../sessionIds';
 import { normalizeDbAgentKind } from '../../../shared/agentKindConversion';
 import {
@@ -268,7 +275,8 @@ export async function recycleSessionWorktreeForStatusChange(
         // quiescence and ref/worktree deletion.
         await removeDeletedSessionMediaRefs(targetSessionId, mediaDb)
           .then((count) => {
-            if (count > 0) log.info('session media refs removed', { sessionId: targetSessionId, count });
+            if (count > 0)
+              log.info('session media refs removed', { sessionId: targetSessionId, count });
           })
           .catch((err) => {
             log.warn('session media ref cleanup failed', {
@@ -382,6 +390,7 @@ export async function applyAgentSwitchToSessionRow(
     /** 目标引擎下的 effort / fastMode(意图登记时 renderer 按目标目录解析,apply 一并落库)。 */
     effort?: string;
     fastMode?: boolean;
+    contextWindow?: number | null;
   },
 ): Promise<void> {
   const ownerScope = captureOwnerScope();
@@ -400,6 +409,9 @@ export async function applyAgentSwitchToSessionRow(
     setObj.effort = patch.effort as (typeof sessions.$inferInsert)['effort'];
   }
   if (patch.fastMode !== undefined) setObj.fastMode = patch.fastMode;
+  if (typeof patch.contextWindow === 'number' && patch.contextWindow > 0) {
+    setObj.contextWindow = Math.floor(patch.contextWindow);
+  }
   await db.update(sessions).set(setObj).where(eq(sessions.id, sessionId));
   if (!isOwnerScopeCurrent(ownerScope)) return;
   broadcastSessionPatched(
@@ -411,6 +423,9 @@ export async function applyAgentSwitchToSessionRow(
       ...(patch.providerId !== undefined ? { providerId: patch.providerId } : {}),
       ...(patch.effort !== undefined ? { effort: patch.effort } : {}),
       ...(patch.fastMode !== undefined ? { fastMode: patch.fastMode } : {}),
+      ...(typeof patch.contextWindow === 'number' && patch.contextWindow > 0
+        ? { contextWindow: Math.floor(patch.contextWindow) }
+        : {}),
     },
     ownerScope,
   );
@@ -548,7 +563,7 @@ const LATEST_MSG_CONTENT_SQL = sql<string | null>`(
     AND m.rewind_at IS NULL
     AND (m.agent_meta IS NULL OR json_extract(m.agent_meta, '$.autoResume') IS NOT 1)
     AND (${sessions.clearedAt} IS NULL OR m.created_at > ${sessions.clearedAt})
-  ORDER BY m.created_at DESC LIMIT 1
+  ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1
 )`.as('latest_message_content');
 const LATEST_MSG_ROLE_SQL = sql<string | null>`(
   SELECT m.role FROM messages m
@@ -557,7 +572,7 @@ const LATEST_MSG_ROLE_SQL = sql<string | null>`(
     AND m.rewind_at IS NULL
     AND (m.agent_meta IS NULL OR json_extract(m.agent_meta, '$.autoResume') IS NOT 1)
     AND (${sessions.clearedAt} IS NULL OR m.created_at > ${sessions.clearedAt})
-  ORDER BY m.created_at DESC LIMIT 1
+  ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1
 )`.as('latest_message_role');
 
 /**
@@ -1436,8 +1451,8 @@ export function registerSessionIpc(
     if (p.clearedAt !== undefined) {
       noteSessionClearBoundary(sid, p.clearedAt as string | null);
       // sidebar-card-mode(codex review):summary 是基于 clear 前内容生成的,clear 后
-      // 已过时;SessionCard / rail flyout 优先用 summary 而非 preview,不清就会继续
-      // 显示旧任务摘要。这里一并清空,待 clear 后新一轮 turn-done 重新生成。
+      // 已过时;置顶卡片优先用 summary 而非 preview,不清就会继续显示旧任务摘要。
+      // 这里一并清空,待 clear 后新一轮 turn-done 重新生成。
       await db.update(sessions).set({ summary: null }).where(eq(sessions.id, sid));
       // 广播 summary:null,让已挂载的 sidebar 立即清掉旧摘要(codex review)——renderer 的
       // clearSession 乐观 patch 只带 sdkSessionId/clearedAt、不含 summary,本 update handler
@@ -1473,6 +1488,11 @@ export function registerSessionIpc(
     }
     const row = await selectSessionWithCount(db, sid);
     if (!row) throwIpcError('NOT_FOUND', 'Session 不存在');
+    // 取消置顶后摘要不再有展示面,立刻清掉,避免列表/再次置顶前继续吃旧句。
+    if (p.pinnedAt !== undefined && row.pinnedAt == null) {
+      await db.update(sessions).set({ summary: null }).where(eq(sessions.id, sid));
+      row.summary = null;
+    }
     const updated = sessionToCamel(row);
     const broadcastPatch =
       p.pinnedAt === undefined
@@ -1480,11 +1500,14 @@ export function registerSessionIpc(
         : {
             ...p,
             pinnedAt: updated.pinnedAt,
-            ...(updated.pinnedAt === null ? {} : { status: updated.status }),
+            ...(updated.pinnedAt === null ? { summary: null } : { status: updated.status }),
           };
     const projectTargetChanged = p.workspaceKind !== undefined || p.workingDir !== undefined;
     const settingsChanged = Object.keys(p).some((key) => REMOTE_PERSIST_FIELDS.has(key));
     const titleChanged = p.title !== undefined;
+    // 归档/删除这类纯 status 变化也要广播:本机多窗口收敛靠 sessions:patched,
+    // 否则「在新窗口打开」的副窗口无从得知会话已被移除,仍停留在旧视图(#3175)。
+    const statusChanged = p.status !== undefined;
     if (
       projectTargetChanged &&
       row.workspaceKind === 'project' &&
@@ -1493,7 +1516,13 @@ export function registerSessionIpc(
     ) {
       await upsertRecentWorkdir(row.workingDir, Date.now());
     }
-    if (projectTargetChanged || settingsChanged || titleChanged || p.pinnedAt !== undefined) {
+    if (
+      projectTargetChanged ||
+      settingsChanged ||
+      titleChanged ||
+      statusChanged ||
+      p.pinnedAt !== undefined
+    ) {
       if (isOwnerScopeCurrent(ownerScope)) {
         broadcastSessionPatched(sid, broadcastPatch, ownerScope);
       }
@@ -1503,7 +1532,7 @@ export function registerSessionIpc(
     // 模块环;fire-and-forget,模块内部自带置顶/节流守卫。
     if (p.pinnedAt !== undefined && updated.pinnedAt !== null) {
       void import('../../sessionTaskSummary.js').then((m) =>
-        m.maybeGenerateSessionTaskSummary(sid),
+        m.maybeGenerateSessionTaskSummary(sid, { force: true }),
       );
     }
     notifyAgentIslandSessionPatch(updated.id, {
@@ -1514,7 +1543,7 @@ export function registerSessionIpc(
     });
     scheduleWorktreeRecycleForStatusChange(sid, p.status, { ownerScope, mediaDb: db });
     notifyGhostSessionStatusChange(sid, p.status, updated.workingDir);
-    removeHookAttachmentDir(sid, p.status);
+    cleanupSessionTerminalArtifacts(sid, p.status);
     return updated;
   });
 
@@ -1545,6 +1574,21 @@ export function registerSessionIpc(
     async (_e, id: unknown, atMs: unknown): Promise<void> => {
       const sid = requireString(id, 'id');
       await touchUserSendInDb(sid, typeof atMs === 'number' ? atMs : undefined);
+    },
+  );
+
+  // 本机 UI 偏好:置顶段是不是卡片模式。故意不进 device-link allowlist —— 摘要
+  // oneShot 只服务本机卡片展示,控制端卡片回退 preview,不把付费生成推到被控端。
+  // 新增 handler 一律校验顶层 app renderer(electron-security §5)。
+  ipcMain.handle(
+    'local-db:sessions:set-pinned-card-summaries',
+    async (event, enabled: unknown): Promise<void> => {
+      assertTrustedAppRendererEvent(event);
+      if (typeof enabled !== 'boolean') {
+        throwIpcError('INVALID_PARAMS', 'enabled must be a boolean');
+      }
+      const m = await import('../../sessionTaskSummary.js');
+      m.setPinnedSectionCardMode(enabled);
     },
   );
 }
@@ -1583,6 +1627,10 @@ export async function patchSessionMetaInDb(
     await writeSessionPatch(db, sessionId, setObj, patch.status);
     const row = await selectSessionWithCount(db, sessionId);
     if (!row) throwIpcError('NOT_FOUND', 'Session 不存在');
+    if (patch.pinnedAt !== undefined && row.pinnedAt == null) {
+      await db.update(sessions).set({ summary: null }).where(eq(sessions.id, sessionId));
+      row.summary = null;
+    }
     return sessionToCamel(row);
   });
   notifyAgentIslandSessionPatch(updated.id, {
@@ -1605,14 +1653,23 @@ export async function patchSessionMetaInDb(
       });
     });
   }
-  removeHookAttachmentDir(sessionId, patch.status);
+  cleanupSessionTerminalArtifacts(sessionId, patch.status);
   scheduleWorktreeRecycleForStatusChange(sessionId, patch.status, { ownerScope, mediaDb: db });
   notifyGhostSessionStatusChange(sessionId, patch.status, updated.workingDir);
   // 远程 / MCP 改动绕过 renderer 乐观更新,故主动广播 sessions:patched:
   //   - sessionsStore.onPatched → patchLocal,即时反映到 sidebar(删/归档移出 active 桶、改名/置顶刷新);
   //   - CCAgentSessionView.onPatched → 合并进 serverSession。
   // 经 tap 转发:订阅了该被控端 `sessions` topic 的控制端也即时收到这条 patched(push 驱动镜像)。
-  if (isOwnerScopeCurrent(ownerScope)) broadcastSessionPatched(sessionId, patch, ownerScope);
+  const broadcastPatch =
+    patch.pinnedAt !== undefined && updated.pinnedAt == null ? { ...patch, summary: null } : patch;
+  if (isOwnerScopeCurrent(ownerScope)) {
+    broadcastSessionPatched(sessionId, broadcastPatch, ownerScope);
+  }
+  if (patch.pinnedAt !== undefined && updated.pinnedAt != null) {
+    void import('../../sessionTaskSummary.js').then((m) =>
+      m.maybeGenerateSessionTaskSummary(sessionId, { force: true }),
+    );
+  }
   return updated;
 }
 
@@ -1756,7 +1813,7 @@ export async function setSessionsStatusInDb(
       mediaDb: dbClient.drizzle,
     });
     notifyGhostSessionStatusChange(item.sessionId, item.status, item.workingDir);
-    removeHookAttachmentDir(item.sessionId, item.status);
+    cleanupSessionTerminalArtifacts(item.sessionId, item.status);
   }
   return applied.map((item) => ({
     sessionId: item.sessionId,
@@ -1766,11 +1823,206 @@ export async function setSessionsStatusInDb(
   }));
 }
 
+const piSubagentCleanupTimers = new Map<string, NodeJS.Timeout>();
+const piSubagentCleanupEpoch = new Map<string, number>();
+/** Longer than the adapter's own close budget, so a normal close is never cut short. */
+const PI_SUBAGENT_CLEANUP_CLOSE_TIMEOUT_MS = 15_000;
+
+function piSubagentCleanupCurrentEpoch(sessionId: string): number {
+  return piSubagentCleanupEpoch.get(sessionId) ?? 0;
+}
+
+function cancelDeletedPiSubagentCleanupImpl(sessionId: string): void {
+  piSubagentCleanupEpoch.set(sessionId, piSubagentCleanupCurrentEpoch(sessionId) + 1);
+  const timer = piSubagentCleanupTimers.get(sessionId);
+  if (!timer) return;
+  clearTimeout(timer);
+  piSubagentCleanupTimers.delete(sessionId);
+}
+
+bindDeletedPiSubagentCleanupCancel(cancelDeletedPiSubagentCleanupImpl);
+
 /**
- * hook 入站附件目录回收(fire-and-forget): deleted/archived 都是终态,
- * 文件在 turn 送出后即无用。所有把 session 置为终态的路径都应调用。
+ * Can this parent task still start a durable Subagent?
+ *
+ * Only one thing can: the `cindy-subagent` extension, which exists solely
+ * inside the parent PI process. `stopAndRemovePiSubagentRuns` finishes by
+ * scanning for an empty run root and deleting it — so if the parent is still
+ * alive, a launch entering after that scan recreates the root and spawns a
+ * detached runner, on the deleted task's inherited provider credentials, with
+ * the cleanup already reporting success and its retry timer discarded. The
+ * publish-intent-first protocol makes the converse true: a launch that started
+ * before the parent died has already written its `queued` status, so the scan
+ * sees it and stops it.
+ *
+ * This function only proves the launcher in *this* process stopped. Other
+ * supported instances share userData, so a parent PI elsewhere can still be
+ * alive; the per-session tombstone written before the scan is what stops those
+ * launches. Not the host-level launch fence: that one blocks *every* session
+ * for the duration, and this is one deleted task's cleanup.
+ *
+ * `closeSession` is idempotent and is issued here rather than waited for
+ * elsewhere: the worktree recycle path also closes the session, but the two are
+ * unordered and its close is best-effort, so waiting on it could mean waiting
+ * forever. It resolves only after `proc.close()` confirms the PI process exited
+ * (adapter contract); if the close failed the session is left in `error`, which
+ * `isSessionAlive` still reports as alive — so the recheck below stays
+ * conservative by construction.
  */
-function removeHookAttachmentDir(sessionId: string, status: unknown): void {
+async function piSubagentLauncherProvenStopped(sessionId: string): Promise<boolean> {
+  let maker: ReturnType<typeof import('../../maker-host/index.js').getMakerIfReady>;
+  try {
+    // Dynamic, like every other maker-host use here: localDb must not take a
+    // static edge on it.
+    const mh = await import('../../maker-host/index.js');
+    maker = mh.getMakerIfReady();
+  } catch (err) {
+    // Unable to ask is not permission to proceed.
+    log.warn('PI Subagent cleanup could not reach the Maker host', {
+      sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+  // Nothing loaded in *this* process. Another instance sharing userData may
+  // still have the parent PI alive; the deleted-task tombstone (written before
+  // this function is used as a scan gate) is what stops its launches. Returning
+  // true here only means there is no local launcher left to close.
+  if (!maker) return true;
+  if (!maker.isSessionAlive(sessionId)) return true;
+  const closing = maker.closeSession(sessionId).catch((err: unknown) => {
+    log.warn('PI Subagent cleanup close of the deleted parent task failed', {
+      sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  });
+  // Bounded. `closeSession` has no deadline of its own, and this path used to
+  // await nothing unbounded: a wedged close would otherwise park this attempt
+  // forever, and with it the retry that is supposed to keep trying. Giving up
+  // returns "not proven stopped", so the backoff re-enters — and `Session.close`
+  // hands back the same in-flight promise, so no second close is issued.
+  let deadline: NodeJS.Timeout | undefined;
+  const closed = await Promise.race([
+    closing.then(() => true),
+    new Promise<boolean>((resolve) => {
+      deadline = setTimeout(() => resolve(false), PI_SUBAGENT_CLEANUP_CLOSE_TIMEOUT_MS);
+      deadline.unref?.();
+    }),
+  ]).finally(() => { if (deadline) clearTimeout(deadline); });
+  if (!closed) {
+    log.warn('PI Subagent cleanup timed out closing the deleted parent task', { sessionId });
+    return false;
+  }
+  return !maker.isSessionAlive(sessionId);
+}
+
+function scheduleDeletedPiSubagentCleanup(sessionId: string, attempt = 0): void {
+  if (piSubagentCleanupTimers.has(sessionId)) return;
+  const epoch = piSubagentCleanupCurrentEpoch(sessionId);
+  const marker = setTimeout(() => undefined, 0);
+  marker.unref?.();
+  piSubagentCleanupTimers.set(sessionId, marker);
+  void (async () => {
+    const agentHome = path.join(app.getPath('userData'), 'pi-agent-home');
+    const superseded = (): boolean => piSubagentCleanupCurrentEpoch(sessionId) !== epoch;
+    try {
+      if (superseded()) return;
+      // Tombstone first, before asking whether *this* process still has a
+      // launcher. Dev, packaged and --passive instances share userData, so a
+      // parent PI in another process can still spawn after our local Maker
+      // reports the task unloaded. The in-Pi launcher reads this marker after
+      // publishing queued and before spawn — same opposite-order protocol as
+      // the launch fence. Without it, stopAndRemove deleting an empty root is
+      // not a proof.
+      try {
+        await writePiSubagentDeletedTombstone(agentHome, sessionId);
+      } catch (err) {
+        log.warn('PI Subagent cleanup could not write the deleted-task tombstone', {
+          sessionId,
+          err: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
+      }
+      if (superseded()) {
+        await clearPiSubagentDeletedTombstone(agentHome, sessionId);
+        return;
+      }
+      // Every attempt, not just the first: the parent may still have been alive
+      // when an earlier one gave up, and this is the only thing standing
+      // between the conclusive scan and a launch that outruns it.
+      if (await piSubagentLauncherProvenStopped(sessionId)) {
+        if (superseded()) {
+          await clearPiSubagentDeletedTombstone(agentHome, sessionId);
+          return;
+        }
+        const removed = await stopAndRemovePiSubagentRuns(piSubagentRunRoot(agentHome, sessionId));
+        if (removed) {
+          piSubagentCleanupTimers.delete(sessionId);
+          return;
+        }
+      } else {
+        log.warn('PI Subagent cleanup deferred: the deleted parent task is still running', {
+          sessionId,
+          attempt,
+        });
+      }
+    } catch (err) {
+      log.warn('PI Subagent cleanup attempt failed', {
+        sessionId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+    if (superseded()) return;
+    const delayMs = Math.min(60_000, 1_000 * (2 ** Math.min(attempt, 6)));
+    const timer = setTimeout(() => {
+      piSubagentCleanupTimers.delete(sessionId);
+      scheduleDeletedPiSubagentCleanup(sessionId, attempt + 1);
+    }, delayMs);
+    timer.unref?.();
+    piSubagentCleanupTimers.set(sessionId, timer);
+  })();
+}
+
+export async function resumeDeletedPiSubagentCleanup(): Promise<void> {
+  const parentRoot = path.join(app.getPath('userData'), 'pi-agent-home', 'runtime', 'pi-subagent-runs');
+  let idsFromDisk: string[] = [];
+  try {
+    const entries = await fs.readdir(parentRoot, { withFileTypes: true });
+    idsFromDisk = entries
+      .filter((entry) => entry.isDirectory() && entry.name && !/[\\/\0]/.test(entry.name))
+      .map((entry) => entry.name);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+
+  const db = getDbClient().drizzle;
+  // Deleted PI parents must get a tombstone even when they never grew a run
+  // root. Crash between the delete commit and the fire-and-forget write would
+  // otherwise leave another shared-userData process free to launch later.
+  const deletedPi = await db
+    .select({ id: sessions.id })
+    .from(sessions)
+    .where(and(eq(sessions.status, 'deleted'), eq(sessions.agentKind, 'pi')));
+
+  const diskDeleted = idsFromDisk.length === 0
+    ? []
+    : await db
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(and(inArray(sessions.id, idsFromDisk), eq(sessions.status, 'deleted')));
+
+  const ids = new Set<string>();
+  for (const row of deletedPi) ids.add(row.id);
+  for (const row of diskDeleted) ids.add(row.id);
+  for (const id of ids) scheduleDeletedPiSubagentCleanup(id);
+}
+
+/**
+ * Terminal task artifact cleanup. Archive only removes one-shot hook files;
+ * delete additionally stops and removes detached PI Subagents owned by the
+ * parent task. All status writers must pass through this helper.
+ */
+function cleanupSessionTerminalArtifacts(sessionId: string, status: unknown): void {
   if (status !== 'deleted' && status !== 'archived') return;
   if (status === 'deleted') {
     void removeTurnChangeSetsForSession(sessionId).catch((err) => {
@@ -1779,6 +2031,7 @@ function removeHookAttachmentDir(sessionId: string, status: unknown): void {
         err: err instanceof Error ? err.message : String(err),
       });
     });
+    scheduleDeletedPiSubagentCleanup(sessionId);
   }
   const attachRoot = path.join(app.getPath('userData'), 'hook-attachments');
   const attachDir = path.join(attachRoot, sessionId);
