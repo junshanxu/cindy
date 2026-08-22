@@ -1976,6 +1976,30 @@ function xdProviderClaimsWireModel(wireModel: string): boolean {
  * Keep this transform deliberately narrow: gateway routing and the model
  * namespace must both match before applying the same tool-shape cleanup.
  */
+/**
+ * Whether the request's session provider route is actually adopted by the
+ * router for the current auth injection. Mirrors createModelRoutingTransform's
+ * canUseExplicitSessionRoute: under `env-key`, a built-in session provider
+ * (e.g. the default `openai` catalog entry) is NOT adopted — the request
+ * falls through decideCodexRoute/gateway default and lands on the XD gateway
+ * even though the session records a providerId. Trusting that provider's
+ * (universal) routing descriptor would skip Grok cleanup and let namespace
+ * tools reach Grok (PR #2444 Codex P2).
+ */
+function explicitProviderRouteIsAdopted(
+  sessionId: string | undefined,
+  subagentRoute: { providerId: string } | undefined,
+): boolean {
+  if (subagentRoute) return true;
+  if (!sessionId) return false;
+  const authInjection = getCodexProxyAuthInjection();
+  return (
+    authInjection === 'oauth-bearer'
+    || isUserProviderSession(sessionId)
+    || isHostInjectedAuthSession(sessionId, 'codex')
+  );
+}
+
 function createGatewayGrokResponsesCompatTransform(): RequestTransform {
   return (body, ctx) => {
     if (!isPlainObject(body)) return null;
@@ -1986,16 +2010,16 @@ function createGatewayGrokResponsesCompatTransform(): RequestTransform {
     // clean tools when the effective provider for THIS request is xd.
     const providerContext = providerContextForRequest(ctx.headers, requestModel);
     if (providerContext.providerId === 'xd') return sanitizeXaiTools(body);
-    // An explicit non-xd provider owns this request only when it actually
-    // serves the wire model. A provider-oauth xAI session sending an
-    // out-of-scope `x-ai/grok*` request falls through the xAI scope gate and
-    // is routed back to the XD Gateway by gatewayDefaultRouteDecision (the
-    // xAI modelPrefixes cover `xai/`, not the gateway's `x-ai/` namespace).
-    // Skipping cleanup there lets namespace tools reach Grok untouched and
-    // re-trigger the schema 400 — keep cleaning whenever the selected
-    // provider does not natively serve this model (PR #2444 Codex P2).
+    // An explicit non-xd provider owns this request only when (a) the router
+    // actually adopts the session route for this auth mode, and (b) that
+    // provider natively serves the wire model. A built-in `openai` session
+    // under env-key is NOT adopted (the request passes through to XD), and a
+    // provider-oauth xAI session with an out-of-scope `x-ai/grok*` request
+    // falls back to XD via gatewayDefaultRouteDecision — in both cases the
+    // namespace tools must still be cleaned (PR #2444 Codex P2).
     if (
       providerContext.providerId !== null
+      && explicitProviderRouteIsAdopted(providerContext.sessionId, providerContext.subagentRoute)
       && providerRoutingServesWireModel(
         providerContext.providerId,
         'codex',
@@ -2004,12 +2028,11 @@ function createGatewayGrokResponsesCompatTransform(): RequestTransform {
     ) {
       return null;
     }
-    // Implicit session (no explicit provider). The request still lands on the
+    // Implicit session (no explicit provider), or an explicit session that is
+    // not adopted under the current auth mode. The request still lands on the
     // XD gateway when the xd catalog owns this wire model (env-key default
-    // route, or an implicit default that resolves to xd). A non-xd provider
-    // merely *listing* the same id does not mean THIS request routes there —
-    // if it did, the provider would be explicitly selected and caught above.
-    // Clean whenever xd owns the catalog entry, matching the routing scope.
+    // route, or an implicit default that resolves to xd). Clean whenever xd
+    // owns the catalog entry, matching the routing scope.
     if (!xdProviderClaimsWireModel(requestModel)) return null;
     return sanitizeXaiTools(body);
   };

@@ -4347,6 +4347,56 @@ describe('codex proxy host', () => {
     }
   });
 
+  it('cleans Grok namespace tools for a built-in openai session under env-key (passthrough to XD)', async () => {
+    // Under env-key auth injection, a built-in session provider (e.g. the
+    // default `openai` catalog entry with universal routing) is NOT adopted by
+    // the router; an x-ai/grok* request passes through to the default XD
+    // Gateway. The compat transform must still clean namespace tools even
+    // though providerRoutingServesWireModel returns true for the universal
+    // openai routing — trusting it would leave the tools untouched and
+    // re-trigger the Grok schema 400 (PR #2444 Codex P2).
+    const host = await freshCodexProxyHost();
+    const { setXdGatewayModels } = await import('../active-catalog.js');
+    const { setSessionProvider, clearSessionProvider } = await import('../session-provider-store.js');
+    setXdGatewayModels([{ id: 'x-ai/grok-4.5', agents: ['codex'] }], { authoritative: true });
+    host.setCodexProxyAuthInjection('env-key');
+    mockState.createAnthropicCompatProxy.mockResolvedValueOnce({
+      url: 'http://127.0.0.1:43210',
+      dispose: vi.fn(async () => undefined),
+    });
+    await host.ensureCodexProxyReady();
+    host.registerComposed('session-openai-envkey', 'thread-openai-envkey', 'PRODUCT_PROMPT');
+    setSessionProvider('session-openai-envkey', 'openai');
+
+    try {
+      const transforms = mockState.createAnthropicCompatProxy.mock.calls[0]?.[0]?.transformRequest ?? [];
+      let current: unknown = {
+        model: 'x-ai/grok-4.5',
+        tools: [
+          { type: 'function', name: 'exec_command' },
+          { type: 'namespace', name: 'multi_agent_v1', tools: [] },
+        ],
+      };
+      const ctx = {
+        method: 'POST',
+        url: '/responses',
+        headers: { 'thread-id': 'thread-openai-envkey' },
+      };
+      for (const transform of transforms) {
+        const next = transform(current, ctx);
+        if (next !== null && next !== undefined) current = next;
+      }
+
+      expect(current).toMatchObject({
+        model: 'x-ai/grok-4.5',
+        tools: [{ type: 'function', name: 'exec_command' }],
+      });
+    } finally {
+      clearSessionProvider('session-openai-envkey');
+      setXdGatewayModels([]);
+    }
+  });
+
   it('drops Grok search when live web access is explicitly disabled', async () => {
     const host = await freshCodexProxyHost();
     const { setXdGatewayModels } = await import('../active-catalog.js');
