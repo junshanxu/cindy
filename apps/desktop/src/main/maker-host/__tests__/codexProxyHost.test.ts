@@ -4251,6 +4251,54 @@ describe('codex proxy host', () => {
     }
   });
 
+  it('still sanitizes implicit-session Grok namespace tools while the gateway catalog is non-authoritative', async () => {
+    // A pending/failed /models fetch leaves xdGatewayModelsAuthoritative=false
+    // with an empty list. The empty list must NOT be used as negative evidence
+    // for an implicit session (no explicit provider): the env-key default route
+    // still sends it to XD, so leaving namespace tools untouched would re-trigger
+    // the schema 400 (PR #2444 Codex P1).
+    const host = await freshCodexProxyHost();
+    const { setXdGatewayModels, markXdGatewayModelAccessUnknown } = await import('../active-catalog.js');
+    const { setSessionProvider, clearSessionProvider } = await import('../session-provider-store.js');
+    setXdGatewayModels([]);
+    markXdGatewayModelAccessUnknown();
+    mockState.createAnthropicCompatProxy.mockResolvedValueOnce({
+      url: 'http://127.0.0.1:43210',
+      dispose: vi.fn(async () => undefined),
+    });
+    await host.ensureCodexProxyReady();
+    host.registerComposed('session-xd-grok-implicit', 'thread-xd-grok-implicit', 'PRODUCT_PROMPT');
+    clearSessionProvider('session-xd-grok-implicit');
+
+    try {
+      const transforms = mockState.createAnthropicCompatProxy.mock.calls[0]?.[0]?.transformRequest ?? [];
+      let current: unknown = {
+        model: 'x-ai/grok-4.5',
+        tools: [
+          { type: 'function', name: 'exec_command' },
+          { type: 'namespace', name: 'multi_agent_v1', tools: [] },
+        ],
+      };
+      const ctx = {
+        method: 'POST',
+        url: '/responses',
+        headers: { 'thread-id': 'thread-xd-grok-implicit' },
+      };
+      for (const transform of transforms) {
+        const next = transform(current, ctx);
+        if (next !== null && next !== undefined) current = next;
+      }
+
+      expect(current).toMatchObject({
+        model: 'x-ai/grok-4.5',
+        tools: [{ type: 'function', name: 'exec_command' }],
+      });
+    } finally {
+      clearSessionProvider('session-xd-grok-implicit');
+      setXdGatewayModels([], { authoritative: false });
+    }
+  });
+
   it('drops Grok search when live web access is explicitly disabled', async () => {
     const host = await freshCodexProxyHost();
     const { setXdGatewayModels } = await import('../active-catalog.js');

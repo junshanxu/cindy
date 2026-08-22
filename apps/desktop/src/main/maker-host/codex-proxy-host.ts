@@ -48,7 +48,11 @@ import path from 'node:path';
 import { isCuratedQwen38Tag } from '../../shared/localModelRuntime.js';
 import { buildCodexGatewayBaseUrl, CODEX_OAUTH_UPSTREAM } from './codex-gateway-config.js';
 import { claudeUpstreamEndpoint } from './runtime-configs.js';
-import { getActiveCatalog, getCatalogModelContextWindow } from './active-catalog.js';
+import {
+  getActiveCatalog,
+  getCatalogModelContextWindow,
+  getXdGatewayModelAccessSnapshot,
+} from './active-catalog.js';
 import {
   gatewayDefaultRouteDecision,
   getProviderRoutingDescriptor,
@@ -1941,11 +1945,28 @@ function createXaiResponsesCompatTransform(): RequestTransform {
  * (not `providerRoutingServesWireModel`, which only consults routing
  * descriptors and is universal for `xd`) so that a non-xd provider that also
  * lists the same id stays authoritative for its own compat transform.
+ *
+ * When the catalog is non-authoritative (a /models fetch is pending or
+ * failed), an empty codex list must NOT be used as negative evidence: an
+ * implicit session still defaults to the XD Gateway, so skipping cleanup here
+ * would let namespace tools reach Grok untouched and re-trigger the schema 400
+ * this transform exists to prevent. In that state clean unconditionally for
+ * implicit routes (PR #2444 Codex P1).
  */
 function xdProviderClaimsWireModel(wireModel: string): boolean {
   if (!wireModel.startsWith('x-ai/grok')) return false;
+  const { authoritative, models } = getXdGatewayModelAccessSnapshot();
+  if (!authoritative) {
+    // Negative evidence is unavailable. The env-key default route and the
+    // implicit-default both resolve to XD when no provider is explicitly
+    // selected, so treat an unverified grok wire model as gateway-owned.
+    return true;
+  }
   const xdProvider = getActiveCatalog().providers.find((provider) => provider.id === 'xd');
-  return xdProvider?.models.codex?.some((candidate) => candidate.id === wireModel) ?? false;
+  if (xdProvider?.models.codex?.some((candidate) => candidate.id === wireModel)) return true;
+  // Authoritative gateway snapshot may also carry wire models outside the
+  // static catalog codex list.
+  return models.some((m) => m.id === wireModel);
 }
 
 /**
