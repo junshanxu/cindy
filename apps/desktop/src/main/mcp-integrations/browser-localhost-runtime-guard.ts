@@ -133,6 +133,30 @@ export function createLocalhostGuardedRuntime(
   };
 
   const call = async (request: BrowserControlRequest): Promise<BrowserControlResult> => {
+    // Pre-dispatch rejection for direct navigations/opens to a sensitive
+    // loopback port. The post-result check below closes the tab after the fact,
+    // but by then Chromium has already issued the request and a state-changing
+    // or blind request may have produced side effects on a local control plane.
+    // When the URL is known up front, block it before inner.call so no request
+    // is sent at all (PR #2445 Codex/Greptile P1). Redirects and interaction-
+    // triggered navigations still go through the post-result guard below because
+    // their final destination is not knowable before dispatch.
+    const requested = requestedNavigationUrl(request);
+    if (requested) {
+      const pre = inspectLocalhostUrl(requested);
+      if (pre.isLoopback && !pre.allowed) {
+        logger.warn('localhost guard: blocked direct navigation to sensitive loopback port before dispatch', {
+          action: request.action,
+          url: requested,
+          port: pre.port,
+        });
+        return failedResult(
+          request.action,
+          new LocalhostPortBlockedError(requested, pre.port).message,
+        );
+      }
+    }
+
     const result = await inner.call(request);
 
     if (request.action === 'close') {

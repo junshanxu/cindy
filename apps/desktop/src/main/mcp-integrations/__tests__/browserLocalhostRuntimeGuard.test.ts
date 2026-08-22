@@ -77,7 +77,7 @@ describe('LocalhostGuardedRuntime', () => {
     expect(res.ok).toBe(true);
   });
 
-  it('blocks localhost on a sensitive port and closes the tab', async () => {
+  it('blocks localhost on a sensitive port without dispatching the request', async () => {
     const { inner, calls } = makeInner();
     const rt = makeRuntime(inner);
     const res = await rt.call({
@@ -87,8 +87,21 @@ describe('LocalhostGuardedRuntime', () => {
     });
     expect(res.ok).toBe(false);
     expect(res.message).toContain('6379');
-    // The violating tab must be closed so the agent can't scrape it.
-    expect(calls.some((c) => c.action === 'close' && c.targetId === 't1')).toBe(true);
+    // Pre-dispatch rejection: the request never reaches the runtime, so no
+    // navigate is sent and there is no tab to close (PR #2445 P1).
+    expect(calls.filter((c) => c.action !== 'close')).toHaveLength(0);
+  });
+
+  it('blocks an open() to a sensitive loopback port before dispatch', async () => {
+    const { inner, calls } = makeInner();
+    const rt = makeRuntime(inner);
+    const res = await rt.call({
+      action: 'open',
+      url: 'http://127.0.0.1:6379/',
+    });
+    expect(res.ok).toBe(false);
+    expect(res.message).toContain('6379');
+    expect(calls).toHaveLength(0);
   });
 
   it('blocks a public URL that 30x-redirects to localhost', async () => {
