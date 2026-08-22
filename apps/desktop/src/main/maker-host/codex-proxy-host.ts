@@ -1986,9 +1986,24 @@ function createGatewayGrokResponsesCompatTransform(): RequestTransform {
     // clean tools when the effective provider for THIS request is xd.
     const providerContext = providerContextForRequest(ctx.headers, requestModel);
     if (providerContext.providerId === 'xd') return sanitizeXaiTools(body);
-    // An explicit non-xd provider (session selection or subagent freeze) owns
-    // this request — leave it to that provider's own compat transform.
-    if (providerContext.providerId !== null) return null;
+    // An explicit non-xd provider owns this request only when it actually
+    // serves the wire model. A provider-oauth xAI session sending an
+    // out-of-scope `x-ai/grok*` request falls through the xAI scope gate and
+    // is routed back to the XD Gateway by gatewayDefaultRouteDecision (the
+    // xAI modelPrefixes cover `xai/`, not the gateway's `x-ai/` namespace).
+    // Skipping cleanup there lets namespace tools reach Grok untouched and
+    // re-trigger the schema 400 — keep cleaning whenever the selected
+    // provider does not natively serve this model (PR #2444 Codex P2).
+    if (
+      providerContext.providerId !== null
+      && providerRoutingServesWireModel(
+        providerContext.providerId,
+        'codex',
+        providerContext.catalogModel ?? requestModel,
+      )
+    ) {
+      return null;
+    }
     // Implicit session (no explicit provider). The request still lands on the
     // XD gateway when the xd catalog owns this wire model (env-key default
     // route, or an implicit default that resolves to xd). A non-xd provider

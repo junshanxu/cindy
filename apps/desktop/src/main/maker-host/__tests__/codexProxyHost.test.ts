@@ -4299,6 +4299,54 @@ describe('codex proxy host', () => {
     }
   });
 
+  it('sanitizes out-of-scope x-ai/grok tools even when the session belongs to a non-xd provider', async () => {
+    // A provider-oauth xAI session that sends an `x-ai/grok*` request falls
+    // through the xAI scope gate (xAI modelPrefixes cover `xai/`, not the
+    // gateway's `x-ai/` namespace) and is routed back to the XD Gateway by
+    // gatewayDefaultRouteDecision. The compat transform must still clean the
+    // namespace tools; returning early just because providerId === 'xai' left
+    // them untouched and re-triggered the Grok schema 400 (PR #2444 Codex P2).
+    const host = await freshCodexProxyHost();
+    const { setXdGatewayModels } = await import('../active-catalog.js');
+    const { setSessionProvider, clearSessionProvider } = await import('../session-provider-store.js');
+    setXdGatewayModels([{ id: 'x-ai/grok-4.5', agents: ['codex'] }], { authoritative: true });
+    mockState.createAnthropicCompatProxy.mockResolvedValueOnce({
+      url: 'http://127.0.0.1:43210',
+      dispose: vi.fn(async () => undefined),
+    });
+    await host.ensureCodexProxyReady();
+    host.registerComposed('session-xai-grok-fallback', 'thread-xai-grok-fallback', 'PRODUCT_PROMPT');
+    setSessionProvider('session-xai-grok-fallback', 'xai');
+
+    try {
+      const transforms = mockState.createAnthropicCompatProxy.mock.calls[0]?.[0]?.transformRequest ?? [];
+      let current: unknown = {
+        model: 'x-ai/grok-4.5',
+        tools: [
+          { type: 'function', name: 'exec_command' },
+          { type: 'namespace', name: 'multi_agent_v1', tools: [] },
+        ],
+      };
+      const ctx = {
+        method: 'POST',
+        url: '/responses',
+        headers: { 'thread-id': 'thread-xai-grok-fallback' },
+      };
+      for (const transform of transforms) {
+        const next = transform(current, ctx);
+        if (next !== null && next !== undefined) current = next;
+      }
+
+      expect(current).toMatchObject({
+        model: 'x-ai/grok-4.5',
+        tools: [{ type: 'function', name: 'exec_command' }],
+      });
+    } finally {
+      clearSessionProvider('session-xai-grok-fallback');
+      setXdGatewayModels([]);
+    }
+  });
+
   it('drops Grok search when live web access is explicitly disabled', async () => {
     const host = await freshCodexProxyHost();
     const { setXdGatewayModels } = await import('../active-catalog.js');
