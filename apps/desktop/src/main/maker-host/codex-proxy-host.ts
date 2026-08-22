@@ -1989,10 +1989,10 @@ function xdProviderClaimsWireModel(wireModel: string): boolean {
 function explicitProviderRouteIsAdopted(
   sessionId: string | undefined,
   subagentRoute: { providerId: string } | undefined,
+  authInjection: CodexProxyAuthInjection,
 ): boolean {
   if (subagentRoute) return true;
   if (!sessionId) return false;
-  const authInjection = getCodexProxyAuthInjection();
   return (
     authInjection === 'oauth-bearer'
     || isUserProviderSession(sessionId)
@@ -2000,7 +2000,9 @@ function explicitProviderRouteIsAdopted(
   );
 }
 
-function createGatewayGrokResponsesCompatTransform(): RequestTransform {
+function createGatewayGrokResponsesCompatTransform(
+  frozenAuthInjection?: CodexProxyAuthInjection,
+): RequestTransform {
   return (body, ctx) => {
     if (!isPlainObject(body)) return null;
     const requestModel = typeof body.model === 'string' ? body.model : '';
@@ -2019,7 +2021,11 @@ function createGatewayGrokResponsesCompatTransform(): RequestTransform {
     // namespace tools must still be cleaned (PR #2444 Codex P2).
     if (
       providerContext.providerId !== null
-      && explicitProviderRouteIsAdopted(providerContext.sessionId, providerContext.subagentRoute)
+      && explicitProviderRouteIsAdopted(
+        providerContext.sessionId,
+        providerContext.subagentRoute,
+        frozenAuthInjection ?? getCodexProxyAuthInjection(),
+      )
       && providerRoutingServesWireModel(
         providerContext.providerId,
         'codex',
@@ -2635,7 +2641,7 @@ function createTransformRequestChain(
     createXaiModelInputSanitizeTransform(),
     sanitizeDeepSeekV4CustomTools,
     createXaiResponsesCompatTransform(),
-    createGatewayGrokResponsesCompatTransform(),
+    createGatewayGrokResponsesCompatTransform(frozenAuthInjection),
     createByteDanceSeedResponsesCompatTransform(),
     createMiniMaxResponsesCompatTransform(),
     createProviderModelRewriteTransform(),
