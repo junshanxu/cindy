@@ -806,6 +806,30 @@ function captureOriginalSyntheticTrigger(item: AgentInputQueuedMessage): AgentIn
 }
 
 /**
+ * First acceptance overwrites the untrusted wire value; later Main-owned queue
+ * transitions use `preserveActiveSessionDispatchFence` so edits, resume, retry,
+ * and crash recovery cannot weaken an already accepted lifecycle requirement.
+ */
+function stampActiveSessionDispatchFence(
+  item: AgentInputQueuedMessage,
+  requireActiveSession: boolean,
+): AgentInputQueuedMessage {
+  const stamped = { ...item };
+  if (requireActiveSession) stamped.requireActiveSession = true;
+  else delete stamped.requireActiveSession;
+  return stamped;
+}
+
+function preserveActiveSessionDispatchFence(
+  item: AgentInputQueuedMessage,
+  requireActiveSession: boolean,
+): AgentInputQueuedMessage {
+  return item.requireActiveSession || requireActiveSession
+    ? { ...item, requireActiveSession: true }
+    : item;
+}
+
+/**
  * Stamp the acceptance boundary with the controlled host's clock.  Remote
  * renderer timestamps are presentation data and may come from a device with a
  * different wall clock; they must never decide whether a crash-restored item
@@ -1504,11 +1528,15 @@ export class AgentInputCoordinator {
       wasFirst?: boolean;
       sendAtMs?: number;
       resumeRestorePausedQueue?: boolean;
+      requireActiveSession?: boolean;
       onDuplicate?: () => void;
     },
   ): AgentInputProjection {
     const state = this.getState(sessionId);
-    item = captureOriginalSyntheticTrigger(item);
+    item = stampActiveSessionDispatchFence(
+      captureOriginalSyntheticTrigger(item),
+      opts?.requireActiveSession === true,
+    );
     // 幂等去重(弱网重发防线,PR #881):同 clientId 重复投递说明是控制端(手机
     // 断连自动重试 / 用户对 ack 丢失的消息重发)在补发同一条消息,不是新消息。
     // 直接返回当前 projection、不再入队——否则同一条消息双入队、agent 跑两轮。
@@ -1958,6 +1986,12 @@ export class AgentInputCoordinator {
           typeof item.hostAcceptedAtMs === 'number' && Number.isFinite(item.hostAcceptedAtMs);
       }
     }
+    // A same-turn steer can fall back to an ordinary queued turn both before
+    // vendor delivery and after a NO_ACTIVE_TURN race. Stamp the lifecycle
+    // requirement on the Main-owned item before either fallback can retain it;
+    // otherwise that later drain would lose the secondary-window fence even
+    // though direct steer delivery still rechecks it.
+    item = preserveActiveSessionDispatchFence(item, opts?.requireActiveSession === true);
     if (state.steeringQueueClientIds.includes(item.clientId)) {
       log.info('steer ignored: duplicate in-flight clientId (control-side resend)', {
         sessionId,
@@ -2595,6 +2629,11 @@ export class AgentInputCoordinator {
       return this.getProjection(sessionId);
     }
     const state = this.getState(sessionId);
+    if (opts?.requireActiveSession) {
+      state.pendingQueue = state.pendingQueue.map((item) =>
+        preserveActiveSessionDispatchFence(item, true),
+      );
+    }
     const recovery = state.recovery;
     const pausedQueueHeadRecoveryClientId =
       state.queuePaused &&
@@ -2869,6 +2908,7 @@ export class AgentInputCoordinator {
           },
         };
       }
+      item = preserveActiveSessionDispatchFence(item, opts?.requireActiveSession === true);
       if (opts?.auto && attemptToken !== null) {
         this.pendingAutoResumeRecoveries.set(item.clientId, {
           sessionId,
@@ -2899,6 +2939,16 @@ export class AgentInputCoordinator {
         opts?.auto ? 'auto' : 'manual',
         attemptToken ?? undefined,
       );
+    } else if (opts?.requireActiveSession) {
+      const headIndex = state.pendingQueue.findIndex(
+        (item) => item.clientId === recovery.clientId,
+      );
+      const head = headIndex >= 0 ? state.pendingQueue[headIndex] : undefined;
+      if (head) {
+        const nextQueue = [...state.pendingQueue];
+        nextQueue[headIndex] = preserveActiveSessionDispatchFence(head, true);
+        state.pendingQueue = nextQueue;
+      }
     }
     if (!opts?.auto) this.touchUserSend(sessionId);
     this.emit(sessionId);
@@ -3081,6 +3131,8 @@ export class AgentInputCoordinator {
     const replacement = { ...next };
     if (current.hostAcceptedAtMs === undefined) delete replacement.hostAcceptedAtMs;
     else replacement.hostAcceptedAtMs = current.hostAcceptedAtMs;
+    if (current.requireActiveSession === undefined) delete replacement.requireActiveSession;
+    else replacement.requireActiveSession = current.requireActiveSession;
     const nextQueue = [...state.pendingQueue];
     nextQueue[index] = replacement;
     state.pendingQueue = nextQueue;
@@ -3808,6 +3860,7 @@ export class AgentInputCoordinator {
   private toProjectedItem(item: AgentInputQueuedMessage): AgentInputQueuedMessage {
     const projected = { ...item };
     delete projected.hostAcceptedAtMs;
+    delete projected.requireActiveSession;
     delete projected.trustedSessionReferenceContexts;
     delete projected.sessionReferencesRequireTrustedSnapshot;
     delete (projected as Record<string, unknown>)[TRUSTED_DESKTOP_PI_COMMAND_SNAPSHOT];
@@ -4371,6 +4424,7 @@ export class AgentInputCoordinator {
         signal: this.getInputAbortSignal(sessionId, active.generation),
         expectedClearBoundaryMs: active.clearBoundaryMs,
         expectedInputGeneration: active.generation,
+        ...(head.requireActiveSession ? { requireActiveSession: true } : {}),
         ...(head.origin?.kind === 'scheduler' ? { origin: head.origin } : {}),
         // 手机来源透传到 send 事务:drain 已脱离入队时的 async context。
         ...(head.fromMobileClient ? { fromMobileClient: true } : {}),
@@ -4494,6 +4548,18 @@ export class AgentInputCoordinator {
       this.discardDeferredResumableCandidate(sessionId, active);
       const latest = this.getState(sessionId);
       if (!active.persisted) {
+        if (head.requireActiveSession && isSessionNotActiveError(err)) {
+          latest.activeTurn = null;
+          this.clearCredentialSwitchWait(latest);
+          this.deps.onDiscardedQueuedMessage?.(sessionId, head);
+          log.info('discarded queued input after final lifecycle fence', {
+            sessionId,
+            clientId: head.clientId,
+          });
+          this.emit(sessionId);
+          this.scheduleDrain(sessionId, 'session-no-longer-active');
+          return;
+        }
         if (isSessionRunningError(err)) {
           this.deferQueueHeadAfterSessionRunning(
             sessionId,

@@ -335,5 +335,7 @@ describe('archived secondary-window ownership', () => {
     expect(makerChatStoreSource).toContain(
       '...(opts?.requireActiveSession ? { requireActiveSession: true } : {})',
     );
+    expect(registerSource).toContain('delete normalized.requireActiveSession;');
+    expect(enqueueBody).toContain('{ requireActiveSession: true }');
   });
 });

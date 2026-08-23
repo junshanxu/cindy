@@ -14505,6 +14505,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       throwIpcError('INVALID_PARAMS', 'queued.createOpts.agentKind invalid');
     }
     const normalized: AgentInputQueuedMessage = { ...msg };
+    // Lifecycle fences are Main-owned. Renderer/device-link payloads may ask
+    // for one through the validated opts object, but may not forge it on a
+    // queue row that can survive beyond the current IPC invocation.
+    delete normalized.requireActiveSession;
     const refs = requireSessionRefs(normalized.sessionRefs);
     if (!isDeviceLinkInvoke()) {
       // preload/renderer 不属于可信边界，不能直接注入历史正文。
@@ -14923,6 +14927,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         let duplicate = false;
         const projection = inputCoordinator.enqueue(sid, queued, {
           ...(enqueueOpts?.sendAtMs !== undefined ? { sendAtMs: enqueueOpts.sendAtMs } : {}),
+          ...(requiresActiveSessionForDispatch(enqueueOpts)
+            ? { requireActiveSession: true }
+            : {}),
           // INPUT_ENQUEUE 只承载显式用户输入(composer 发送 / UI trigger / device-link
           // 被控端转投的用户消息):崩溃恢复出的暂停队列遇到显式输入即放行,解开
           // 「继续任务/新消息全部排队直到重启」的死锁。Orca 自动投递走 main 侧直调
