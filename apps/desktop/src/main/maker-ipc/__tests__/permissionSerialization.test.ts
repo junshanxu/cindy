@@ -228,15 +228,22 @@ describe('PermissionQueue (issue #3092)', () => {
           }),
         { timeoutMs: 1000 },
       );
-      // Second permission: queued behind A, same timeout.
+      // Second permission: queued behind A, same timeout. Track whether
+      // its run body ever executes — after timeout it must NOT run.
       const start = Date.now();
+      let secondRan = false;
       const secondPromise = queue.dispatch(
-        async () => allow(),
+        async () => {
+          secondRan = true;
+          return allow();
+        },
         { timeoutMs: 1000 },
       );
       let settledAt: number | null = null;
-      void secondPromise.then(() => {
+      let settledDecision: InteractionDecision | null = null;
+      void secondPromise.then((d) => {
         settledAt = Date.now() - start;
+        settledDecision = d;
       });
 
       // Advance well past one timeout but not two.
@@ -245,10 +252,20 @@ describe('PermissionQueue (issue #3092)', () => {
       // It should have settled around the 1000ms cap (queue wait counted),
       // certainly not near 2000ms.
       expect(settledAt!).toBeLessThan(1500);
+      // It settled as a timeout denial, and its run body never executed
+      // (no orphan card broadcast after the agent already moved on).
+      expect(secondRan).toBe(false);
+      expect(settledDecision).toMatchObject({
+        kind: 'permission',
+        behavior: 'deny',
+        reason: 'timeout',
+      });
 
-      // Clean up the dangling first promise.
+      // Release A and advance: B must still not run even though it has
+      // now reached the front of the queue.
       releaseA?.();
-      await vi.runAllTimersAsync();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(secondRan).toBe(false);
     } finally {
       vi.useRealTimers();
     }

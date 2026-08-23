@@ -3833,11 +3833,17 @@ export class PermissionQueue {
     const myGen = this.generation;
     const timeoutMs = opts?.timeoutMs;
 
+    // Per-dispatch stale flag: set when this dispatch's overall timeout
+    // fires so that — even if it later reaches the front of the queue —
+    // runIfCurrent skips the broadcast instead of showing an orphan card
+    // that nobody is awaiting (issue #3092 review P1).
+    let timedOut = false;
+
     // The gate resolves when it's this run's turn AND it is still current,
     // or rejects if the previous run threw (we still proceed to run()).
     const next = this.tail.then(
-      () => this.runIfCurrent(myGen, run),
-      () => this.runIfCurrent(myGen, run),
+      () => this.runIfCurrent(myGen, run, () => timedOut),
+      () => this.runIfCurrent(myGen, run, () => timedOut),
     );
 
     // Advance the tail. On rejection recover so a throwing run doesn't
@@ -3853,10 +3859,12 @@ export class PermissionQueue {
     // just execution. Without this, N parallel permissions with no user
     // present could extend the 10-minute renderer timeout to N×10 minutes
     // because each card's own timer only starts when it reaches the front
-    // (issue #3092 review).
+    // (issue #3092 review). When the timeout fires, mark the dispatch
+    // stale so its run never broadcasts even after it reaches the front.
     if (timeoutMs && timeoutMs > 0 && timeoutMs < Number.POSITIVE_INFINITY) {
       return new Promise<InteractionDecision>((resolve) => {
         const timer = setTimeout(() => {
+          timedOut = true;
           resolve({
             kind: 'permission',
             behavior: 'deny',
@@ -3866,6 +3874,10 @@ export class PermissionQueue {
         next.then(
           (decision) => {
             clearTimeout(timer);
+            // If the outer timeout already resolved, don't override it —
+            // but the run has already executed by now (it reached the
+            // front and runIfCurrent let it through before timedOut was
+            // set), so this only resolves the same promise once.
             resolve(decision);
           },
           () => {
@@ -3882,12 +3894,21 @@ export class PermissionQueue {
     return next;
   }
 
-  /** Run `run` only if no reset/close happened while queued. */
+  /** Run `run` only if no reset/close/timeout happened while queued. */
   private runIfCurrent(
     myGen: number,
     run: () => Promise<InteractionDecision>,
+    isTimedOut: () => boolean,
   ): Promise<InteractionDecision> {
     if (this.closedDecision) return Promise.resolve(this.closedDecision);
+    if (isTimedOut()) {
+      // This dispatch's overall timeout fired while queued. Don't run.
+      return Promise.resolve({
+        kind: 'permission',
+        behavior: 'deny',
+        reason: 'timeout',
+      });
+    }
     if (myGen !== this.generation) {
       // A reset happened while we were queued. Settle with the drain
       // decision recorded for our generation instead of running.
