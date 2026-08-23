@@ -2581,6 +2581,7 @@ function cleanupPendingAgentInteractionsForSession(sessionId: string, reason: st
   cancelPermissionQueueForSession(
     sessionId,
     defaultDecisionForPending('permission', reason),
+    reason === 'session_closed',
   );
   const entries = Array.from(pendingInteractionResolvers.entries()).filter(
     ([, entry]) => entry.sessionId === sessionId,
@@ -2667,12 +2668,16 @@ export function takePendingInteractionsForSession(sessionId: string): Array<{
   }
   // Permission requests still queued behind the in-flight one have no
   // pendingInteractionResolvers entry yet, so take() can't migrate them.
-  // Cancel them with a terminal deny so they don't later broadcast on the
-  // old Desktop surface after the channel takeover (issue #3092 review P2);
-  // the agent receives the denial and can re-issue on the new turn if needed.
+  // Reset (not permanently cancel) queued permissions: the items queued
+  // behind the in-flight one have no pendingInteractionResolvers entry yet,
+  // so they settle with a terminal deny; the queue stays live so permissions
+  // emitted later in the same turn — after the listener switched to the
+  // taken-over route — still broadcast normally instead of returning a stale
+  // deny forever (issue #3092 review P2).
   cancelPermissionQueueForSession(
     sessionId,
     defaultDecisionForPending('permission', 'session_migrated'),
+    false,
   );
   return taken;
 }
@@ -3832,11 +3837,38 @@ export class PermissionQueue {
   /**
    * Settle all queued (not yet started) permissions with `decision` and
    * prevent any future dispatch from running. Safe to call multiple times;
-   * the first decision wins.
+   * the first decision wins. Use this for terminal session teardown
+   * (session_closed), where no further turn will run on this queue.
    */
   cancel(decision: InteractionDecision): void {
     if (this.cancelled) return;
     this.cancelled = decision;
+  }
+
+  /**
+   * Settle all queued (not yet started) permissions with `decision`, but
+   * leave the queue usable for future dispatches. Use this for transient
+   * turn teardown (session_aborted / turn_idle_reconcile / orca_disable):
+   * the agent's current turn is over and queued cards belong to it, but
+   * the next user turn on the same session must still be able to show
+   * permission cards. Cancelling permanently here would make every later
+   * permission dispatch return a stale deny (issue #3092 review P1).
+   */
+  resetForNewTurn(decision: InteractionDecision): void {
+    // Drain any queued runs by flipping the cancelled flag; the tail
+    // carries the drained decision. Then clear the flag and start a fresh
+    // tail so dispatches after this point run their handlers normally.
+    this.cancelled = decision;
+    this.tail = this.tail.then(
+      () => {
+        this.cancelled = null;
+        return permissionQueueSeed();
+      },
+      () => {
+        this.cancelled = null;
+        return permissionQueueSeed();
+      },
+    );
   }
 }
 
@@ -3853,19 +3885,31 @@ function ensurePermissionQueue(sessionId: string): PermissionQueue {
 }
 
 /**
- * Cancel every queued permission for a session and forget the queue. Called
- * by cleanupPendingAgentInteractionsForSession when the session closes /
- * aborts so queued permissions don't broadcast phantom cards after teardown.
+ * Drain queued permissions for a session during interaction cleanup.
+ *
+ * - `permanent: true` (session_closed): cancel the queue and remove it from
+ *   the map — the session is gone, no further turn will use it.
+ * - `permanent: false` (session_aborted / turn_idle_reconcile / orca_disable):
+ *   reset the queue for a new turn — queued cards belonging to the aborted
+ *   turn settle with `decision`, but the queue stays usable so the next user
+ *   turn on the same session can still show permission cards. Permanently
+ *   cancelling here would make every later permission dispatch return a
+ *   stale deny (issue #3092 review P1 / Greptile).
+ *
  * Already in-flight interactions are resolved by the normal cleanup path.
  */
 export function cancelPermissionQueueForSession(
   sessionId: string,
   decision: InteractionDecision,
+  permanent: boolean,
 ): void {
   const q = permissionQueuesBySession.get(sessionId);
-  if (q) {
+  if (!q) return;
+  if (permanent) {
     q.cancel(decision);
     permissionQueuesBySession.delete(sessionId);
+  } else {
+    q.resetForNewTurn(decision);
   }
 }
 

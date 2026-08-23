@@ -164,4 +164,49 @@ describe('PermissionQueue (issue #3092)', () => {
     await a;
     expect(bRan).toBe(false);
   });
+
+  it('resetForNewTurn drains queued runs but keeps the queue usable for a later turn', async () => {
+    // Transient teardown (Stop / turn-idle reconcile / orca disable) must
+    // settle queued permissions for the aborted turn, but must NOT poison the
+    // session permanently — a subsequent permission on the next turn still has
+    // to show its card and run (issue #3092 review P1 / Greptile).
+    const queue = new PermissionQueue();
+    let aReleased: ((() => void) | null) | undefined;
+    let bRan = false;
+
+    const a = queue.dispatch(
+      () =>
+        new Promise((resolve) => {
+          aReleased = () => resolve(allow());
+        }),
+    );
+    const b = queue.dispatch(async () => {
+      bRan = true;
+      return allow();
+    });
+
+    // Transient reset while A is in-flight and B is queued.
+    queue.resetForNewTurn(deny('session_aborted'));
+    await expect(b).resolves.toMatchObject({
+      kind: 'permission',
+      behavior: 'deny',
+      reason: 'session_aborted',
+    });
+    expect(bRan).toBe(false);
+
+    // Release A; it resolves normally.
+    aReleased?.();
+    await a;
+
+    // A dispatch AFTER reset must run normally (queue is not permanently
+    // cancelled), simulating the next user turn.
+    let laterRan = false;
+    const later = queue.dispatch(async () => {
+      laterRan = true;
+      return allow();
+    });
+    await later;
+    expect(laterRan).toBe(true);
+    expect(queue.isCancelled()).toBe(false);
+  });
 });
