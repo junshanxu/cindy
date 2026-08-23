@@ -12949,23 +12949,25 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       ? prependNoteToWireUserMessage(normalized as HandoffWireMessage, steerNote)
       : normalized;
     try {
-      const remote = isDeviceLinkInvoke();
-      assertRemoteInputClearNotInFlight(sessionId, remote);
-      const precondition = readRemoteInputClearBoundaryPrecondition(sendOpts);
-      if (precondition.present) {
-        assertCurrentInputClearBoundary(sessionId, precondition.expected);
-      }
-      assertCurrentInputGeneration(sessionId, readExpectedInputGeneration(sendOpts));
-      if (so.requireActiveSession) {
-        await assertSessionActiveForManualDispatch(sessionId);
-      }
-      sess = readCurrentSteerSession();
-      await sess.steer(steerPayload as never, {
-        logTitle: meta?.title,
-        messageUuid: so.messageUuid,
-        userName: so.userName,
-        signal: so.signal,
-        [MAIN_OWNED_SEND_CONTEXT]: so[MAIN_OWNED_SEND_CONTEXT],
+      await withSendToSessionLock(sessionId, async () => {
+        const remote = isDeviceLinkInvoke();
+        assertRemoteInputClearNotInFlight(sessionId, remote);
+        const precondition = readRemoteInputClearBoundaryPrecondition(sendOpts);
+        if (precondition.present) {
+          assertCurrentInputClearBoundary(sessionId, precondition.expected);
+        }
+        assertCurrentInputGeneration(sessionId, readExpectedInputGeneration(sendOpts));
+        if (so.requireActiveSession) {
+          await assertSessionActiveForManualDispatch(sessionId);
+        }
+        sess = readCurrentSteerSession();
+        await sess.steer(steerPayload as never, {
+          logTitle: meta?.title,
+          messageUuid: so.messageUuid,
+          userName: so.userName,
+          signal: so.signal,
+          [MAIN_OWNED_SEND_CONTEXT]: so[MAIN_OWNED_SEND_CONTEXT],
+        });
       });
       log.info('steer: delivered', { sessionId, agentKind: sess.agentKind });
     } catch (err) {

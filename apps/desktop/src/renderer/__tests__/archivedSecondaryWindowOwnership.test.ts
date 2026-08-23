@@ -317,9 +317,17 @@ describe('archived secondary-window ownership', () => {
       'await assertSessionActiveForManualDispatch(sessionId);',
       steerMetadataRead,
     );
+    const finalSteerLock = registerSource.indexOf(
+      'await withSendToSessionLock(sessionId, async () => {',
+      steerMetadataRead,
+    );
     const vendorSteer = registerSource.indexOf(
       'await sess.steer(steerPayload as never,',
       finalSteerFence,
+    );
+    const finalSteerLockEnd = registerSource.indexOf(
+      "\n      });\n      log.info('steer: delivered'",
+      vendorSteer,
     );
 
     expect(enqueueFence).toBeGreaterThan(-1);
@@ -330,8 +338,10 @@ describe('archived secondary-window ownership', () => {
     expect(directDispatch).toBeGreaterThan(directFence);
     expect(acceptedSteerStart).toBeGreaterThan(-1);
     expect(steerMetadataRead).toBeGreaterThan(-1);
-    expect(finalSteerFence).toBeGreaterThan(steerMetadataRead);
+    expect(finalSteerLock).toBeGreaterThan(steerMetadataRead);
+    expect(finalSteerFence).toBeGreaterThan(finalSteerLock);
     expect(vendorSteer).toBeGreaterThan(finalSteerFence);
+    expect(finalSteerLockEnd).toBeGreaterThan(vendorSteer);
     expect(makerChatStoreSource).toContain(
       '...(opts?.requireActiveSession ? { requireActiveSession: true } : {})',
     );
