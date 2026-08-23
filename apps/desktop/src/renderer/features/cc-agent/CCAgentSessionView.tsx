@@ -1790,6 +1790,17 @@ export function CCAgentSessionView({
     updateQueueItem,
     chatDisplaySnapshot,
   } = useCCAgentChat(sessionId, handleTitleUpdate, { chatRealtime });
+  const handleArchivedSafeQueueResume = useCallback(() => {
+    if (isArchivedSecondaryWindowInputBlocked()) return;
+    resumeQueue();
+  }, [isArchivedSecondaryWindowInputBlocked, resumeQueue]);
+  const handleArchivedSafeQueueSteer = useCallback(
+    (clientId: string) => {
+      if (isArchivedSecondaryWindowInputBlocked()) return Promise.resolve(false);
+      return steerQueuedMessage(clientId);
+    },
+    [isArchivedSecondaryWindowInputBlocked, steerQueuedMessage],
+  );
   useEffect(() => {
     if (!sessionId || !isOrcaLeadSessionView || !historyLoaded) return;
     const recoveredAssignment = getRecoverableDeferredUiAssignment({
@@ -3272,7 +3283,10 @@ export function CCAgentSessionView({
               isSecondaryWindow()
               ? {
                   ...(isSecondaryWindow()
-                    ? { beforeEnqueue: allowArchivedSecondaryWindowEnqueue }
+                    ? {
+                        beforeEnqueue: allowArchivedSecondaryWindowEnqueue,
+                        beforeDispatch: allowArchivedSecondaryWindowEnqueue,
+                      }
                     : {}),
                   ...(pending.vendorOptions ? { vendorOptions: pending.vendorOptions } : {}),
                   ...(pending.quotesEncoded ? { quotesEncoded: true } : {}),
@@ -3578,7 +3592,10 @@ export function CCAgentSessionView({
       const sendOptions = {
         ...orcaLeadVendorOptions,
         ...(isSecondaryWindow()
-          ? { beforeEnqueue: allowArchivedSecondaryWindowEnqueue }
+          ? {
+              beforeEnqueue: allowArchivedSecondaryWindowEnqueue,
+              beforeDispatch: allowArchivedSecondaryWindowEnqueue,
+            }
           : {}),
         ...(opts?.quotesEncoded ? { quotesEncoded: true } : {}),
         ...(opts?.agentReferences?.length ? { agentReferences: opts.agentReferences } : {}),
@@ -3842,7 +3859,7 @@ export function CCAgentSessionView({
     void rebuildClaudeSubscriptionSessionBeforeRetry(errorReason)
       .then(() => {
         if (isArchivedSecondaryWindowInputBlocked()) return;
-        return retryLastError();
+        return retryLastError({ requireActiveSession: isSecondaryWindow() });
       })
       .catch((error) => {
         log.warn('retryLastError failed', error);
@@ -3922,7 +3939,7 @@ export function CCAgentSessionView({
 
     await refreshServerSession();
     if (isArchivedSecondaryWindowInputBlocked()) return;
-    await retryLastError();
+    await retryLastError({ requireActiveSession: isSecondaryWindow() });
   }, [
     canSwitchToClaudeSubscription,
     confirmDialog,
@@ -4213,7 +4230,10 @@ export function CCAgentSessionView({
               isSecondaryWindow()
               ? {
                   ...(isSecondaryWindow()
-                    ? { beforeEnqueue: allowArchivedSecondaryWindowEnqueue }
+                    ? {
+                        beforeEnqueue: allowArchivedSecondaryWindowEnqueue,
+                        beforeDispatch: allowArchivedSecondaryWindowEnqueue,
+                      }
                     : {}),
                   ...(pending.vendorOptions ? { vendorOptions: pending.vendorOptions } : {}),
                   ...(pending.quotesEncoded ? { quotesEncoded: true } : {}),
@@ -5168,10 +5188,18 @@ export function CCAgentSessionView({
                   queuePaused={queuePaused}
                   queueExpanded={queueExpanded}
                   onQueueExpandedChange={setQueueExpanded}
-                  onQueueResume={resumeQueue}
+                  onQueueResume={
+                    blocksArchivedSecondaryWindowInput
+                      ? undefined
+                      : handleArchivedSafeQueueResume
+                  }
                   onQueueRemove={removeFromQueue}
                   onQueueEdit={updateQueueItem}
-                  onQueueSteer={steerQueuedMessage}
+                  onQueueSteer={
+                    blocksArchivedSecondaryWindowInput
+                      ? undefined
+                      : handleArchivedSafeQueueSteer
+                  }
                   onQueueReorder={moveQueueItem}
                   onQueueInteractionLock={setQueueInteractionLock}
                   onQueueEditLock={setQueueEditLock}

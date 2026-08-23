@@ -78,6 +78,7 @@ import {
   type AgentInputClearBoundaryOpts,
   type AgentInputCreateOpts,
   type AgentInputQueuedMessage,
+  type AgentInputRetryOpts,
   type AgentInputSessionRef,
   type AgentInputSessionReferenceContext,
 } from '../../shared/agentInputQueue.js';
@@ -15221,7 +15222,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     async (_e, sessionId: unknown, opts?: unknown) => {
       const sid = requireSessionId(sessionId);
       await assertRemoteInputControlBoundary(sid, isDeviceLinkInvoke(), opts);
-      return inputCoordinator.retryLastError(sid);
+      const retryOpts = opts && typeof opts === 'object' ? (opts as AgentInputRetryOpts) : undefined;
+      return inputCoordinator.retryLastError(sid, {
+        requireActiveSession: retryOpts?.requireActiveSession === true,
+      });
     },
   );
 

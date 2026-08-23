@@ -2941,7 +2941,7 @@ describe('AgentInputCoordinator send transaction', () => {
     await flush();
     expect(latestProjection(h.projections).recovery?.kind).toBe('active-turn');
 
-    const retryPromise = h.coordinator.retryLastError(sid);
+    const retryPromise = h.coordinator.retryLastError(sid, { requireActiveSession: true });
     await flush();
     expect(isSessionActiveForRetry).not.toHaveBeenCalled();
 
@@ -2954,6 +2954,25 @@ describe('AgentInputCoordinator send transaction', () => {
     expect(isSessionActiveForRetry).toHaveBeenCalledWith(sid);
     expect(h.sendToAgent).toHaveBeenCalledTimes(1);
     expect(latestProjection(h.projections).recovery?.kind).toBe('active-turn');
+  });
+
+  it('keeps main-window retry compatible with archived tasks when no lifecycle fence is requested', async () => {
+    const isSessionActiveForRetry = vi.fn(async () => false);
+    const h = createHarness({ isSessionActiveForRetry });
+    const sid = 'retry-archived-main-window';
+    h.setHasAssistantProgressAfter(async () => false);
+
+    h.coordinator.enqueue(sid, makeItem('q-first', 'original task'));
+    await flush();
+    h.setRunning(false);
+    h.coordinator.onTurnEvent(sid, 'error', 'turn failed');
+    await flush();
+
+    await h.coordinator.retryLastError(sid);
+    await flush();
+
+    expect(isSessionActiveForRetry).not.toHaveBeenCalled();
+    expect(h.sendToAgent).toHaveBeenCalledTimes(2);
   });
 
   it('active-turn retry falls back to resending the original text when the turn produced nothing', async () => {

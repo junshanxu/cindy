@@ -193,7 +193,33 @@ describe('archived secondary-window ownership', () => {
 
     for (const source of [workingDirChange, recoverableFirstMessage, ordinarySend]) {
       expect(source).toContain('beforeEnqueue: allowArchivedSecondaryWindowEnqueue');
+      expect(source).toContain('beforeDispatch: allowArchivedSecondaryWindowEnqueue');
     }
+  });
+
+  it('removes queue resume and steer dispatchers while an archived secondary window stays open', () => {
+    const resumeHandler = sessionViewSource.slice(
+      sessionViewSource.indexOf('const handleArchivedSafeQueueResume = useCallback('),
+      sessionViewSource.indexOf('const handleArchivedSafeQueueSteer = useCallback('),
+    );
+    const steerHandler = sessionViewSource.slice(
+      sessionViewSource.indexOf('const handleArchivedSafeQueueSteer = useCallback('),
+      sessionViewSource.indexOf(
+        'useEffect(() => {',
+        sessionViewSource.indexOf('const handleArchivedSafeQueueSteer = useCallback('),
+      ),
+    );
+    const chatInputStart = sessionViewSource.indexOf('<ChatInput');
+    const chatInput = sessionViewSource.slice(
+      chatInputStart,
+      sessionViewSource.indexOf('/>', chatInputStart),
+    );
+
+    expect(resumeHandler).toContain('isArchivedSecondaryWindowInputBlocked()');
+    expect(steerHandler).toContain('isArchivedSecondaryWindowInputBlocked()');
+    expect(chatInput).toContain('blocksArchivedSecondaryWindowInput');
+    expect(chatInput).toContain(': handleArchivedSafeQueueResume');
+    expect(chatInput).toContain(': handleArchivedSafeQueueSteer');
   });
 
   it('blocks every retry and continuation entry after its task is archived', () => {
@@ -239,5 +265,8 @@ describe('archived secondary-window ownership', () => {
         sessionViewSource.indexOf('const handleContinueAfterUsageReset = useCallback('),
       ),
     ).toContain('beforeEnqueue: allowArchivedSecondaryWindowEnqueue');
+    expect(sessionViewSource).toContain(
+      'retryLastError({ requireActiveSession: isSecondaryWindow() })',
+    );
   });
 });

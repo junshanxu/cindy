@@ -167,6 +167,11 @@ export interface AgentInputClearBoundaryOpts {
   expectedClearBoundaryMs?: number | null;
 }
 
+/** Manual retry options; secondary windows can require an active task at dispatch time. */
+export interface AgentInputRetryOpts extends AgentInputClearBoundaryOpts {
+  requireActiveSession?: boolean;
+}
+
 /**
  * 一次自动续跑（中断自愈）的展示信息，main 与 renderer 共用。
  *

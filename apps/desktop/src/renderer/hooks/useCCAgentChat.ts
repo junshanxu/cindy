@@ -130,6 +130,7 @@ interface UseCCAgentChatReturn {
       pastedTextRanges?: PastedTextRange[];
       slashCommandRanges?: SlashCommandRange[];
       beforeEnqueue?: () => Promise<boolean>;
+      beforeDispatch?: () => Promise<boolean>;
       onRemoteOptimisticFailure?: (clientId: string, error?: unknown) => void;
     },
   ) => Promise<boolean>;
@@ -155,6 +156,7 @@ interface UseCCAgentChatReturn {
       pastedTextRanges?: PastedTextRange[];
       slashCommandRanges?: SlashCommandRange[];
       beforeEnqueue?: () => Promise<boolean>;
+      beforeDispatch?: () => Promise<boolean>;
       onRemoteOptimisticFailure?: (clientId: string, error?: unknown) => void;
     },
   ) => Promise<boolean>;
@@ -166,7 +168,7 @@ interface UseCCAgentChatReturn {
   /** Dismiss the error banner without retrying. */
   clearError: () => void;
   /** Retry the main-owned typed recovery target. */
-  retryLastError: () => Promise<void>;
+  retryLastError: (opts?: { requireActiveSession?: boolean }) => Promise<void>;
   /** silent-stop 耗尽横幅「继续」:清横幅并发隐藏续跑指令(充值守卫额度)。 */
   continueAfterSilentStop: (opts?: { beforeEnqueue?: () => Promise<boolean> }) => void;
   /** F-CMD: Insert a local-only system card */
@@ -531,9 +533,9 @@ export function useCCAgentChat(
     [sessionId],
   );
 
-  const retryLastError = useCallback(() => {
+  const retryLastError = useCallback((opts?: { requireActiveSession?: boolean }) => {
     if (!sessionId) return Promise.resolve();
-    return makerChatStore.retryLastError(sessionId);
+    return makerChatStore.retryLastError(sessionId, opts);
   }, [sessionId]);
 
   const insertSystemCard = useCallback(

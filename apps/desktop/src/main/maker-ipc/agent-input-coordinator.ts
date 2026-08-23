@@ -2596,8 +2596,11 @@ export class AgentInputCoordinator {
   }
 
   /** 用户点「重试 / 继续任务」。行为见 performRetryLastError。 */
-  async retryLastError(sessionId: string): Promise<AgentInputProjection> {
-    const { projection } = await this.performRetryLastError(sessionId);
+  async retryLastError(
+    sessionId: string,
+    opts?: { requireActiveSession?: boolean },
+  ): Promise<AgentInputProjection> {
+    const { projection } = await this.performRetryLastError(sessionId, opts);
     return projection;
   }
 
@@ -2633,7 +2636,7 @@ export class AgentInputCoordinator {
    */
   private async performRetryLastError(
     sessionId: string,
-    opts?: { auto?: boolean; attemptToken?: number },
+    opts?: { auto?: boolean; attemptToken?: number; requireActiveSession?: boolean },
   ): Promise<{ projection: AgentInputProjection; outcome: AutoRetryOutcome }> {
     const state = this.getState(sessionId);
     const recovery = state.recovery;
@@ -2787,6 +2790,7 @@ export class AgentInputCoordinator {
     // is not sufficient. Re-read the durable lifecycle state at the actual
     // enqueue boundary; no await occurs between this check and the mutation.
     if (
+      opts?.requireActiveSession &&
       this.deps.isSessionActiveForRetry &&
       !(await this.deps.isSessionActiveForRetry(sessionId))
     ) {

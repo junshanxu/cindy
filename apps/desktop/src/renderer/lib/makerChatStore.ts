@@ -930,6 +930,7 @@ interface RemoteOptimisticSendRecord {
   dispatching: boolean;
   attempt: number;
   beforeEnqueue?: () => Promise<boolean>;
+  beforeDispatch?: () => Promise<boolean>;
   preflightCompleted: boolean;
   /** 标注附件仍在本机烧录；完成前必须挡住本条及后续 FIFO 派发。 */
   materializationPending: boolean;
@@ -1519,6 +1520,7 @@ function registerRemoteOptimisticSend(
     dispatching: false,
     attempt: 0,
     beforeEnqueue: opts?.beforeEnqueue,
+    beforeDispatch: opts?.beforeDispatch,
     preflightCompleted: opts?.beforeEnqueue === undefined,
     materializationPending,
     steerDispatchUncertain: false,
@@ -9857,6 +9859,10 @@ async function dispatchRemoteOptimisticSend(
       if (record.steerDispatchUncertain) {
         return await reconcileUncertainRemoteSteer(sessionId, record, operation);
       }
+      if (record.beforeDispatch && !(await record.beforeDispatch())) {
+        return { kind: 'failed', error: undefined };
+      }
+      if (!isRemoteOptimisticSendRegistered(sessionId, record)) return { kind: 'cancelled' };
       const accepted = await operation.api.input.steer(sessionId, record.queued, {
         touchUserSend: true,
         ...(record.expectedClearBoundaryMs !== undefined
@@ -9869,6 +9875,10 @@ async function dispatchRemoteOptimisticSend(
       void requestInputProjection(sessionId);
       return { kind: 'accepted' };
     }
+    if (record.beforeDispatch && !(await record.beforeDispatch())) {
+      return { kind: 'failed', error: undefined };
+    }
+    if (!isRemoteOptimisticSendRegistered(sessionId, record)) return { kind: 'cancelled' };
     const projection = await operation.api.input.enqueue(sessionId, record.queued, {
       sendAtMs: Date.now(),
       ...(record.expectedClearBoundaryMs !== undefined
@@ -12533,6 +12543,8 @@ type SendMessageOpts = {
   bypassGhostHooks?: boolean;
   /** 远程预检在乐观投影建立后执行；false 时按 clientId 精确回滚。 */
   beforeEnqueue?: () => Promise<boolean>;
+  /** device-link 每次实际派发前重跑的生命周期门禁；重连重试不得复用旧结果。 */
+  beforeDispatch?: () => Promise<boolean>;
   /** 远程乐观发送在稍后确认永久失败时恢复 composer。 */
   onRemoteOptimisticFailure?: (clientId: string, error?: unknown) => void;
 };
@@ -13639,7 +13651,10 @@ function clearError(sessionId: string): void {
   });
 }
 
-function retryLastError(sessionId: string): Promise<void> {
+function retryLastError(
+  sessionId: string,
+  opts?: { requireActiveSession?: boolean },
+): Promise<void> {
   if (!sessionId) return Promise.resolve();
   disposeLiveErrorPersist(sessionId);
   // 续跑语义在 main:coordinator 判定失败 turn 已有 assistant 产出时,用共享英文
@@ -13684,8 +13699,14 @@ function retryLastError(sessionId: string): Promise<void> {
     markLocalSentUserMessage(sessionId, preRetryQueueHeadClientId);
   }
   const boundaryOpts = getRemoteInputClearBoundaryOpts(sessionId);
+  const retryOpts = {
+    ...(boundaryOpts ?? {}),
+    ...(opts?.requireActiveSession ? { requireActiveSession: true } : {}),
+  };
   return runAgentDispatchProjectionOperation(sessionId, (input) =>
-    boundaryOpts ? input.retryLastError(sessionId, boundaryOpts) : input.retryLastError(sessionId),
+    Object.keys(retryOpts).length > 0
+      ? input.retryLastError(sessionId, retryOpts)
+      : input.retryLastError(sessionId),
   ).then(
     ({ projection }) => {
       // 一次性意图的兜底清理：正常路径下 applyInputProjection 已凭意图认领

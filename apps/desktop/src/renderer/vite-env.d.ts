@@ -5544,7 +5544,7 @@ interface ElectronAPI {
       ) => Promise<import('../shared/agentInputQueue').AgentInputProjection>;
       retryLastError: (
         sessionId: string,
-        opts?: { expectedClearBoundaryMs?: number | null },
+        opts?: import('../shared/agentInputQueue').AgentInputRetryOpts,
       ) => Promise<import('../shared/agentInputQueue').AgentInputProjection>;
       clearError: (
         sessionId: string,

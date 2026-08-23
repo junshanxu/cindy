@@ -6189,6 +6189,55 @@ describe('makerChatStore text delta batching', () => {
     expect(sentTexts).toEqual(['wait for preflight']);
   });
 
+  it('reruns the lifecycle fence before a deferred remote dispatch after reconnect', async () => {
+    remoteProjectsStore.pinSessionOrigin('device-1', SESSION_ID);
+    let online = false;
+    let archived = false;
+    let enqueueCalls = 0;
+    const beforeEnqueue = vi.fn(async () => true);
+    const beforeDispatch = vi.fn(async () => !archived);
+    const restore = vi.fn();
+    deviceLinkInvoke.mockImplementation(async (_deviceId, channel, args) => {
+      if (channel === 'maker:input:get-projection') {
+        if (!online) throw new Error('[DEVICE_LINK_NOT_CONNECTED] relay offline');
+        return projection(SESSION_ID);
+      }
+      if (channel === 'maker:input:enqueue') {
+        enqueueCalls += 1;
+        return projection(SESSION_ID, { pendingQueue: [args[1] as AgentInputQueuedMessage] });
+      }
+      throw new Error(`unexpected remote channel: ${channel}`);
+    });
+
+    await expect(
+      makerChatStore.sendMessage(
+        SESSION_ID,
+        'wait for lifecycle fence',
+        MODEL,
+        EFFORT,
+        PERMISSION_MODE,
+        WORKING_DIR,
+        undefined,
+        undefined,
+        { beforeEnqueue, beforeDispatch, onRemoteOptimisticFailure: restore },
+      ),
+    ).resolves.toBe(true);
+    expect(beforeEnqueue).toHaveBeenCalledOnce();
+    expect(beforeDispatch).not.toHaveBeenCalled();
+
+    archived = true;
+    online = true;
+    onPresenceChanged?.({ deviceId: 'device-1', online: true });
+    await flushPromises();
+    await flushPromises();
+
+    expect(beforeEnqueue).toHaveBeenCalledOnce();
+    expect(beforeDispatch).toHaveBeenCalledOnce();
+    expect(enqueueCalls).toBe(0);
+    expect(restore).toHaveBeenCalledOnce();
+    expect(makerChatStore.getSnapshot(SESSION_ID).messages).toHaveLength(0);
+  });
+
   it('hydrates existing runtime messages with authoritative DB-created timestamps', () => {
     vi.setSystemTime(new Date('2026-06-15T00:00:30.000Z'));
     emitTextDelta('draft');
