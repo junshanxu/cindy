@@ -1,36 +1,27 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
-import { serializePermissionDispatch } from '../register.js';
+import { PermissionQueue } from '../register.js';
 import type { InteractionDecision } from '@cindy/maker-core';
 
 function allow(): InteractionDecision {
   return { kind: 'permission', behavior: 'allow' };
 }
-function deny(): InteractionDecision {
-  return { kind: 'permission', behavior: 'deny' };
-}
-function newChain(): { current: Promise<InteractionDecision> } {
-  return {
-    current: Promise.resolve({
-      kind: 'permission',
-      behavior: 'deny',
-      reason: 'seed',
-    }),
-  };
+function deny(reason = 'denied'): InteractionDecision {
+  return { kind: 'permission', behavior: 'deny', reason };
 }
 
-describe('serializePermissionDispatch (issue #3092)', () => {
+describe('PermissionQueue (issue #3092)', () => {
   it('runs two permission requests sequentially, not in parallel', async () => {
     // The renderer has a single pending-permission slot, so two parallel
     // permission requests must NOT be broadcast concurrently. This is the
     // root cause of #3092: the second broadcast overwrote the first slot
     // and the first canUseTool Promise hung for the 10-minute timeout.
-    const chain = newChain();
+    const queue = new PermissionQueue();
     let firstStarted = false;
     let firstFinished = false;
     let secondStartedBeforeFirstFinished = false;
 
-    const first = serializePermissionDispatch(chain, async () => {
+    const first = queue.dispatch(async () => {
       firstStarted = true;
       // Simulate an async wait for the user to resolve the card.
       await new Promise((r) => setTimeout(r, 30));
@@ -38,7 +29,7 @@ describe('serializePermissionDispatch (issue #3092)', () => {
       return allow();
     });
     // Schedule the second immediately — before the first resolves.
-    const second = serializePermissionDispatch(chain, async () => {
+    const second = queue.dispatch(async () => {
       if (!firstFinished) secondStartedBeforeFirstFinished = true;
       return allow();
     });
@@ -51,13 +42,13 @@ describe('serializePermissionDispatch (issue #3092)', () => {
   });
 
   it('resolves the second with its own decision after the first', async () => {
-    const chain = newChain();
+    const queue = new PermissionQueue();
     const decisions: Array<'allow' | 'deny'> = [];
-    const first = serializePermissionDispatch(chain, async () => {
+    const first = queue.dispatch(async () => {
       decisions.push('allow');
       return allow();
     });
-    const second = serializePermissionDispatch(chain, async () => {
+    const second = queue.dispatch(async () => {
       decisions.push('deny');
       return deny();
     });
@@ -82,13 +73,13 @@ describe('serializePermissionDispatch (issue #3092)', () => {
     // A throwing handler (e.g. broadcast failed) must not poison the chain
     // so subsequent permissions can still run. The rejected promise itself
     // propagates, but the chain recovers.
-    const chain = newChain();
-    const rejected = serializePermissionDispatch(chain, async () => {
+    const queue = new PermissionQueue();
+    const rejected = queue.dispatch(async () => {
       throw new Error('broadcast failed');
     });
     await expect(rejected).rejects.toThrow('broadcast failed');
 
-    const after = serializePermissionDispatch(chain, async () => allow());
+    const after = queue.dispatch(async () => allow());
     const afterDecision = await after;
     expect(afterDecision.kind).toBe('permission');
     if (afterDecision.kind === 'permission') {
@@ -99,14 +90,14 @@ describe('serializePermissionDispatch (issue #3092)', () => {
   it('never invokes a run before the previous one settles even under microtask bursts', async () => {
     // Stress test: queue N synchronous dispatches and assert that only one
     // run body is ever in-flight at a time.
-    const chain = newChain();
+    const queue = new PermissionQueue();
     const N = 10;
     let inFlight = 0;
     let maxInFlight = 0;
     const violations: number[] = [];
 
     const runs = Array.from({ length: N }, (_, i) =>
-      serializePermissionDispatch(chain, async () => {
+      queue.dispatch(async () => {
         inFlight++;
         maxInFlight = Math.max(maxInFlight, inFlight);
         if (inFlight > 1) violations.push(i);
@@ -122,5 +113,55 @@ describe('serializePermissionDispatch (issue #3092)', () => {
     await Promise.all(runs);
     expect(violations).toEqual([]);
     expect(maxInFlight).toBe(1);
+  });
+
+  it('cancels queued-but-not-started runs without invoking them (session close)', async () => {
+    // When a session closes while A is in-flight and B is queued behind it,
+    // cancel() must settle B immediately with the terminal decision and NOT
+    // run B's broadcast after A settles — otherwise the closed session gets
+    // a phantom permission card that hangs for 10 minutes (issue #3092
+    // review P1).
+    const queue = new PermissionQueue();
+    let aReleased: ((() => void) | null) | undefined;
+    let bRan = false;
+    let cRan = false;
+
+    const a = queue.dispatch(
+      () =>
+        new Promise((resolve) => {
+          aReleased = () => resolve(allow());
+        }),
+    );
+    const b = queue.dispatch(async () => {
+      bRan = true;
+      return allow();
+    });
+    // Cancel while A is in-flight and B is queued.
+    queue.cancel(deny('session_closed'));
+    const c = queue.dispatch(async () => {
+      cRan = true;
+      return allow();
+    });
+
+    // B and C settle immediately with the cancellation decision, without
+    // ever invoking their run bodies.
+    await expect(b).resolves.toMatchObject({
+      kind: 'permission',
+      behavior: 'deny',
+      reason: 'session_closed',
+    });
+    await expect(c).resolves.toMatchObject({
+      kind: 'permission',
+      behavior: 'deny',
+      reason: 'session_closed',
+    });
+    expect(bRan).toBe(false);
+    expect(cRan).toBe(false);
+    expect(queue.isCancelled()).toBe(true);
+
+    // Releasing A lets it settle normally; B must still not have run.
+    aReleased?.();
+    await a;
+    expect(bRan).toBe(false);
   });
 });

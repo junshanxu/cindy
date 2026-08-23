@@ -2574,6 +2574,14 @@ function defaultDecisionForPending(
 }
 
 function cleanupPendingAgentInteractionsForSession(sessionId: string, reason: string): void {
+  // First cancel any permission interactions still queued behind the
+  // currently-in-flight one. Without this, the in-flight permission settling
+  // would start the next queued broadcast on a closed/aborted session,
+  // producing a phantom card that hangs for 10 minutes (issue #3092 review).
+  cancelPermissionQueueForSession(
+    sessionId,
+    defaultDecisionForPending('permission', reason),
+  );
   const entries = Array.from(pendingInteractionResolvers.entries()).filter(
     ([, entry]) => entry.sessionId === sessionId,
   );
@@ -2657,6 +2665,15 @@ export function takePendingInteractionsForSession(sessionId: string): Array<{
       reason: 'migrated_to_feishu',
     });
   }
+  // Permission requests still queued behind the in-flight one have no
+  // pendingInteractionResolvers entry yet, so take() can't migrate them.
+  // Cancel them with a terminal deny so they don't later broadcast on the
+  // old Desktop surface after the channel takeover (issue #3092 review P2);
+  // the agent receives the denial and can re-issue on the new turn if needed.
+  cancelPermissionQueueForSession(
+    sessionId,
+    defaultDecisionForPending('permission', 'session_migrated'),
+  );
   return taken;
 }
 
@@ -3669,16 +3686,17 @@ export function installDesktopInteractionListener(session: {
   // resolve in arrival order). ask_user_question / plan_review are NOT
   // serialised: they have different lifecycle (no timeout) and the renderer
   // queues them separately today.
-  let permissionChain: Promise<InteractionDecision> = Promise.resolve(
-    permissionQueueSeed(),
-  );
-  const permissionChainRef = { current: permissionChain };
+  //
+  // The queue is cancellation-aware: cancelPermissionQueueForSession (called
+  // by cleanupPendingAgentInteractionsForSession on session close/abort)
+  // rejects every queued-but-not-started permission with a terminal deny, so
+  // a permission B waiting behind A cannot run after the session is gone and
+  // re-broadcast a phantom card / hang for 10 minutes (issue #3092 review).
+  const queue = ensurePermissionQueue(session.id);
 
   installDesktopInteractionHandler(session, async (req: InteractionRequest) => {
     if (req.kind === 'permission') {
-      return serializePermissionDispatch(permissionChainRef, () =>
-        handleDesktopInteractionRequest(req),
-      );
+      return queue.dispatch(() => handleDesktopInteractionRequest(req));
     }
     return handleDesktopInteractionRequest(req);
   });
@@ -3751,7 +3769,7 @@ export function installDesktopInteractionListener(session: {
 /**
  * Default deny decision used as the permission serialization chain's
  * starting sentinel. A real permission interaction never settles to this
- * value — the handler's decision overwrites it — but the chain needs a
+ * value — the handler's decision overwrites it — but the queue needs a
  * concrete initial value and a rejected-promise recovery so one failure
  * cannot wedge the queue for later permissions.
  */
@@ -3760,32 +3778,95 @@ function permissionQueueSeed(): InteractionDecision {
 }
 
 /**
- * Append a new permission run onto an existing serialization chain.
+ * Per-session serializer for permission interactions.
  *
- * Exported so the serialisation contract (run-on-previous-settle, recover on
- * rejection, never queue-poison) can be tested without spinning up the full
- * Desktop fallback handler. `chainRef` carries the tail of the queue and is
- * mutated in-place to the new tail after this run starts.
+ * Beyond plain serialization (run one permission at a time), the queue is
+ * cancellation-aware: when the session closes / aborts, cancel() settles
+ * every queued-but-not-started permission with a terminal decision and
+ * marks the queue drained, so a permission waiting behind an in-flight one
+ * cannot execute its broadcast after the session is gone and re-create a
+ * phantom 10-minute card. An in-flight run is left to the normal
+ * pendingInteractionResolvers cleanup; once it settles, the cancelled tail
+ * prevents the next run from starting.
  *
- * Returned promise resolves with the run's decision; the chain itself stays
- * alive regardless of the run's outcome so subsequent permissions are not
- * blocked by a rejected run.
+ * The class is exported for unit testing of the serialization + cancellation
+ * contract without spinning up the full Desktop fallback handler.
  */
-export function serializePermissionDispatch(
-  chainRef: { current: Promise<InteractionDecision> },
-  run: () => Promise<InteractionDecision>,
-): Promise<InteractionDecision> {
-  // Run on the previous chain's settle (resolve OR reject) so a single
-  // rejected run never poisons the queue.
-  const next = chainRef.current.then(
-    () => run(),
-    () => run(),
-  );
-  chainRef.current = next.then(
-    (d) => d,
-    () => permissionQueueSeed(),
-  );
-  return next;
+export class PermissionQueue {
+  private tail: Promise<InteractionDecision> = Promise.resolve(permissionQueueSeed());
+  private cancelled: InteractionDecision | null = null;
+
+  /** Enqueue a permission run. Resolves with the run's own decision. */
+  dispatch(run: () => Promise<InteractionDecision>): Promise<InteractionDecision> {
+    // If cancellation already fired, do NOT chain onto the tail — that would
+    // run after the current in-flight settles. Settle immediately with the
+    // cancellation decision.
+    if (this.cancelled) return Promise.resolve(this.cancelled);
+    const cancelled = this.cancelled;
+    const next = this.tail.then(
+      () => {
+        // Re-check after the await: cancellation may have fired while we
+        // were queued behind the previous permission. If so, skip the run.
+        if (this.cancelled) return this.cancelled;
+        return run();
+      },
+      () => {
+        if (this.cancelled) return this.cancelled;
+        return run();
+      },
+    );
+    // Keep the tail alive regardless of a run's outcome so a rejected run
+    // never poisons subsequent dispatches.
+    this.tail = next.then(
+      (d) => d,
+      () => this.cancelled ?? permissionQueueSeed(),
+    );
+    return next;
+  }
+
+  /** True once cancel() has been called. */
+  isCancelled(): boolean {
+    return this.cancelled !== null;
+  }
+
+  /**
+   * Settle all queued (not yet started) permissions with `decision` and
+   * prevent any future dispatch from running. Safe to call multiple times;
+   * the first decision wins.
+   */
+  cancel(decision: InteractionDecision): void {
+    if (this.cancelled) return;
+    this.cancelled = decision;
+  }
+}
+
+const permissionQueuesBySession = new Map<string, PermissionQueue>();
+
+/** Get (or create) the permission queue for a session. */
+function ensurePermissionQueue(sessionId: string): PermissionQueue {
+  let q = permissionQueuesBySession.get(sessionId);
+  if (!q) {
+    q = new PermissionQueue();
+    permissionQueuesBySession.set(sessionId, q);
+  }
+  return q;
+}
+
+/**
+ * Cancel every queued permission for a session and forget the queue. Called
+ * by cleanupPendingAgentInteractionsForSession when the session closes /
+ * aborts so queued permissions don't broadcast phantom cards after teardown.
+ * Already in-flight interactions are resolved by the normal cleanup path.
+ */
+export function cancelPermissionQueueForSession(
+  sessionId: string,
+  decision: InteractionDecision,
+): void {
+  const q = permissionQueuesBySession.get(sessionId);
+  if (q) {
+    q.cancel(decision);
+    permissionQueuesBySession.delete(sessionId);
+  }
 }
 
 /**
