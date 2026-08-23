@@ -907,6 +907,20 @@ export function CCAgentSessionView({
   const isOrcaLeadSessionView = session?.orcaRole === 'lead';
   const blocksArchivedSecondaryWindowInput =
     isSecondaryWindow() && session?.status === 'archived';
+  const archivedSecondaryWindowInputBlockedRef = useRef({
+    sessionId: sessionId ?? null,
+    blocked: blocksArchivedSecondaryWindowInput,
+  });
+  useLayoutEffect(() => {
+    archivedSecondaryWindowInputBlockedRef.current = {
+      sessionId: sessionId ?? null,
+      blocked: blocksArchivedSecondaryWindowInput,
+    };
+  }, [blocksArchivedSecondaryWindowInput, sessionId]);
+  const isArchivedSecondaryWindowInputBlocked = useCallback(() => {
+    const current = archivedSecondaryWindowInputBlockedRef.current;
+    return current.sessionId === sessionId && current.blocked;
+  }, [sessionId]);
 
   // worktree-parallel-sessions:订阅当前 session 的 worktree 创建态(creating/failed)。
   // 触发源:NewMakerDraftRoute 的 worktree 异步创建路径。
@@ -1186,6 +1200,12 @@ export function CCAgentSessionView({
     const unsub = sessionsPush.onPatched(({ sessionId: patchedId, patch }, ownerStamp) => {
       if (!isDataOwnerPushCurrent(ownerStamp)) return;
       if (patchedId !== sessionId || !refreshSequence.isCurrentSession(patchedId)) return;
+      if (patch.status !== undefined) {
+        archivedSecondaryWindowInputBlockedRef.current = {
+          sessionId: patchedId,
+          blocked: isSecondaryWindow() && patch.status === 'archived',
+        };
+      }
       const patchBuffer = sessionSnapshotPatchBufferRef.current;
       patchBuffer.stage(patchedId, patch);
       const fullSnapshot = currentServerSessionRef.current;
@@ -3114,8 +3134,10 @@ export function CCAgentSessionView({
       const pending = pendingSendRef.current;
       if (!newDir || !pending) return;
       pendingSendRef.current = null;
+      if (isArchivedSecondaryWindowInputBlocked()) return;
       void (async () => {
         try {
+          if (isArchivedSecondaryWindowInputBlocked()) return;
           const slashDispatch = await maybeDispatchDesktopSlashCommand(
             pending.message,
             pending.files,
@@ -3151,6 +3173,7 @@ export function CCAgentSessionView({
               },
             },
           );
+          if (isArchivedSecondaryWindowInputBlocked()) return;
           if (slashDispatch.handled) {
             if (slashDispatch.accepted) {
               pending.onDeferredAccepted?.();
@@ -3193,6 +3216,7 @@ export function CCAgentSessionView({
                   slashDispatch.message,
                 )
               : undefined;
+          if (isArchivedSecondaryWindowInputBlocked()) return;
           const dispatch = pending.deliveryMode === 'steer' ? steerMessage : sendMessage;
           const followStartGeneration = readSendFollowCancelGeneration(sessionId);
           requestFollowLatest(sessionId, followStartGeneration);
@@ -3252,6 +3276,7 @@ export function CCAgentSessionView({
     },
     [
       maybeDispatchDesktopSlashCommand,
+      isArchivedSecondaryWindowInputBlocked,
       refreshServerSession,
       remoteDeviceId,
       session?.agentKind,
@@ -3336,7 +3361,7 @@ export function CCAgentSessionView({
         onDeferredAccepted?: () => void;
       },
     ) => {
-      if (blocksArchivedSecondaryWindowInput) return false;
+      if (isArchivedSecondaryWindowInputBlocked()) return false;
       const deliveryMode = opts?.deliveryMode ?? 'queue';
       const navigationRequestVersion =
         deliveryMode !== 'steer' && matchNavigationCommandName(message)
@@ -3357,10 +3382,12 @@ export function CCAgentSessionView({
       ) {
         return;
       }
+      if (isArchivedSecondaryWindowInputBlocked()) return false;
 
       if (deliveryMode !== 'steer' && (await maybeShowContextUsage(message))) {
         return;
       }
+      if (isArchivedSecondaryWindowInputBlocked()) return false;
 
       // ── Slash command dispatch (palette refactor) ──
       // 三源 palette 命中:
@@ -3379,6 +3406,7 @@ export function CCAgentSessionView({
           : await maybeDispatchDesktopSlashCommand(message, files, {
               piRuntimeRetryDelaysMs: PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
             });
+      if (isArchivedSecondaryWindowInputBlocked()) return false;
       if (slashDispatch.handled) {
         if (slashDispatch.accepted) {
           // Desktop commands can wait in Main long enough for draft hydration to
@@ -3443,6 +3471,7 @@ export function CCAgentSessionView({
           existingSessionRoute: true,
         });
         if (!proceed) return false;
+        if (isArchivedSecondaryWindowInputBlocked()) return false;
       }
 
       // Popover open → prevent re-entry
@@ -3450,6 +3479,7 @@ export function CCAgentSessionView({
       // 会话交接尚未完成(建 worktree / 远程开协同)时不放行:否则新输入会插到
       // 草稿提交的首条之前,顺序倒置。
       if (sessionHandoffPreparing) return false;
+      if (isArchivedSecondaryWindowInputBlocked()) return false;
 
       const orcaLeadVendorOptions =
         sessionId && session !== null && isOrcaLeadSession(session)
@@ -3520,6 +3550,7 @@ export function CCAgentSessionView({
         ...(opts?.onDeferredAccepted ? { onDeferredAccepted: opts.onDeferredAccepted } : {}),
       };
       if (deliveryMode === 'steer') {
+        if (isArchivedSecondaryWindowInputBlocked()) return false;
         const followStartGeneration = readSendFollowCancelGeneration(sessionId);
         if (sessionId) requestFollowLatest(sessionId, followStartGeneration);
         const accepted = await steerMessage(
@@ -3540,6 +3571,7 @@ export function CCAgentSessionView({
         }
         return accepted;
       }
+      if (isArchivedSecondaryWindowInputBlocked()) return false;
       const followStartGeneration = readSendFollowCancelGeneration(sessionId);
       if (sessionId) requestFollowLatest(sessionId, followStartGeneration);
       const accepted = await sendMessage(
@@ -3579,7 +3611,7 @@ export function CCAgentSessionView({
       vendorAuthGate,
       remoteDeviceId,
       sessionHandoffPreparing,
-      blocksArchivedSecondaryWindowInput,
+      isArchivedSecondaryWindowInputBlocked,
     ],
   );
 
@@ -4006,6 +4038,7 @@ export function CCAgentSessionView({
       const holdComposer = !!pending.remoteCollab;
       if (holdComposer) setRemoteHandoffPreparing(true);
       try {
+        if (isArchivedSecondaryWindowInputBlocked()) return;
         if (pending.remoteCollab) {
           const remoteCollab = await consumePendingRemoteCollab(pending.remoteCollab, {
             leadSessionId: sessionId,
@@ -4027,6 +4060,7 @@ export function CCAgentSessionView({
             });
           }
         }
+        if (isArchivedSecondaryWindowInputBlocked()) return;
         // 三处交接统一走 deliverRecoverableHandoff:交付成功才丢副本,
         // resolve false / 抛错都保留(见该函数注释)。
         let pendingText = pending.text;
@@ -4034,6 +4068,7 @@ export function CCAgentSessionView({
           piRuntimeRetryDelaysMs: PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
         });
         pendingText = slashDispatch.message;
+        if (isArchivedSecondaryWindowInputBlocked()) return;
         if (slashDispatch.handled) {
           if (!slashDispatch.accepted) {
             // NewMaker 已把源草稿移交并清空；Main 没受理 `/review` 时，把正文和附件
@@ -4087,6 +4122,7 @@ export function CCAgentSessionView({
             : undefined;
         // 必须 await:sendMessage 在设备离线 / 访问被撤销 / 远端 enqueue 拒绝时不抛错,
         // 而是 resolve false —— 不等它就丢副本,正文会从界面和磁盘上一起消失(codex P1)。
+        if (isArchivedSecondaryWindowInputBlocked()) return;
         const followStartGeneration = readSendFollowCancelGeneration(sessionId);
         requestFollowLatest(sessionId, followStartGeneration);
         const delivered = await deliverRecoverableHandoff(sessionId, () =>
@@ -4133,6 +4169,7 @@ export function CCAgentSessionView({
     })();
   }, [
     historyLoaded,
+    isArchivedSecondaryWindowInputBlocked,
     maybeDispatchDesktopSlashCommand,
     restoreRecoverableHandoff,
     requestFollowLatest,

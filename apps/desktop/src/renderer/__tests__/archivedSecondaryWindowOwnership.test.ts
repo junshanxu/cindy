@@ -107,23 +107,57 @@ describe('archived secondary-window ownership', () => {
     ).toHaveLength(2);
   });
 
-  it('blocks both the composer and send path for archived secondary-window sessions', () => {
+  it('uses a synchronous archive fence for the composer and every send path', () => {
     const guardDeclaration = sessionViewSource.indexOf(
       'const blocksArchivedSecondaryWindowInput =',
     );
-    const sendGuard = sessionViewSource.indexOf(
-      'if (blocksArchivedSecondaryWindowInput) return false;',
+    const refDeclaration = sessionViewSource.indexOf(
+      'const archivedSecondaryWindowInputBlockedRef = useRef(',
       guardDeclaration,
     );
-    const composerDisabled = sessionViewSource.indexOf('disabled={', sendGuard);
+    const pushFence = sessionViewSource.indexOf(
+      'archivedSecondaryWindowInputBlockedRef.current = {',
+      refDeclaration + 1,
+    );
+    const handleSend = sessionViewSource.indexOf('const handleSend = useCallback(', pushFence);
+    const initialSendGuard = sessionViewSource.indexOf(
+      'if (isArchivedSecondaryWindowInputBlocked()) return false;',
+      handleSend,
+    );
+    const steerDispatch = sessionViewSource.indexOf(
+      'const accepted = await steerMessage(',
+      initialSendGuard,
+    );
+    const steerGuard = sessionViewSource.lastIndexOf(
+      'if (isArchivedSecondaryWindowInputBlocked()) return false;',
+      steerDispatch,
+    );
+    const sendDispatch = sessionViewSource.indexOf(
+      'const accepted = await sendMessage(',
+      steerDispatch,
+    );
+    const sendGuard = sessionViewSource.lastIndexOf(
+      'if (isArchivedSecondaryWindowInputBlocked()) return false;',
+      sendDispatch,
+    );
+    const composerDisabled = sessionViewSource.indexOf('disabled={', sendDispatch);
     const composerGuard = sessionViewSource.indexOf(
       'blocksArchivedSecondaryWindowInput',
       composerDisabled,
     );
 
     expect(guardDeclaration).toBeGreaterThan(-1);
-    expect(sendGuard).toBeGreaterThan(guardDeclaration);
-    expect(composerDisabled).toBeGreaterThan(sendGuard);
+    expect(refDeclaration).toBeGreaterThan(guardDeclaration);
+    expect(pushFence).toBeGreaterThan(refDeclaration);
+    expect(initialSendGuard).toBeGreaterThan(handleSend);
+    expect(steerGuard).toBeGreaterThan(initialSendGuard);
+    expect(steerDispatch).toBeGreaterThan(steerGuard);
+    expect(sendGuard).toBeGreaterThan(steerDispatch);
+    expect(sendDispatch).toBeGreaterThan(sendGuard);
+    expect(composerDisabled).toBeGreaterThan(sendDispatch);
     expect(composerGuard).toBeGreaterThan(composerDisabled);
+    expect(
+      sessionViewSource.match(/if \(isArchivedSecondaryWindowInputBlocked\(\)\) return/g),
+    ).toHaveLength(16);
   });
 });
