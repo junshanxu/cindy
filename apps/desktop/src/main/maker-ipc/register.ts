@@ -2581,7 +2581,7 @@ function cleanupPendingAgentInteractionsForSession(sessionId: string, reason: st
   cancelPermissionQueueForSession(
     sessionId,
     defaultDecisionForPending('permission', reason),
-    reason === 'session_closed',
+    reason === 'session_closed' ? 'close' : 'reset',
   );
   const entries = Array.from(pendingInteractionResolvers.entries()).filter(
     ([, entry]) => entry.sessionId === sessionId,
@@ -2677,7 +2677,7 @@ export function takePendingInteractionsForSession(sessionId: string): Array<{
   cancelPermissionQueueForSession(
     sessionId,
     defaultDecisionForPending('permission', 'session_migrated'),
-    false,
+    'takeover',
   );
   return taken;
 }
@@ -4006,6 +4006,26 @@ export class PermissionQueue {
       if (gen < this.generation - 1) this.drainedDecisionByGen.delete(gen);
     }
   }
+
+  /**
+   * Detach an in-flight permission from the queue tail for channel takeover.
+   *
+   * When Feishu/Discord/Slack takes over a turn, the currently-displayed
+   * permission has already been migrated (its resolver handed to the
+   * taken-over route). The Desktop queue must NOT keep waiting for that
+   * migrated card to settle (it may sit unanswered for the full 10 minutes,
+   * blocking subsequent Desktop permissions); replacing the tail lets later
+   * dispatches proceed. The in-flight Promise continues independently and
+   * settles on the taken-over route. This also bumps the generation so any
+   * permission queued behind the migrated one drains with `decision` instead
+   * of broadcasting on the old Desktop surface (issue #3092 review /
+   * channel takeover).
+   */
+  skipInFlightForTakeover(decision: InteractionDecision): void {
+    this.drainedDecisionByGen.set(this.generation, decision);
+    this.generation++;
+    this.tail = Promise.resolve(permissionQueueSeed());
+  }
 }
 
 const permissionQueuesBySession = new Map<string, PermissionQueue>();
@@ -4034,16 +4054,24 @@ function ensurePermissionQueue(sessionId: string): PermissionQueue {
  *
  * Already in-flight interactions are resolved by the normal cleanup path.
  */
+/** How to drain a session's permission queue. */
+export type PermissionQueueDrainMode =
+  | 'close' // terminal session teardown: cancel and forget the queue
+  | 'reset' // transient abort/turn-idle: drain old turn, keep queue usable
+  | 'takeover'; // channel (/ctr) takeover: detach migrated in-flight, keep usable
+
 export function cancelPermissionQueueForSession(
   sessionId: string,
   decision: InteractionDecision,
-  permanent: boolean,
+  mode: PermissionQueueDrainMode,
 ): void {
   const q = permissionQueuesBySession.get(sessionId);
   if (!q) return;
-  if (permanent) {
+  if (mode === 'close') {
     q.cancel(decision);
     permissionQueuesBySession.delete(sessionId);
+  } else if (mode === 'takeover') {
+    q.skipInFlightForTakeover(decision);
   } else {
     q.resetForNewTurn(decision);
   }
