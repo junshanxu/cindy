@@ -3705,7 +3705,7 @@ export function installDesktopInteractionListener(session: {
       // unanswered permissions can't extend the 10-minute cap to N×10 minutes
       // (each card's in-handler timer only starts when it reaches the front).
       return queue.dispatch(
-        () => handleDesktopInteractionRequest(req),
+        (ctx) => handleDesktopInteractionRequest(req, ctx),
         { timeoutMs: PERMISSION_INTERACTION_TIMEOUT_MS },
       );
     }
@@ -3714,6 +3714,7 @@ export function installDesktopInteractionListener(session: {
 
   async function handleDesktopInteractionRequest(
     req: InteractionRequest,
+    ctx?: PermissionRunContext,
   ): Promise<InteractionDecision> {
     const agentIslandInteractionEpoch = shouldNotifyAgentIslandForSession(session.id)
       ? (getAgentIslandService()?.captureInteractionEpoch(session.id) ?? null)
@@ -3773,6 +3774,19 @@ export function installDesktopInteractionListener(session: {
         req,
         agentIslandInteractionEpoch,
       );
+      // If the dispatch's overall timeout fires AFTER this handler has
+      // started (queue wait + execution exceeded the cap), tear down the
+      // pending interaction so the card is dismissed and the tail is freed,
+      // rather than leaving it orphaned for another 10 minutes after the
+      // agent has already moved on (issue #3092 review / Greptile).
+      ctx?.bindTimeoutCleanup(() => {
+        const pending = clearPendingInteraction(req.requestId);
+        if (!pending) return;
+        if (entry.timeoutId) clearTimeout(entry.timeoutId);
+        handleAgentIslandInteractionDismissed(session.id, req.requestId);
+        pending.resolve({ kind: 'permission', behavior: 'deny', reason: 'timeout' });
+        dismissRendererInteraction(pending, req.requestId, 'timeout', 'deny');
+      });
     });
   }
 }
@@ -3803,6 +3817,22 @@ function permissionQueueSeed(): InteractionDecision {
  * The class is exported for unit testing of the serialization + cancellation
  * contract without spinning up the full Desktop fallback handler.
  */
+/**
+ * Context handed to a queued permission run.
+ *
+ * - `isStale()` reports whether the dispatch was cancelled (reset/close)
+ *   or hit its overall timeout before it reached the front of the queue.
+ * - `bindTimeoutCleanup(fn)` lets the run register a teardown that fires
+ *   if the overall timeout elapses AFTER the run has started executing
+ *   (e.g. to clear the pending resolver / dismiss the card so an
+ *   already-broadcast permission does not sit orphaned for another 10
+ *   minutes after the agent stopped waiting — issue #3092 review).
+ */
+export interface PermissionRunContext {
+  isStale: () => boolean;
+  bindTimeoutCleanup: (fn: () => void) => void;
+}
+
 export class PermissionQueue {
   // Tail of the serialization chain. Each dispatch chains onto this so
   // runs execute one at a time in arrival order. It is replaced on
@@ -3824,7 +3854,7 @@ export class PermissionQueue {
 
   /** Enqueue a permission run. Resolves with the run's own decision. */
   dispatch(
-    run: () => Promise<InteractionDecision>,
+    run: (ctx: PermissionRunContext) => Promise<InteractionDecision>,
     opts?: { timeoutMs?: number },
   ): Promise<InteractionDecision> {
     // Terminal close: never run again.
@@ -3838,12 +3868,23 @@ export class PermissionQueue {
     // runIfCurrent skips the broadcast instead of showing an orphan card
     // that nobody is awaiting (issue #3092 review P1).
     let timedOut = false;
+    // If the run has already started (registered its pending interaction)
+    // when the outer timeout fires, onTimeout is invoked so the listener
+    // can tear down that interaction (clear the pending resolver, dismiss
+    // the card) rather than leaving it orphaned for another 10 minutes.
+    let onTimeout: (() => void) | null = null;
+    const ctx: PermissionRunContext = {
+      isStale: () => timedOut,
+      bindTimeoutCleanup: (fn) => {
+        onTimeout = fn;
+      },
+    };
 
     // The gate resolves when it's this run's turn AND it is still current,
     // or rejects if the previous run threw (we still proceed to run()).
     const next = this.tail.then(
-      () => this.runIfCurrent(myGen, run, () => timedOut),
-      () => this.runIfCurrent(myGen, run, () => timedOut),
+      () => this.runIfCurrent(myGen, run, ctx),
+      () => this.runIfCurrent(myGen, run, ctx),
     );
 
     // Advance the tail. On rejection recover so a throwing run doesn't
@@ -3860,11 +3901,16 @@ export class PermissionQueue {
     // present could extend the 10-minute renderer timeout to N×10 minutes
     // because each card's own timer only starts when it reaches the front
     // (issue #3092 review). When the timeout fires, mark the dispatch
-    // stale so its run never broadcasts even after it reaches the front.
+    // stale and tear down any interaction the run already started.
     if (timeoutMs && timeoutMs > 0 && timeoutMs < Number.POSITIVE_INFINITY) {
       return new Promise<InteractionDecision>((resolve) => {
         const timer = setTimeout(() => {
           timedOut = true;
+          try {
+            onTimeout?.();
+          } catch {
+            // best-effort cleanup
+          }
           resolve({
             kind: 'permission',
             behavior: 'deny',
@@ -3874,10 +3920,6 @@ export class PermissionQueue {
         next.then(
           (decision) => {
             clearTimeout(timer);
-            // If the outer timeout already resolved, don't override it —
-            // but the run has already executed by now (it reached the
-            // front and runIfCurrent let it through before timedOut was
-            // set), so this only resolves the same promise once.
             resolve(decision);
           },
           () => {
@@ -3897,11 +3939,11 @@ export class PermissionQueue {
   /** Run `run` only if no reset/close/timeout happened while queued. */
   private runIfCurrent(
     myGen: number,
-    run: () => Promise<InteractionDecision>,
-    isTimedOut: () => boolean,
+    run: (ctx: PermissionRunContext) => Promise<InteractionDecision>,
+    ctx: PermissionRunContext,
   ): Promise<InteractionDecision> {
     if (this.closedDecision) return Promise.resolve(this.closedDecision);
-    if (isTimedOut()) {
+    if (ctx.isStale()) {
       // This dispatch's overall timeout fired while queued. Don't run.
       return Promise.resolve({
         kind: 'permission',
@@ -3916,7 +3958,7 @@ export class PermissionQueue {
         this.drainedDecisionByGen.get(myGen) ?? permissionQueueSeed(),
       );
     }
-    return run();
+    return run(ctx);
   }
 
   /** True once cancel() has been called (terminal session close). */
