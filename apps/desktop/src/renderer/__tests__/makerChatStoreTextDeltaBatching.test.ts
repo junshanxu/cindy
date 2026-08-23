@@ -7100,6 +7100,92 @@ describe('makerChatStore text delta batching', () => {
     ).rejects.toThrow(/workdir-missing/);
   });
 
+  it('does not dispatch a UI trigger when its enqueue-time preflight rejects', async () => {
+    vi.mocked(sessionService.get).mockResolvedValueOnce({
+      agentKind: 'codex',
+      remoteHostId: null,
+      sdkSessionId: null,
+      fastMode: false,
+      contextTokens: 0,
+      contextWindow: 0,
+      totalCostUsd: 0,
+      workingDir: WORKING_DIR,
+      model: MODEL,
+      effort: EFFORT,
+      permissionMode: PERMISSION_MODE,
+    } as unknown as Awaited<ReturnType<typeof sessionService.get>>);
+    const beforeEnqueue = vi.fn(async () => false);
+
+    await expect(
+      makerChatStore.sendUiTrigger(SESSION_ID, CONTINUE_AFTER_APP_EXIT_PROMPT, {
+        beforeEnqueue,
+      }),
+    ).resolves.toBe(false);
+
+    expect(beforeEnqueue).toHaveBeenCalledTimes(1);
+    expect(input.enqueue).not.toHaveBeenCalled();
+    expect(window.electronAPI.maker.send).not.toHaveBeenCalled();
+  });
+
+  it('rechecks a local send after attachment materialization before enqueueing it', async () => {
+    let resolveMaterialize!: (value: {
+      url: string;
+      name: string;
+      ext: string;
+      mimeType: string;
+      size: number;
+    }) => void;
+    vi.mocked(window.electronAPI.cacheMediaForSession).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveMaterialize = resolve;
+        }),
+    );
+    const attachment: AttachedFile = {
+      id: 'archive-race-annotation',
+      name: 'archive-race.png',
+      path: '',
+      ext: '.png',
+      size: 1,
+      category: 'image',
+      mimeType: 'image/png',
+      url: 'xdt-image://source/archive-race.png',
+      cacheUrlShared: true,
+    };
+    let archived = false;
+    const beforeEnqueue = vi.fn(async () => !archived);
+
+    const send = makerChatStore.sendMessage(
+      SESSION_ID,
+      'annotated send',
+      MODEL,
+      EFFORT,
+      PERMISSION_MODE,
+      WORKING_DIR,
+      [attachment],
+      undefined,
+      { beforeEnqueue },
+    );
+    await flushPromises();
+    expect(beforeEnqueue).not.toHaveBeenCalled();
+    expect(input.enqueue).not.toHaveBeenCalled();
+
+    archived = true;
+    resolveMaterialize({
+      url: 'xdt-image://text-delta-batching/archive-race-private.png',
+      name: 'archive-race-private.png',
+      ext: '.png',
+      mimeType: 'image/png',
+      size: 1,
+    });
+
+    await expect(send).resolves.toBe(false);
+    expect(beforeEnqueue).toHaveBeenCalledOnce();
+    expect(input.enqueue).not.toHaveBeenCalled();
+    expect(makerChatStore.getSnapshot(SESSION_ID).messages).toHaveLength(0);
+    expect(makerChatStore.getSnapshot(SESSION_ID).pendingQueue).toHaveLength(0);
+  });
+
   it('requests executor-side interrupted-turn ack for a direct-send continue fallback', async () => {
     const api = window.electronAPI.maker;
     const ackInterrupted = window.electronAPI.localDb.sessions.ackInterrupted;

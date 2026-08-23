@@ -126,6 +126,7 @@ import { useCCAgentChat } from '@/hooks/useCCAgentChat';
 import { ackErrorAlertHandled } from '@/lib/errorAlertAck';
 import { useAttachments } from '@/hooks/useAttachments';
 import { useCCSessions } from '@/hooks/useCCSessions';
+import { useConfirmCloseActiveFileIfDirty } from './workdir-browse/hooks/useConfirmSwitchAwayIfDirty';
 import { SessionContentHeaderRegistration } from './SessionContentHeader';
 import { useSessionBinding } from '@/hooks/useSessionBinding';
 import { useVendorAuthGate } from '@/hooks/useVendorAuthGate';
@@ -921,6 +922,11 @@ export function CCAgentSessionView({
     const current = archivedSecondaryWindowInputBlockedRef.current;
     return current.sessionId === sessionId && current.blocked;
   }, [sessionId]);
+  const allowArchivedSecondaryWindowEnqueue = useCallback(
+    async () => !isArchivedSecondaryWindowInputBlocked(),
+    [isArchivedSecondaryWindowInputBlocked],
+  );
+  const confirmCloseActiveFileIfDirty = useConfirmCloseActiveFileIfDirty();
 
   // worktree-parallel-sessions:订阅当前 session 的 worktree 创建态(creating/failed)。
   // 触发源:NewMakerDraftRoute 的 worktree 异步创建路径。
@@ -1272,7 +1278,7 @@ export function CCAgentSessionView({
       try {
         allowClose = onBeforeSecondaryWindowClose
           ? await onBeforeSecondaryWindowClose()
-          : true;
+          : await confirmCloseActiveFileIfDirty();
       } catch (err) {
         log.error('secondary-window close preflight failed', err);
         return;
@@ -1289,6 +1295,7 @@ export function CCAgentSessionView({
     sessionId,
     ownsWindowRoute,
     onBeforeSecondaryWindowClose,
+    confirmCloseActiveFileIfDirty,
     secondaryWindowArchiveOwner,
   ]);
 
@@ -2087,7 +2094,7 @@ export function CCAgentSessionView({
     }
   }, [syntheticContinuationPending, errorTailBannerHiddenFor]);
   const handleErrorTailContinue = useCallback(async () => {
-    if (!sessionId || !errorTailMsg) return;
+    if (!sessionId || !errorTailMsg || isArchivedSecondaryWindowInputBlocked()) return;
     setErrorTailBannerHiddenFor(errorTailMsg.clientId);
     try {
       // 隐藏的英文续跑指令([UI_ACTION_TRIGGER] 前缀,消息流不渲染)——用户视角
@@ -2096,12 +2103,21 @@ export function CCAgentSessionView({
       await rebuildClaudeSubscriptionSessionBeforeRetry(
         errorTailKind === 'error' ? errorTailMsg.errorReason : null,
       );
-      await makerChatStore.sendUiTrigger(
+      if (isArchivedSecondaryWindowInputBlocked()) {
+        setErrorTailBannerHiddenFor(null);
+        return;
+      }
+      const accepted = await makerChatStore.sendUiTrigger(
         sessionId,
         errorTailKind === 'interrupted'
           ? CONTINUE_AFTER_APP_EXIT_PROMPT
           : CONTINUE_AFTER_ERROR_PROMPT,
+        { beforeEnqueue: allowArchivedSecondaryWindowEnqueue },
       );
+      if (!accepted) {
+        setErrorTailBannerHiddenFor(null);
+        return;
+      }
       // sendUiTrigger 在 enqueue 成功后就 resolve,续跑消息**还没落库** —— 此刻重算
       // 仍会把原 error 行判为尾行并保留红点,而 syntheticContinuationPending 已经把
       // 横幅隐藏了(排队被暂停 / 阻塞时可能持续很久)。所以先临时清点让两者一致;
@@ -2117,8 +2133,10 @@ export function CCAgentSessionView({
       toast.error(err instanceof Error ? err.message : String(err));
     }
   }, [
+    allowArchivedSecondaryWindowEnqueue,
     errorTailKind,
     errorTailMsg,
+    isArchivedSecondaryWindowInputBlocked,
     markCurrentUnreadFailedScheduleRun,
     rebuildClaudeSubscriptionSessionBeforeRetry,
     sessionId,
@@ -2223,14 +2241,24 @@ export function CCAgentSessionView({
     void refreshPendingAlerts();
   }, [syntheticContinuationPending, remoteDeviceId, sessionId]);
   const handleSessionInterruptContinue = useCallback(async () => {
-    if (!sessionId) return;
+    if (!sessionId || isArchivedSecondaryWindowInputBlocked()) return;
     setSessionInterruptAcked(true);
     try {
       // main 侧把续跑项插到队首；durable ack 延后到 vendor dispatch 成功后，
       // 避免排队取消 / cancelled-before-dispatch 时旧中断提示被提前抹掉。
       // 续跑 turn 真正启动时会写更新的 started；若再次被 app 退出打断，仍会产生新提示。
       // 本视图先靠内存 acked 即时熄灭，peer 视图靠 dispatch 后的 ack 广播收敛。
-      await makerChatStore.sendUiTrigger(sessionId, CONTINUE_AFTER_APP_EXIT_PROMPT);
+      const accepted = await makerChatStore.sendUiTrigger(
+        sessionId,
+        CONTINUE_AFTER_APP_EXIT_PROMPT,
+        {
+          beforeEnqueue: allowArchivedSecondaryWindowEnqueue,
+        },
+      );
+      if (!accepted) {
+        setSessionInterruptAcked(false);
+        return;
+      }
       // 同 handleErrorTailContinue:enqueue 成功但续跑还没落库、durable ack 也要等
       // dispatch 成功,而横幅已隐藏 —— 先临时清点保持一致,排队被取消时由 pending
       // 落回 false 的 effect 重算恢复。远程会话同样延后(见那里的说明)。
@@ -2240,7 +2268,13 @@ export function CCAgentSessionView({
       setSessionInterruptAcked(false);
       toast.error(err instanceof Error ? err.message : String(err));
     }
-  }, [markCurrentUnreadFailedScheduleRun, remoteDeviceId, sessionId]);
+  }, [
+    allowArchivedSecondaryWindowEnqueue,
+    isArchivedSecondaryWindowInputBlocked,
+    markCurrentUnreadFailedScheduleRun,
+    remoteDeviceId,
+    sessionId,
+  ]);
   const handleSessionInterruptDismiss = useCallback(() => {
     if (!sessionId) return;
     void markCurrentUnreadFailedScheduleRun().then((marked) => {
@@ -3234,8 +3268,12 @@ export function CCAgentSessionView({
               pendingPastedTextRanges?.length ||
               pendingSlashCommandRanges !== undefined ||
               pending.onRemoteOptimisticFailure !== undefined ||
-              pending.onDeferredAccepted !== undefined
+              pending.onDeferredAccepted !== undefined ||
+              isSecondaryWindow()
               ? {
+                  ...(isSecondaryWindow()
+                    ? { beforeEnqueue: allowArchivedSecondaryWindowEnqueue }
+                    : {}),
                   ...(pending.vendorOptions ? { vendorOptions: pending.vendorOptions } : {}),
                   ...(pending.quotesEncoded ? { quotesEncoded: true } : {}),
                   ...(pendingAgentReferences?.length
@@ -3275,6 +3313,7 @@ export function CCAgentSessionView({
       })();
     },
     [
+      allowArchivedSecondaryWindowEnqueue,
       maybeDispatchDesktopSlashCommand,
       isArchivedSecondaryWindowInputBlocked,
       refreshServerSession,
@@ -3538,6 +3577,9 @@ export function CCAgentSessionView({
       // ④ Execute send — effort + permissionMode came straight from ChatInput (fresh value)
       const sendOptions = {
         ...orcaLeadVendorOptions,
+        ...(isSecondaryWindow()
+          ? { beforeEnqueue: allowArchivedSecondaryWindowEnqueue }
+          : {}),
         ...(opts?.quotesEncoded ? { quotesEncoded: true } : {}),
         ...(opts?.agentReferences?.length ? { agentReferences: opts.agentReferences } : {}),
         ...(opts?.pastedTextRanges?.length ? { pastedTextRanges: opts.pastedTextRanges } : {}),
@@ -3611,6 +3653,7 @@ export function CCAgentSessionView({
       vendorAuthGate,
       remoteDeviceId,
       sessionHandoffPreparing,
+      allowArchivedSecondaryWindowEnqueue,
       isArchivedSecondaryWindowInputBlocked,
     ],
   );
@@ -3795,15 +3838,30 @@ export function CCAgentSessionView({
   // useSessionRunningStatus 在 running 上升沿把 orphan 的 error 角标 explicit 清掉。
   // 失败路径则天然保留红点,与仍在展示的横幅一致。
   const handleRetry = useCallback(() => {
+    if (isArchivedSecondaryWindowInputBlocked()) return;
     void rebuildClaudeSubscriptionSessionBeforeRetry(errorReason)
-      .then(() => retryLastError())
+      .then(() => {
+        if (isArchivedSecondaryWindowInputBlocked()) return;
+        return retryLastError();
+      })
       .catch((error) => {
         log.warn('retryLastError failed', error);
       });
-  }, [errorReason, rebuildClaudeSubscriptionSessionBeforeRetry, retryLastError]);
+  }, [
+    errorReason,
+    isArchivedSecondaryWindowInputBlocked,
+    rebuildClaudeSubscriptionSessionBeforeRetry,
+    retryLastError,
+  ]);
 
   const handleSwitchToClaudeSubscription = useCallback(async (): Promise<void> => {
-    if (!sessionId || !session || !canSwitchToClaudeSubscription) return;
+    if (
+      !sessionId ||
+      !session ||
+      !canSwitchToClaudeSubscription ||
+      isArchivedSecondaryWindowInputBlocked()
+    )
+      return;
     const model = session.model;
     const previousProviderId = session.providerId ?? null;
     const retryEffort =
@@ -3863,15 +3921,28 @@ export function CCAgentSessionView({
     }
 
     await refreshServerSession();
+    if (isArchivedSecondaryWindowInputBlocked()) return;
     await retryLastError();
   }, [
-    canSwitchToClaudeSubscription, confirmDialog, fastMode, refreshServerSession,
-    retryLastError, session, sessionId, t,
+    canSwitchToClaudeSubscription,
+    confirmDialog,
+    fastMode,
+    isArchivedSecondaryWindowInputBlocked,
+    refreshServerSession,
+    retryLastError,
+    session,
+    sessionId,
+    t,
   ]);
 
   const handleSilentStopContinue = useCallback(() => {
-    continueAfterSilentStop();
-  }, [continueAfterSilentStop]);
+    if (isArchivedSecondaryWindowInputBlocked()) return;
+    continueAfterSilentStop({ beforeEnqueue: allowArchivedSecondaryWindowEnqueue });
+  }, [
+    allowArchivedSecondaryWindowEnqueue,
+    continueAfterSilentStop,
+    isArchivedSecondaryWindowInputBlocked,
+  ]);
 
   const handleContinueAfterUsageReset = useCallback(() => {
     if (!sessionId || !usageLimitRecovery || remoteDeviceId) return;
@@ -4138,8 +4209,12 @@ export function CCAgentSessionView({
               pending.quotesEncoded ||
               pendingAgentReferences?.length ||
               pendingPastedTextRanges?.length ||
-              pendingSlashCommandRanges !== undefined
+              pendingSlashCommandRanges !== undefined ||
+              isSecondaryWindow()
               ? {
+                  ...(isSecondaryWindow()
+                    ? { beforeEnqueue: allowArchivedSecondaryWindowEnqueue }
+                    : {}),
                   ...(pending.vendorOptions ? { vendorOptions: pending.vendorOptions } : {}),
                   ...(pending.quotesEncoded ? { quotesEncoded: true } : {}),
                   ...(pendingAgentReferences?.length
@@ -4169,6 +4244,7 @@ export function CCAgentSessionView({
     })();
   }, [
     historyLoaded,
+    allowArchivedSecondaryWindowEnqueue,
     isArchivedSecondaryWindowInputBlocked,
     maybeDispatchDesktopSlashCommand,
     restoreRecoverableHandoff,

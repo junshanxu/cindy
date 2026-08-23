@@ -13810,6 +13810,14 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       await drainPersistQueue();
       return getRecoveryContextSnapshot(sessionId, userClientId);
     },
+    isSessionActiveForRetry: async (sessionId) => {
+      const [row] = await getDbClient()
+        .drizzle.select({ status: sessions.status })
+        .from(sessions)
+        .where(eq(sessions.id, sessionId))
+        .limit(1);
+      return row?.status === 'active';
+    },
     // retry-supersede:零产出重试的克隆行落库并派发成功后,软删被取代的旧 user 行
     // 与其后的 error 行(实现与守卫见 localDb/ipc/messages.supersedeRetriedUserTurn)。
     // 只发 messages:deleted、不额外发 sessions:patched:软删既不改变会话列表的

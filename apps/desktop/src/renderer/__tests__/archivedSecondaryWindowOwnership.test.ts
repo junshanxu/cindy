@@ -15,6 +15,18 @@ const workdirBrowseRouteSource = readFileSync(
   resolve(__dirname, '..', 'features', 'cc-agent', 'workdir-browse', 'WorkdirBrowseRoute.tsx'),
   'utf8',
 );
+const dirtyPreflightSource = readFileSync(
+  resolve(
+    __dirname,
+    '..',
+    'features',
+    'cc-agent',
+    'workdir-browse',
+    'hooks',
+    'useConfirmSwitchAwayIfDirty.ts',
+  ),
+  'utf8',
+);
 
 describe('archived secondary-window ownership', () => {
   it('removes embedded split panes without letting them close the route-owning window', () => {
@@ -46,7 +58,7 @@ describe('archived secondary-window ownership', () => {
     expect(cancelGate).toBeGreaterThan(closePreflight);
     expect(closeWindow).toBeGreaterThan(cancelGate);
     expect(sessionViewSource).toMatch(
-      /\}, \[\s*session\?\.status,\s*sessionId,\s*ownsWindowRoute,\s*onBeforeSecondaryWindowClose,\s*secondaryWindowArchiveOwner,\s*\]\);/,
+      /\}, \[\s*session\?\.status,\s*sessionId,\s*ownsWindowRoute,\s*onBeforeSecondaryWindowClose,\s*confirmCloseActiveFileIfDirty,\s*secondaryWindowArchiveOwner,\s*\]\);/,
     );
   });
 
@@ -107,7 +119,16 @@ describe('archived secondary-window ownership', () => {
     ).toHaveLength(2);
   });
 
-  it('uses a synchronous archive fence for the composer and every send path', () => {
+  it('uses the active editor dirty-file preflight when an ordinary task route closes', () => {
+    expect(sessionViewSource).toContain(': await confirmCloseActiveFileIfDirty();');
+    expect(dirtyPreflightSource).toContain('export function useConfirmCloseActiveFileIfDirty()');
+    expect(dirtyPreflightSource).toContain('const handle = getActiveFileBodyHandle();');
+    expect(dirtyPreflightSource).toContain('if (!handle || !handle.isDirty()) return true;');
+    expect(dirtyPreflightSource).toContain("if (choice === 'cancel') return false;");
+    expect(dirtyPreflightSource).toContain('return await handle.save();');
+  });
+
+  it('uses a synchronous archive guard plus enqueue-time fences for every send path', () => {
     const guardDeclaration = sessionViewSource.indexOf(
       'const blocksArchivedSecondaryWindowInput =',
     );
@@ -156,8 +177,67 @@ describe('archived secondary-window ownership', () => {
     expect(sendDispatch).toBeGreaterThan(sendGuard);
     expect(composerDisabled).toBeGreaterThan(sendDispatch);
     expect(composerGuard).toBeGreaterThan(composerDisabled);
+
+    const workingDirChange = sessionViewSource.slice(
+      sessionViewSource.indexOf('const handleWorkingDirChange = useCallback('),
+      sessionViewSource.indexOf('const maybeShowContextUsage = useCallback('),
+    );
+    const recoverableFirstMessage = sessionViewSource.slice(
+      sessionViewSource.indexOf('const restoreRecoverableHandoff = useCallback('),
+      sessionViewSource.indexOf('const pendingGoalConsumedRef = useRef(false);'),
+    );
+    const ordinarySend = sessionViewSource.slice(
+      sessionViewSource.indexOf('const handleSend = useCallback('),
+      sessionViewSource.indexOf('const handleStopSession = useCallback('),
+    );
+
+    for (const source of [workingDirChange, recoverableFirstMessage, ordinarySend]) {
+      expect(source).toContain('beforeEnqueue: allowArchivedSecondaryWindowEnqueue');
+    }
+  });
+
+  it('blocks every retry and continuation entry after its task is archived', () => {
+    const handlers = [
+      ['const handleErrorTailContinue = useCallback(', 'const handleErrorTailDismiss = useCallback('],
+      [
+        'const handleSessionInterruptContinue = useCallback(',
+        'const handleSessionInterruptDismiss = useCallback(',
+      ],
+      ['const handleRetry = useCallback(', 'const handleSwitchToClaudeSubscription = useCallback('],
+      [
+        'const handleSwitchToClaudeSubscription = useCallback(',
+        'const handleSilentStopContinue = useCallback(',
+      ],
+      [
+        'const handleSilentStopContinue = useCallback(',
+        'const handleContinueAfterUsageReset = useCallback(',
+      ],
+    ] as const;
+
+    for (const [start, end] of handlers) {
+      const source = sessionViewSource.slice(
+        sessionViewSource.indexOf(start),
+        sessionViewSource.indexOf(end),
+      );
+      expect(source).toContain('isArchivedSecondaryWindowInputBlocked()');
+    }
     expect(
-      sessionViewSource.match(/if \(isArchivedSecondaryWindowInputBlocked\(\)\) return/g),
-    ).toHaveLength(16);
+      sessionViewSource.slice(
+        sessionViewSource.indexOf('const handleErrorTailContinue = useCallback('),
+        sessionViewSource.indexOf('const handleErrorTailDismiss = useCallback('),
+      ),
+    ).toContain('beforeEnqueue: allowArchivedSecondaryWindowEnqueue');
+    expect(
+      sessionViewSource.slice(
+        sessionViewSource.indexOf('const handleSessionInterruptContinue = useCallback('),
+        sessionViewSource.indexOf('const handleSessionInterruptDismiss = useCallback('),
+      ),
+    ).toContain('beforeEnqueue: allowArchivedSecondaryWindowEnqueue');
+    expect(
+      sessionViewSource.slice(
+        sessionViewSource.indexOf('const handleSilentStopContinue = useCallback('),
+        sessionViewSource.indexOf('const handleContinueAfterUsageReset = useCallback('),
+      ),
+    ).toContain('beforeEnqueue: allowArchivedSecondaryWindowEnqueue');
   });
 });

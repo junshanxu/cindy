@@ -610,7 +610,11 @@ function unsupportedChatBridgeImageError(feature = "input content part 'input_im
 }
 
 function createHarness(opts?: {
-  getRecoveryContextSnapshot?: (sessionId: string, userClientId: string) => Promise<RecoveryContextSnapshot>;
+  getRecoveryContextSnapshot?: (
+    sessionId: string,
+    userClientId: string,
+  ) => Promise<RecoveryContextSnapshot>;
+  isSessionActiveForRetry?: (sessionId: string) => Promise<boolean>;
 }) {
   let running = false;
   let liveRunningOverride: boolean | null | 'unknown' = null;
@@ -779,6 +783,9 @@ function createHarness(opts?: {
         : Promise.resolve(false),
     ...(opts?.getRecoveryContextSnapshot
       ? { getRecoveryContextSnapshot: opts.getRecoveryContextSnapshot }
+      : {}),
+    ...(opts?.isSessionActiveForRetry
+      ? { isSessionActiveForRetry: opts.isSessionActiveForRetry }
       : {}),
     beforeDispatchUserTurn,
     onUndispatchedUserTurn,
@@ -2916,6 +2923,37 @@ describe('AgentInputCoordinator send transaction', () => {
     await flush();
     // The retry was superseded — no second dispatch occurred.
     expect(h.sendToAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not enqueue a retry when the session is archived during the history read', async () => {
+    const progressRead = deferred<boolean>();
+    let sessionActive = true;
+    const isSessionActiveForRetry = vi.fn(async () => sessionActive);
+    const h = createHarness({ isSessionActiveForRetry });
+    const sid = 'retry-archived-during-history-read';
+    h.setHasAssistantProgressAfter(async () => progressRead.promise);
+
+    h.coordinator.enqueue(sid, makeItem('q-first', 'original task'));
+    await flush();
+
+    h.setRunning(false);
+    h.coordinator.onTurnEvent(sid, 'error', 'turn failed');
+    await flush();
+    expect(latestProjection(h.projections).recovery?.kind).toBe('active-turn');
+
+    const retryPromise = h.coordinator.retryLastError(sid);
+    await flush();
+    expect(isSessionActiveForRetry).not.toHaveBeenCalled();
+
+    sessionActive = false;
+    progressRead.resolve(false);
+    await retryPromise;
+    await flush();
+
+    expect(isSessionActiveForRetry).toHaveBeenCalledOnce();
+    expect(isSessionActiveForRetry).toHaveBeenCalledWith(sid);
+    expect(h.sendToAgent).toHaveBeenCalledTimes(1);
+    expect(latestProjection(h.projections).recovery?.kind).toBe('active-turn');
   });
 
   it('active-turn retry falls back to resending the original text when the turn produced nothing', async () => {

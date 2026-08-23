@@ -324,6 +324,12 @@ export interface AgentInputCoordinatorDeps {
     userClientId: string,
   ) => Promise<RecoveryContextSnapshot>;
   /**
+   * Durable lifecycle fence for retry paths that can await history before they
+   * mutate the queue. Production checks sessions.status; omitted test harnesses
+   * retain the historical behavior.
+   */
+  isSessionActiveForRetry?: (sessionId: string) => Promise<boolean>;
+  /**
    * Durable user-row writer shared with direct maker sends.  The fallback keeps
    * the coordinator usable in narrow unit harnesses, while the registered host
    * injects its FIFO writer so steer and drain persistence share one ordering.
@@ -2774,6 +2780,17 @@ export class AgentInputCoordinator {
         progressKnown,
       });
       return { projection: this.getProjection(sessionId), outcome: 'no-progress' };
+    }
+    // Manual retry can spend multiple awaits reading durable history before it
+    // reaches the queue mutation below. A secondary window may learn that the
+    // task was archived during those awaits, so the renderer's click-time guard
+    // is not sufficient. Re-read the durable lifecycle state at the actual
+    // enqueue boundary; no await occurs between this check and the mutation.
+    if (
+      this.deps.isSessionActiveForRetry &&
+      !(await this.deps.isSessionActiveForRetry(sessionId))
+    ) {
+      return { projection: this.getProjection(sessionId), outcome: 'superseded' };
     }
     const previousError = state.error;
     const previousErrorReason = state.errorReason;

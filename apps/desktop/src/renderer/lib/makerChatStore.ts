@@ -13757,11 +13757,16 @@ function retryLastError(sessionId: string): Promise<void> {
  * (点击是真实人类动作)。与 retryLastError 不同:耗尽横幅是 main 合成事件,
  * coordinator 无 recovery 状态,retryLastError 会 no-op,必须走本方法。
  */
-function continueAfterSilentStop(sessionId: string): void {
+interface SyntheticTriggerOptions {
+  beforeEnqueue?: () => Promise<boolean>;
+}
+
+function continueAfterSilentStop(sessionId: string, opts?: SyntheticTriggerOptions): void {
   if (!sessionId) return;
-  disposeLiveErrorPersist(sessionId);
-  void sendUiTrigger(sessionId, CONTINUE_AFTER_ERROR_PROMPT).then(
-    () => {
+  void sendUiTrigger(sessionId, CONTINUE_AFTER_ERROR_PROMPT, opts).then(
+    (accepted) => {
+      if (!accepted) return;
+      disposeLiveErrorPersist(sessionId);
       setState(sessionId, (s) => ({
         ...s,
         error: null,
@@ -14900,7 +14905,11 @@ export { UI_ACTION_TRIGGER_PREFIX };
  * error-tail banner) toasts or恢复红条。
  */
 
-function sendUiTriggerCore(sessionId: string, prompt: string): Promise<void> {
+function sendUiTriggerCore(
+  sessionId: string,
+  prompt: string,
+  opts?: SyntheticTriggerOptions,
+): Promise<boolean> {
   const state = getOrCreateState(sessionId);
   // UI triggers can be invoked from an error card while the mirror is being
   // reseeded. Pin every mutation in this attempt to the device that owned the
@@ -14924,7 +14933,8 @@ function sendUiTriggerCore(sessionId: string, prompt: string): Promise<void> {
       log.warn('sendUiTrigger: fetch session for createOpts failed', err);
       return null;
     })
-    .then((session) => {
+    .then(async (session) => {
+      if (opts?.beforeEnqueue && !(await opts.beforeEnqueue())) return false;
       if (!session?.workingDir) {
         // 行缺失兜底:direct send,行为与旧实现一致。
         // 无 pendingQueue 可取消，continue 在直发 accepted 后 durable ack；成功后再 dismiss
@@ -14940,7 +14950,9 @@ function sendUiTriggerCore(sessionId: string, prompt: string): Promise<void> {
                 throw new Error(result.reason ?? 'Maker send was not accepted before dispatch');
               }
             });
-        if (syntheticTriggerKind(prompt) !== 'continue') return sendDirect();
+        if (syntheticTriggerKind(prompt) !== 'continue') {
+          return sendDirect().then(() => true);
+        }
         // 执行端 maker:send 在进入 vendor 前冻结自己的时钟，并仅在 accepted 后
         // durable ack；device-link 控制端不再跨设备传时间戳。老执行端忽略该选项
         // 时安全降级为“不确认旧中断”，不会因时钟偏差抹掉新的中断。
@@ -14948,6 +14960,7 @@ function sendUiTriggerCore(sessionId: string, prompt: string): Promise<void> {
           if (continuedErrorTailClientId) {
             dismissErrorTailMessage(sessionId, continuedErrorTailClientId);
           }
+          return true;
         });
       }
       const queued = buildQueuedMessage(
@@ -14984,6 +14997,7 @@ function sendUiTriggerCore(sessionId: string, prompt: string): Promise<void> {
         .enqueue(sessionId, queued, { sendAtMs: Date.now() })
         .then((projection) => {
           applyInputProjectionOperationResponse(sessionId, operation, projection);
+          return true;
         });
     })
     .catch((err) => {
@@ -14992,12 +15006,16 @@ function sendUiTriggerCore(sessionId: string, prompt: string): Promise<void> {
     });
 }
 
-function sendUiTrigger(sessionId: string, prompt: string): Promise<void> {
+function sendUiTrigger(
+  sessionId: string,
+  prompt: string,
+  opts?: SyntheticTriggerOptions,
+): Promise<boolean> {
   if (!sessionId) return Promise.reject(new Error('sendUiTrigger: empty sessionId'));
   return withAgentSendDispatch(
     sessionId,
     () => Promise.reject(new Error('Agent switch is still in progress')),
-    () => sendUiTriggerCore(sessionId, prompt),
+    () => sendUiTriggerCore(sessionId, prompt, opts),
   );
 }
 

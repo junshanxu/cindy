@@ -168,7 +168,7 @@ interface UseCCAgentChatReturn {
   /** Retry the main-owned typed recovery target. */
   retryLastError: () => Promise<void>;
   /** silent-stop 耗尽横幅「继续」:清横幅并发隐藏续跑指令(充值守卫额度)。 */
-  continueAfterSilentStop: () => void;
+  continueAfterSilentStop: (opts?: { beforeEnqueue?: () => Promise<boolean> }) => void;
   /** F-CMD: Insert a local-only system card */
   insertSystemCard: (
     cardType: 'help' | 'cost' | 'context' | 'pwd' | 'status' | 'cmd' | 'learn',
@@ -523,10 +523,13 @@ export function useCCAgentChat(
     makerChatStore.clearError(sessionId);
   }, [sessionId]);
 
-  const continueAfterSilentStop = useCallback(() => {
-    if (!sessionId) return;
-    makerChatStore.continueAfterSilentStop(sessionId);
-  }, [sessionId]);
+  const continueAfterSilentStop = useCallback(
+    (opts?: { beforeEnqueue?: () => Promise<boolean> }) => {
+      if (!sessionId) return;
+      makerChatStore.continueAfterSilentStop(sessionId, opts);
+    },
+    [sessionId],
+  );
 
   const retryLastError = useCallback(() => {
     if (!sessionId) return Promise.resolve();
