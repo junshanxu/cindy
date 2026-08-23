@@ -3938,23 +3938,23 @@ export class PermissionQueue {
   /**
    * Transient turn teardown (session_aborted / turn_idle_reconcile /
    * orca_disable / channel takeover): settle runs queued for the old turn
-   * with `decision`, but make the queue immediately usable for the next
-   * turn. The tail is reset synchronously so a dispatch that arrives
-   * while the old in-flight run is still settling runs on a fresh
-   * generation and shows its card (issue #3092 review P1 / Greptile).
+   * with `decision`, while keeping serialization intact for the next turn.
+   *
+   * We do NOT replace the tail: the currently in-flight run (which has
+   * already passed runIfCurrent and started its handler) continues to
+   * completion, and any run queued behind it from the old generation sees
+   * the bumped generation when it reaches runIfCurrent and settles with
+   * `decision` without broadcasting. A new-turn dispatch chains onto the
+   * same tail and therefore waits for the in-flight run to finish — this
+   * preserves the single-slot serialization guarantee. Replacing the tail
+   * here would let a new-turn permission broadcast concurrently with the
+   * old in-flight one and reintroduce the slot overwrite (issue #3092
+   * review P1 / Greptile).
    */
   resetForNewTurn(decision: InteractionDecision): void {
     const drainedGen = this.generation;
     this.drainedDecisionByGen.set(drainedGen, decision);
     this.generation++;
-    // Replace the tail immediately: old queued runs (from drainedGen)
-    // see the bumped generation and settle with `decision`; new
-    // dispatches chain onto a fresh resolved seed and execute without
-    // waiting for the old in-flight run.
-    this.tail = Promise.resolve(permissionQueueSeed());
-    // Best-effort reap of stale drain decisions on the next dispatch
-    // (done in dispatch rather than a timer so queued .then callbacks
-    // always observe their cohort's decision first).
   }
 
   /** Remove drain decisions from generations that have fully passed. */

@@ -270,4 +270,47 @@ describe('PermissionQueue (issue #3092)', () => {
       vi.useRealTimers();
     }
   });
+
+  it('resetForNewTurn serializes the next turn behind an in-flight permission', async () => {
+    // Greptile P1: resetForNewTurn must NOT let a new-turn permission
+    // broadcast concurrently with the in-flight old permission, or it
+    // overwrites the renderer single slot and reintroduces #3092.
+    const queue = new PermissionQueue();
+    let releaseA: ((() => void) | null) | undefined;
+    let aRunning = false;
+    let newTurnRan = false;
+    let startedWhileAInFlight = false;
+
+    const a = queue.dispatch(
+      () =>
+        new Promise((resolve) => {
+          aRunning = true;
+          releaseA = () => {
+            aRunning = false;
+            resolve(allow());
+          };
+        }),
+    );
+
+    // Reset while A is in-flight.
+    queue.resetForNewTurn(deny('session_aborted'));
+
+    const newTurn = queue.dispatch(async () => {
+      if (aRunning) startedWhileAInFlight = true;
+      newTurnRan = true;
+      return allow();
+    });
+
+    // New turn must not have started yet; it is queued behind A.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(newTurnRan).toBe(false);
+
+    // Releasing A lets newTurn run, but never concurrently with A.
+    releaseA?.();
+    await a;
+    await newTurn;
+    expect(newTurnRan).toBe(true);
+    expect(startedWhileAInFlight).toBe(false);
+  });
 });
