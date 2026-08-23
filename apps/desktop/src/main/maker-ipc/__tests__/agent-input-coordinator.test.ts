@@ -614,7 +614,7 @@ function createHarness(opts?: {
     sessionId: string,
     userClientId: string,
   ) => Promise<RecoveryContextSnapshot>;
-  isSessionActiveForRetry?: (sessionId: string) => Promise<boolean>;
+  isSessionActiveForManualDispatch?: (sessionId: string) => Promise<boolean>;
 }) {
   let running = false;
   let liveRunningOverride: boolean | null | 'unknown' = null;
@@ -784,8 +784,8 @@ function createHarness(opts?: {
     ...(opts?.getRecoveryContextSnapshot
       ? { getRecoveryContextSnapshot: opts.getRecoveryContextSnapshot }
       : {}),
-    ...(opts?.isSessionActiveForRetry
-      ? { isSessionActiveForRetry: opts.isSessionActiveForRetry }
+    ...(opts?.isSessionActiveForManualDispatch
+      ? { isSessionActiveForManualDispatch: opts.isSessionActiveForManualDispatch }
       : {}),
     beforeDispatchUserTurn,
     onUndispatchedUserTurn,
@@ -1910,6 +1910,31 @@ describe('AgentInputCoordinator send transaction', () => {
     }
   });
 
+  it('keeps an archived secondary-window queue paused when resume reaches main', async () => {
+    const isSessionActiveForManualDispatch = vi.fn(async () => false);
+    const h = createHarness({ isSessionActiveForManualDispatch });
+    const sid = 'resume-archived-secondary-window';
+    const first = makeItem('q-1', 'first');
+
+    h.setRunning(true);
+    h.coordinator.enqueue(sid, first);
+    await flush();
+    h.coordinator.stop(sid, { keepQueue: true, pauseQueue: true });
+    h.setRunning(false);
+    await flush();
+
+    await h.coordinator.resume(sid, { requireActiveSession: true });
+    await flush();
+
+    expect(isSessionActiveForManualDispatch).toHaveBeenCalledOnce();
+    expect(isSessionActiveForManualDispatch).toHaveBeenCalledWith(sid);
+    expect(h.sendToAgent).not.toHaveBeenCalled();
+    expect(latestProjection(h.projections)).toMatchObject({
+      queuePaused: true,
+      pendingQueue: [first],
+    });
+  });
+
   it('retries an interaction-unlocked queue when an external live reservation clears without a terminal event', async () => {
     vi.useFakeTimers();
     try {
@@ -2929,7 +2954,7 @@ describe('AgentInputCoordinator send transaction', () => {
     const progressRead = deferred<boolean>();
     let sessionActive = true;
     const isSessionActiveForRetry = vi.fn(async () => sessionActive);
-    const h = createHarness({ isSessionActiveForRetry });
+    const h = createHarness({ isSessionActiveForManualDispatch: isSessionActiveForRetry });
     const sid = 'retry-archived-during-history-read';
     h.setHasAssistantProgressAfter(async () => progressRead.promise);
 
@@ -2958,7 +2983,7 @@ describe('AgentInputCoordinator send transaction', () => {
 
   it('keeps main-window retry compatible with archived tasks when no lifecycle fence is requested', async () => {
     const isSessionActiveForRetry = vi.fn(async () => false);
-    const h = createHarness({ isSessionActiveForRetry });
+    const h = createHarness({ isSessionActiveForManualDispatch: isSessionActiveForRetry });
     const sid = 'retry-archived-main-window';
     h.setHasAssistantProgressAfter(async () => false);
 

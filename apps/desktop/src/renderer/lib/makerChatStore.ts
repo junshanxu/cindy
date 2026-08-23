@@ -68,6 +68,7 @@ import type {
   AgentInputProjection,
   AgentInputQueuedMessage,
   AgentInputRecovery,
+  AgentInputResumeOpts,
   AgentInputSessionRef,
   AgentInputReference,
 } from '../../shared/agentInputQueue';
@@ -12228,7 +12229,7 @@ function setQueueExpanded(sessionId: string, expanded: boolean): void {
   ).catch((err) => log.warn('setQueueExpanded failed:', err));
 }
 
-function resumeQueue(sessionId: string): void {
+function resumeQueue(sessionId: string, opts?: AgentInputResumeOpts): void {
   if (!sessionId) return;
   // #2194 (Codex review P2): 暂停队列的「继续」是本端点击意图——恢复后 drain
   // 派发的队首项落库时会作为新尾部 user 行出现，不登记则门控误判为外部注入，
@@ -12247,8 +12248,14 @@ function resumeQueue(sessionId: string): void {
     markLocalSentUserMessage(sessionId, preResumeHeadClientId);
   }
   const boundaryOpts = getRemoteInputClearBoundaryOpts(sessionId);
+  const resumeOpts: AgentInputResumeOpts = {
+    ...(boundaryOpts ?? {}),
+    ...(opts?.requireActiveSession ? { requireActiveSession: true } : {}),
+  };
   runAgentDispatchProjectionOperation(sessionId, (input) =>
-    boundaryOpts ? input.resume(sessionId, boundaryOpts) : input.resume(sessionId),
+    Object.keys(resumeOpts).length > 0
+      ? input.resume(sessionId, resumeOpts)
+      : input.resume(sessionId),
   )
     .then(({ projection }) => {
       if (

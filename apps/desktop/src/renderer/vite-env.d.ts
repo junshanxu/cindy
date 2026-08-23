@@ -5540,7 +5540,7 @@ interface ElectronAPI {
       ) => Promise<import('../shared/agentInputQueue').AgentInputProjection>;
       resume: (
         sessionId: string,
-        opts?: { expectedClearBoundaryMs?: number | null },
+        opts?: import('../shared/agentInputQueue').AgentInputResumeOpts,
       ) => Promise<import('../shared/agentInputQueue').AgentInputProjection>;
       retryLastError: (
         sessionId: string,

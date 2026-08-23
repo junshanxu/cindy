@@ -113,6 +113,7 @@ import {
 import { CONTINUE_AFTER_APP_EXIT_PROMPT } from '../../shared/interruptedTurn';
 
 const SESSION_ID = 'text-delta-batching';
+const SHARED_TARGET_PEER_SESSION_ID = `${SESSION_ID}-shared-target-peer`;
 const MODEL = 'gpt-5';
 const EFFORT = 'medium';
 const PERMISSION_MODE = 'default';
@@ -518,6 +519,7 @@ describe('makerChatStore text delta batching', () => {
     vi.clearAllMocks();
     makerChatStore.__teardownGlobalListeners();
     makerChatStore.purgeSession(SESSION_ID);
+    makerChatStore.purgeSession(SHARED_TARGET_PEER_SESSION_ID);
     makerChatStore.__resetRemoteTerminalTombstonesForTest();
     remoteProjectsStore.clear();
     remoteProjectsStore.__resetPinnedOriginsForTest();
@@ -533,6 +535,7 @@ describe('makerChatStore text delta batching', () => {
   afterEach(() => {
     makerChatStore.__teardownGlobalListeners();
     makerChatStore.purgeSession(SESSION_ID);
+    makerChatStore.purgeSession(SHARED_TARGET_PEER_SESSION_ID);
     makerChatStore.__resetRemoteTerminalTombstonesForTest();
     remoteProjectsStore.clear();
     remoteProjectsStore.__resetPinnedOriginsForTest();
@@ -6235,6 +6238,80 @@ describe('makerChatStore text delta batching', () => {
     expect(beforeDispatch).toHaveBeenCalledOnce();
     expect(enqueueCalls).toBe(0);
     expect(restore).toHaveBeenCalledOnce();
+    expect(makerChatStore.getSnapshot(SESSION_ID).messages).toHaveLength(0);
+  });
+
+  it('keeps another in-flight request on the shared controlled endpoint isolated from a rejected lifecycle fence', async () => {
+    remoteProjectsStore.pinSessionOrigin('device-1', SESSION_ID);
+    remoteProjectsStore.pinSessionOrigin('device-1', SHARED_TARGET_PEER_SESSION_ID);
+    let online = false;
+    const dispatched: Array<{ sessionId: string; text: string }> = [];
+    const rejectedRestore = vi.fn();
+    const peerRestore = vi.fn();
+    deviceLinkInvoke.mockImplementation(async (_deviceId, channel, args) => {
+      const sessionId = args[0] as string;
+      if (channel === 'maker:input:get-projection') {
+        if (!online) throw new Error('[DEVICE_LINK_NOT_CONNECTED] relay offline');
+        return projection(sessionId);
+      }
+      if (channel === 'maker:input:enqueue') {
+        const item = args[1] as AgentInputQueuedMessage;
+        dispatched.push({ sessionId, text: item.text });
+        return projection(sessionId, { pendingQueue: [item] });
+      }
+      throw new Error(`unexpected remote channel: ${channel}`);
+    });
+
+    await expect(
+      makerChatStore.sendMessage(
+        SESSION_ID,
+        'archived peer request',
+        MODEL,
+        EFFORT,
+        PERMISSION_MODE,
+        WORKING_DIR,
+        undefined,
+        undefined,
+        {
+          beforeEnqueue: async () => true,
+          beforeDispatch: async () => false,
+          onRemoteOptimisticFailure: rejectedRestore,
+        },
+      ),
+    ).resolves.toBe(true);
+    await expect(
+      makerChatStore.sendMessage(
+        SHARED_TARGET_PEER_SESSION_ID,
+        'healthy peer request',
+        MODEL,
+        EFFORT,
+        PERMISSION_MODE,
+        WORKING_DIR,
+        undefined,
+        undefined,
+        {
+          beforeEnqueue: async () => true,
+          beforeDispatch: async () => true,
+          onRemoteOptimisticFailure: peerRestore,
+        },
+      ),
+    ).resolves.toBe(true);
+    expect(dispatched).toEqual([]);
+
+    // Both controller intents share the same controlled endpoint and reconnect
+    // edge. Rejecting one record is request-scoped: it must not tear down the
+    // shared link or suppress the other in-flight record.
+    online = true;
+    onPresenceChanged?.({ deviceId: 'device-1', online: true });
+    await flushPromises();
+    await flushPromises();
+    await flushPromises();
+
+    expect(rejectedRestore).toHaveBeenCalledOnce();
+    expect(peerRestore).not.toHaveBeenCalled();
+    expect(dispatched).toEqual([
+      { sessionId: SHARED_TARGET_PEER_SESSION_ID, text: 'healthy peer request' },
+    ]);
     expect(makerChatStore.getSnapshot(SESSION_ID).messages).toHaveLength(0);
   });
 

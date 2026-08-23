@@ -78,6 +78,7 @@ import {
   type AgentInputClearBoundaryOpts,
   type AgentInputCreateOpts,
   type AgentInputQueuedMessage,
+  type AgentInputResumeOpts,
   type AgentInputRetryOpts,
   type AgentInputSessionRef,
   type AgentInputSessionReferenceContext,
@@ -13811,7 +13812,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       await drainPersistQueue();
       return getRecoveryContextSnapshot(sessionId, userClientId);
     },
-    isSessionActiveForRetry: async (sessionId) => {
+    isSessionActiveForManualDispatch: async (sessionId) => {
       const [row] = await getDbClient()
         .drizzle.select({ status: sessions.status })
         .from(sessions)
@@ -15214,7 +15215,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   ipcMain.handle(MAKER_INVOKE.INPUT_RESUME, async (_e, sessionId: unknown, opts?: unknown) => {
     const sid = requireSessionId(sessionId);
     await assertRemoteInputControlBoundary(sid, isDeviceLinkInvoke(), opts);
-    return inputCoordinator.resume(sid);
+    const resumeOpts = opts && typeof opts === 'object' ? (opts as AgentInputResumeOpts) : undefined;
+    return inputCoordinator.resume(sid, {
+      requireActiveSession: resumeOpts?.requireActiveSession === true,
+    });
   });
 
   ipcMain.handle(

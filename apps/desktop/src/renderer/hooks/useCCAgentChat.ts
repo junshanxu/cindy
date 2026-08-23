@@ -55,6 +55,7 @@ import type { ChatDisplaySnapshot } from '@/components/chat/ChatDisplaySnapshotC
 import type { AttachedFile, MentionedResource } from '@/lib/fileTypes';
 import type { PastedTextRange, SlashCommandRange } from '@/lib/imageRef';
 import type { AgentInputReference } from '@cindy/maker-shared/agent-input-projection';
+import type { AgentInputResumeOpts } from '../../shared/agentInputQueue';
 import { createLogger } from '@/lib/logger';
 import { isRemoteSessionSticky } from '@/lib/makerTransport';
 import type { UsageLimitRecoveryHint } from '@/lib/usageLimitRecovery';
@@ -104,7 +105,7 @@ interface UseCCAgentChatReturn {
   /** F-QUEUE-DEFER: 切换队列面板的展开 / 折叠态，仅影响展示。 */
   setQueueExpanded: (expanded: boolean) => void;
   /** Resume a queue paused by Stop. */
-  resumeQueue: () => void;
+  resumeQueue: (opts?: AgentInputResumeOpts) => void;
   /** Reorder a queued row by moving it to the requested insertion index. */
   moveQueueItem: (clientId: string, targetIndex: number) => void;
   /** Protect the whole queue from auto-drain while row order is being changed. */
@@ -779,10 +780,13 @@ export function useCCAgentChat(
     [sessionId],
   );
 
-  const resumeQueue = useCallback(() => {
-    if (!sessionId) return;
-    makerChatStore.resumeQueue(sessionId);
-  }, [sessionId]);
+  const resumeQueue = useCallback(
+    (opts?: AgentInputResumeOpts) => {
+      if (!sessionId) return;
+      makerChatStore.resumeQueue(sessionId, opts);
+    },
+    [sessionId],
+  );
 
   const moveQueueItem = useCallback(
     (clientId: string, targetIndex: number) => {

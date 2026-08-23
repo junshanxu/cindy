@@ -216,6 +216,9 @@ describe('archived secondary-window ownership', () => {
     );
 
     expect(resumeHandler).toContain('isArchivedSecondaryWindowInputBlocked()');
+    expect(resumeHandler).toContain(
+      'resumeQueue({ requireActiveSession: isSecondaryWindow() })',
+    );
     expect(steerHandler).toContain('isArchivedSecondaryWindowInputBlocked()');
     expect(chatInput).toContain('blocksArchivedSecondaryWindowInput');
     expect(chatInput).toContain(': handleArchivedSafeQueueResume');

@@ -167,6 +167,11 @@ export interface AgentInputClearBoundaryOpts {
   expectedClearBoundaryMs?: number | null;
 }
 
+/** Queue resume options; secondary windows can require an active task at dispatch time. */
+export interface AgentInputResumeOpts extends AgentInputClearBoundaryOpts {
+  requireActiveSession?: boolean;
+}
+
 /** Manual retry options; secondary windows can require an active task at dispatch time. */
 export interface AgentInputRetryOpts extends AgentInputClearBoundaryOpts {
   requireActiveSession?: boolean;

@@ -324,11 +324,11 @@ export interface AgentInputCoordinatorDeps {
     userClientId: string,
   ) => Promise<RecoveryContextSnapshot>;
   /**
-   * Durable lifecycle fence for retry paths that can await history before they
-   * mutate the queue. Production checks sessions.status; omitted test harnesses
-   * retain the historical behavior.
+   * Durable lifecycle fence for manual dispatch paths that can race an archive
+   * update before they mutate the queue. Production checks sessions.status;
+   * omitted test harnesses retain the historical behavior.
    */
-  isSessionActiveForRetry?: (sessionId: string) => Promise<boolean>;
+  isSessionActiveForManualDispatch?: (sessionId: string) => Promise<boolean>;
   /**
    * Durable user-row writer shared with direct maker sends.  The fallback keeps
    * the coordinator usable in narrow unit harnesses, while the registered host
@@ -2565,7 +2565,17 @@ export class AgentInputCoordinator {
     return this.getProjection(sessionId);
   }
 
-  resume(sessionId: string): AgentInputProjection {
+  async resume(
+    sessionId: string,
+    opts?: { requireActiveSession?: boolean },
+  ): Promise<AgentInputProjection> {
+    if (
+      opts?.requireActiveSession &&
+      this.deps.isSessionActiveForManualDispatch &&
+      !(await this.deps.isSessionActiveForManualDispatch(sessionId))
+    ) {
+      return this.getProjection(sessionId);
+    }
     const state = this.getState(sessionId);
     const recovery = state.recovery;
     const pausedQueueHeadRecoveryClientId =
@@ -2791,8 +2801,8 @@ export class AgentInputCoordinator {
     // enqueue boundary; no await occurs between this check and the mutation.
     if (
       opts?.requireActiveSession &&
-      this.deps.isSessionActiveForRetry &&
-      !(await this.deps.isSessionActiveForRetry(sessionId))
+      this.deps.isSessionActiveForManualDispatch &&
+      !(await this.deps.isSessionActiveForManualDispatch(sessionId))
     ) {
       return { projection: this.getProjection(sessionId), outcome: 'superseded' };
     }

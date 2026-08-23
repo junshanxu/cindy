@@ -1792,7 +1792,7 @@ export function CCAgentSessionView({
   } = useCCAgentChat(sessionId, handleTitleUpdate, { chatRealtime });
   const handleArchivedSafeQueueResume = useCallback(() => {
     if (isArchivedSecondaryWindowInputBlocked()) return;
-    resumeQueue();
+    resumeQueue({ requireActiveSession: isSecondaryWindow() });
   }, [isArchivedSecondaryWindowInputBlocked, resumeQueue]);
   const handleArchivedSafeQueueSteer = useCallback(
     (clientId: string) => {
