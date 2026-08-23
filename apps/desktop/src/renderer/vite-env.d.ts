@@ -5514,7 +5514,7 @@ interface ElectronAPI {
       enqueue: (
         sessionId: string,
         item: import('../shared/agentInputQueue').AgentInputQueuedMessage,
-        opts?: { sendAtMs?: number; expectedClearBoundaryMs?: number | null },
+        opts?: import('../shared/agentInputQueue').AgentInputEnqueueOpts,
       ) => Promise<import('../shared/agentInputQueue').AgentInputProjection>;
       compact: (
         sessionId: string,
@@ -5524,11 +5524,7 @@ interface ElectronAPI {
       steer: (
         sessionId: string,
         item: import('../shared/agentInputQueue').AgentInputQueuedMessage,
-        opts?: {
-          removeFromQueue?: boolean;
-          touchUserSend?: boolean;
-          expectedClearBoundaryMs?: number | null;
-        },
+        opts?: import('../shared/agentInputQueue').AgentInputSteerOpts,
       ) => Promise<boolean>;
       stop: (
         sessionId: string,

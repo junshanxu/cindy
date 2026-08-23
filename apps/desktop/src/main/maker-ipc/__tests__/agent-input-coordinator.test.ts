@@ -5770,6 +5770,35 @@ describe('AgentInputCoordinator steer transaction', () => {
     expect(latestProjection(h.projections).steeringQueueClientIds).toEqual([]);
   });
 
+  it('clears the steer marker without fallback when the final lifecycle fence sees an archived task', async () => {
+    const h = createHarness();
+    const sid = 'inspection-secondary-steer-archived-race';
+    const queued = makeItem('q-archived', 'still here');
+    h.setRunning(true);
+    h.coordinator.enqueue(sid, makeItem('q-running', 'running'));
+    h.coordinator.enqueue(sid, queued);
+    h.steerToAgent.mockRejectedValueOnce(
+      new Error('SESSION_NOT_ACTIVE: Session is no longer active'),
+    );
+
+    await expect(
+      h.coordinator.steer(sid, queued, {
+        removeFromQueue: true,
+        requireActiveSession: true,
+      }),
+    ).resolves.toBe(false);
+
+    expect(h.steerToAgent).toHaveBeenCalledWith(
+      sid,
+      { type: 'user', content: 'still here' },
+      expect.objectContaining({ requireActiveSession: true }),
+    );
+    const projection = latestProjection(h.projections);
+    expect(projection.pendingQueue.map((item) => item.clientId)).toContain('q-archived');
+    expect(projection.steeringQueueClientIds).toEqual([]);
+    expect(projection.error).toBeNull();
+  });
+
   it('does not report a policy-blocked control steer as delivered', async () => {
     const h = createHarness();
     h.setScreenUserMessage(

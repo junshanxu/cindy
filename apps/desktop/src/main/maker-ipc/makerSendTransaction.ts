@@ -17,6 +17,7 @@ import {
   toDesktopSessionDispatchOutcome,
 } from '../maker-host/send-outcome.js';
 import { isCredentialModeSwitchBusyError } from '../maker-host/codex-credential-switch.js';
+import { requiresActiveSessionForDispatch } from '../../shared/agentInputQueue.js';
 import { throwIpcError } from '../utils/ipcValidate.js';
 import {
   extractPlainText,
@@ -354,6 +355,8 @@ export interface MakerSendTransactionDeps {
   /** 把 Pi 原生 user entry id 补到已落库的 Cindy user 行，供会话树恢复附件。 */
   linkPiUserEntry?(sessionId: string, clientId: string, piEntryId: string): Promise<boolean | void>;
   beforeDispatchDirectUserTurn?: (sessionId: string) => void | Promise<void>;
+  /** Re-read the durable session row immediately before a guarded direct send. */
+  assertSessionActiveForManualDispatch?: (sessionId: string) => void | Promise<void>;
   /** Synchronous final fence immediately before Session.send enters vendor code. */
   assertBeforeVendorDispatch?: (sessionId: string, sendOpts: unknown) => void;
   onUndispatchedDirectUserTurn?: (sessionId: string) => void;
@@ -1132,6 +1135,9 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
         if (directPreDispatchHook) {
           await directPreDispatchHook(sessionId);
           directPreDispatchHookStarted = true;
+        }
+        if (requiresActiveSessionForDispatch(finalFenceSendOpts)) {
+          await deps.assertSessionActiveForManualDispatch?.(sessionId);
         }
         // Capture on the executor immediately before vendor code. sess.send may
         // synchronously publish the continuation's new started marker before it

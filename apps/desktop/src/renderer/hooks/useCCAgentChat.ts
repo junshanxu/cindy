@@ -132,6 +132,7 @@ interface UseCCAgentChatReturn {
       slashCommandRanges?: SlashCommandRange[];
       beforeEnqueue?: () => Promise<boolean>;
       beforeDispatch?: () => Promise<boolean>;
+      requireActiveSession?: boolean;
       onRemoteOptimisticFailure?: (clientId: string, error?: unknown) => void;
     },
   ) => Promise<boolean>;
@@ -158,10 +159,14 @@ interface UseCCAgentChatReturn {
       slashCommandRanges?: SlashCommandRange[];
       beforeEnqueue?: () => Promise<boolean>;
       beforeDispatch?: () => Promise<boolean>;
+      requireActiveSession?: boolean;
       onRemoteOptimisticFailure?: (clientId: string, error?: unknown) => void;
     },
   ) => Promise<boolean>;
-  steerQueuedMessage: (clientId: string) => Promise<boolean>;
+  steerQueuedMessage: (
+    clientId: string,
+    opts?: { requireActiveSession?: boolean },
+  ) => Promise<boolean>;
   /** User-initiated stop: aborts the current SDK query and clears streaming state */
   stopSession: () => void;
   /** F-CLEAR-1: Clear conversation — hides old messages, resets SDK context, stays on same session */
@@ -171,7 +176,10 @@ interface UseCCAgentChatReturn {
   /** Retry the main-owned typed recovery target. */
   retryLastError: (opts?: { requireActiveSession?: boolean }) => Promise<void>;
   /** silent-stop 耗尽横幅「继续」:清横幅并发隐藏续跑指令(充值守卫额度)。 */
-  continueAfterSilentStop: (opts?: { beforeEnqueue?: () => Promise<boolean> }) => void;
+  continueAfterSilentStop: (opts?: {
+    beforeEnqueue?: () => Promise<boolean>;
+    requireActiveSession?: boolean;
+  }) => void;
   /** F-CMD: Insert a local-only system card */
   insertSystemCard: (
     cardType: 'help' | 'cost' | 'context' | 'pwd' | 'status' | 'cmd' | 'learn',
@@ -496,9 +504,9 @@ export function useCCAgentChat(
   );
 
   const steerQueuedMessage = useCallback(
-    (clientId: string) => {
+    (clientId: string, opts?: { requireActiveSession?: boolean }) => {
       if (!sessionId) return Promise.resolve(false);
-      return makerChatStore.steerQueuedMessage(sessionId, clientId);
+      return makerChatStore.steerQueuedMessage(sessionId, clientId, opts);
     },
     [sessionId],
   );
@@ -527,7 +535,7 @@ export function useCCAgentChat(
   }, [sessionId]);
 
   const continueAfterSilentStop = useCallback(
-    (opts?: { beforeEnqueue?: () => Promise<boolean> }) => {
+    (opts?: { beforeEnqueue?: () => Promise<boolean>; requireActiveSession?: boolean }) => {
       if (!sessionId) return;
       makerChatStore.continueAfterSilentStop(sessionId, opts);
     },

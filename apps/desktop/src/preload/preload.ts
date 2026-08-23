@@ -6665,7 +6665,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       enqueue: (
         sessionId: string,
         item: import('../shared/agentInputQueue').AgentInputQueuedMessage,
-        opts?: { sendAtMs?: number; expectedClearBoundaryMs?: number | null },
+        opts?: import('../shared/agentInputQueue').AgentInputEnqueueOpts,
       ): Promise<import('../shared/agentInputQueue').AgentInputProjection> =>
         ipcRenderer.invoke('maker:input:enqueue', sessionId, item, opts),
       compact: (
@@ -6677,11 +6677,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       steer: (
         sessionId: string,
         item: import('../shared/agentInputQueue').AgentInputQueuedMessage,
-        opts?: {
-          removeFromQueue?: boolean;
-          touchUserSend?: boolean;
-          expectedClearBoundaryMs?: number | null;
-        },
+        opts?: import('../shared/agentInputQueue').AgentInputSteerOpts,
       ): Promise<boolean> => ipcRenderer.invoke('maker:input:steer', sessionId, item, opts),
       stop: (
         sessionId: string,

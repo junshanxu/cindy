@@ -27,15 +27,27 @@ const dirtyPreflightSource = readFileSync(
   ),
   'utf8',
 );
+const makerChatStoreSource = readFileSync(
+  resolve(__dirname, '..', 'lib', 'makerChatStore.ts'),
+  'utf8',
+);
+const registerSource = readFileSync(
+  resolve(__dirname, '..', '..', 'main', 'maker-ipc', 'register.ts'),
+  'utf8',
+);
+const makerSendTransactionSource = readFileSync(
+  resolve(__dirname, '..', '..', 'main', 'maker-ipc', 'makerSendTransaction.ts'),
+  'utf8',
+);
 
 describe('archived secondary-window ownership', () => {
   it('removes embedded split panes without letting them close the route-owning window', () => {
     const archivedEffect = sessionViewSource.indexOf("if (session?.status !== 'archived') return;");
+    const ownerGate = sessionViewSource.indexOf('if (!ownsWindowRoute) {', archivedEffect);
     const removePane = sessionViewSource.indexOf(
       'splitGroupStore.removeSession(sessionId);',
-      archivedEffect,
+      ownerGate,
     );
-    const ownerGate = sessionViewSource.indexOf('if (!ownsWindowRoute) {', removePane);
     const ownerGateEnd = sessionViewSource.indexOf('\n    }', ownerGate);
     const closePreflight = sessionViewSource.indexOf(
       'await onBeforeSecondaryWindowClose()',
@@ -51,8 +63,9 @@ describe('archived secondary-window ownership', () => {
     );
 
     expect(archivedEffect).toBeGreaterThan(-1);
-    expect(removePane).toBeGreaterThan(archivedEffect);
-    expect(ownerGate).toBeGreaterThan(removePane);
+    expect(ownerGate).toBeGreaterThan(archivedEffect);
+    expect(removePane).toBeGreaterThan(ownerGate);
+    expect(removePane).toBeLessThan(ownerGateEnd);
     expect(ownerGateEnd).toBeGreaterThan(ownerGate);
     expect(closePreflight).toBeGreaterThan(ownerGateEnd);
     expect(cancelGate).toBeGreaterThan(closePreflight);
@@ -220,6 +233,9 @@ describe('archived secondary-window ownership', () => {
       'resumeQueue({ requireActiveSession: isSecondaryWindow() })',
     );
     expect(steerHandler).toContain('isArchivedSecondaryWindowInputBlocked()');
+    expect(steerHandler).toContain(
+      'steerQueuedMessage(clientId, { requireActiveSession: isSecondaryWindow() })',
+    );
     expect(chatInput).toContain('blocksArchivedSecondaryWindowInput');
     expect(chatInput).toContain(': handleArchivedSafeQueueResume');
     expect(chatInput).toContain(': handleArchivedSafeQueueSteer');
@@ -270,6 +286,54 @@ describe('archived secondary-window ownership', () => {
     ).toContain('beforeEnqueue: allowArchivedSecondaryWindowEnqueue');
     expect(sessionViewSource).toContain(
       'retryLastError({ requireActiveSession: isSecondaryWindow() })',
+    );
+  });
+
+  it('rechecks the durable active state at every Main dispatch boundary', () => {
+    const enqueueStart = registerSource.indexOf('MAKER_INVOKE.INPUT_ENQUEUE');
+    const enqueueEnd = registerSource.indexOf('MAKER_INVOKE.INPUT_COMPACT', enqueueStart);
+    const enqueueBody = registerSource.slice(enqueueStart, enqueueEnd);
+    const enqueueFence = enqueueBody.indexOf('await assertSessionActiveForManualDispatch(sid);');
+    const enqueueDispatch = enqueueBody.indexOf('inputCoordinator.enqueue(sid, queued');
+
+    const steerStart = registerSource.indexOf('MAKER_INVOKE.INPUT_STEER');
+    const steerEnd = registerSource.indexOf('MAKER_INVOKE.INPUT_STOP', steerStart);
+    const steerBody = registerSource.slice(steerStart, steerEnd);
+    const steerFence = steerBody.indexOf('await assertSessionActiveForManualDispatch(sid);');
+    const steerDispatch = steerBody.indexOf('inputCoordinator.steer(');
+
+    const directFence = makerSendTransactionSource.indexOf(
+      'await deps.assertSessionActiveForManualDispatch?.(sessionId);',
+    );
+    const directDispatch = makerSendTransactionSource.indexOf(
+      'const sendResult = await sess.send(',
+    );
+    const acceptedSteerStart = registerSource.indexOf('const steerToAgentAccepted = async');
+    const steerMetadataRead = registerSource.indexOf(
+      'const meta = await maker.getSessionMeta(sessionId).catch(() => null);',
+      acceptedSteerStart,
+    );
+    const finalSteerFence = registerSource.indexOf(
+      'await assertSessionActiveForManualDispatch(sessionId);',
+      steerMetadataRead,
+    );
+    const vendorSteer = registerSource.indexOf(
+      'await sess.steer(steerPayload as never,',
+      finalSteerFence,
+    );
+
+    expect(enqueueFence).toBeGreaterThan(-1);
+    expect(enqueueDispatch).toBeGreaterThan(enqueueFence);
+    expect(steerFence).toBeGreaterThan(-1);
+    expect(steerDispatch).toBeGreaterThan(steerFence);
+    expect(directFence).toBeGreaterThan(-1);
+    expect(directDispatch).toBeGreaterThan(directFence);
+    expect(acceptedSteerStart).toBeGreaterThan(-1);
+    expect(steerMetadataRead).toBeGreaterThan(-1);
+    expect(finalSteerFence).toBeGreaterThan(steerMetadataRead);
+    expect(vendorSteer).toBeGreaterThan(finalSteerFence);
+    expect(makerChatStoreSource).toContain(
+      '...(opts?.requireActiveSession ? { requireActiveSession: true } : {})',
     );
   });
 });

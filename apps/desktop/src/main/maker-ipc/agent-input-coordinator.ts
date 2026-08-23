@@ -210,6 +210,8 @@ export interface AgentInputSendOpts {
   expectedClearBoundaryMs?: number | null;
   /** Main-owned input generation captured before async preparation. */
   expectedInputGeneration?: number;
+  /** Recheck the durable task lifecycle at the final manual dispatch boundary. */
+  requireActiveSession?: boolean;
   /** Main-owned Session identity for a control-plane same-turn steer. */
   expectedTurnSession?: object;
   /** Main-owned maker-core turn generation for a control-plane same-turn steer. */
@@ -841,6 +843,11 @@ function isNoActiveTurnError(err: unknown): boolean {
 function isStaleTurnError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /\[STALE_TURN\]/i.test(msg);
+}
+
+function isSessionNotActiveError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /\bSESSION_NOT_ACTIVE\b/i.test(msg);
 }
 
 /**
@@ -1899,6 +1906,8 @@ export class AgentInputCoordinator {
       expectedTurnSession?: object;
       /** 控制面初检捕获的 maker-core turn generation。 */
       expectedTurnGeneration?: number;
+      /** 副窗口人工插话在最终 vendor 边界复核持久化任务仍为 active。 */
+      requireActiveSession?: boolean;
     },
   ): Promise<boolean> {
     const matchesExpectedTurn = () =>
@@ -2127,6 +2136,7 @@ export class AgentInputCoordinator {
         signal: AbortSignal.any([inputBoundarySignal, steerAbort.signal]),
         expectedClearBoundaryMs: steerClearBoundaryMs,
         expectedInputGeneration: steerGeneration,
+        ...(opts?.requireActiveSession ? { requireActiveSession: true } : {}),
         ...(opts?.expectedTurnSession !== undefined
           ? { expectedTurnSession: opts.expectedTurnSession }
           : {}),
@@ -2157,6 +2167,14 @@ export class AgentInputCoordinator {
       this.clearSteerAbortController(sessionId, item.clientId, steerAbort);
 
       if (isStaleTurnError(err)) {
+        if (markerStillPresent) {
+          this.clearDirectSteeringItem(latest, item.clientId);
+          this.emit(sessionId);
+        }
+        return finishSteerRequest(false);
+      }
+
+      if (isSessionNotActiveError(err)) {
         if (markerStillPresent) {
           this.clearDirectSteeringItem(latest, item.clientId);
           this.emit(sessionId);

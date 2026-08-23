@@ -167,15 +167,40 @@ export interface AgentInputClearBoundaryOpts {
   expectedClearBoundaryMs?: number | null;
 }
 
-/** Queue resume options; secondary windows can require an active task at dispatch time. */
-export interface AgentInputResumeOpts extends AgentInputClearBoundaryOpts {
+/** Optional Main-side lifecycle fence for manual dispatches from secondary windows. */
+export interface AgentInputRequireActiveSessionOpts {
   requireActiveSession?: boolean;
 }
 
-/** Manual retry options; secondary windows can require an active task at dispatch time. */
-export interface AgentInputRetryOpts extends AgentInputClearBoundaryOpts {
-  requireActiveSession?: boolean;
+export function requiresActiveSessionForDispatch(opts: unknown): boolean {
+  return Boolean(
+    opts &&
+    typeof opts === 'object' &&
+    !Array.isArray(opts) &&
+    (opts as AgentInputRequireActiveSessionOpts).requireActiveSession === true,
+  );
 }
+
+/** Queue enqueue options; secondary windows can require an active task at dispatch time. */
+export interface AgentInputEnqueueOpts
+  extends AgentInputClearBoundaryOpts, AgentInputRequireActiveSessionOpts {
+  sendAtMs?: number;
+}
+
+/** Same-turn steer options, including the secondary-window lifecycle fence. */
+export interface AgentInputSteerOpts
+  extends AgentInputClearBoundaryOpts, AgentInputRequireActiveSessionOpts {
+  removeFromQueue?: boolean;
+  touchUserSend?: boolean;
+}
+
+/** Queue resume options; secondary windows can require an active task at dispatch time. */
+export interface AgentInputResumeOpts
+  extends AgentInputClearBoundaryOpts, AgentInputRequireActiveSessionOpts {}
+
+/** Manual retry options; secondary windows can require an active task at dispatch time. */
+export interface AgentInputRetryOpts
+  extends AgentInputClearBoundaryOpts, AgentInputRequireActiveSessionOpts {}
 
 /**
  * 一次自动续跑（中断自愈）的展示信息，main 与 renderer 共用。

@@ -74,14 +74,17 @@ import {
   getAgentFacingText,
   normalizeAgentInputClearBoundaryMs,
   parseAgentInputToolLoopDetails,
+  requiresActiveSessionForDispatch,
   serializeSessionReferencePayload,
   type AgentInputClearBoundaryOpts,
   type AgentInputCreateOpts,
+  type AgentInputEnqueueOpts,
   type AgentInputQueuedMessage,
   type AgentInputResumeOpts,
   type AgentInputRetryOpts,
   type AgentInputSessionRef,
   type AgentInputSessionReferenceContext,
+  type AgentInputSteerOpts,
 } from '../../shared/agentInputQueue.js';
 import { getManagedWorktreeBasePath } from '../../shared/managedWorktreePaths.js';
 import { normalizeWorkingDirForProjectSettings } from '../../shared/workingDir.js';
@@ -12430,6 +12433,22 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     }
   };
 
+  const isSessionActiveForManualDispatch = async (sessionId: string): Promise<boolean> => {
+    const [row] = await getDbClient()
+      .drizzle.select({ status: sessions.status })
+      .from(sessions)
+      .where(eq(sessions.id, sessionId))
+      .limit(1);
+    return row?.status === 'active';
+  };
+  const assertSessionActiveForManualDispatch = async (sessionId: string): Promise<void> => {
+    if (await isSessionActiveForManualDispatch(sessionId)) return;
+    throwIpcError(
+      'PRECONDITION_FAILED',
+      `SESSION_NOT_ACTIVE: Session ${sessionId} is no longer active`,
+    );
+  };
+
   const { sendToAgentAccepted: sendToAgentAcceptedUnlocked } = createMakerSendTransaction({
     getSession: (sessionId) => maker.getSession(sessionId),
     closeSession: (sessionId) => maker.closeSession(sessionId),
@@ -12472,6 +12491,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         patchMessageAgentMeta(sessionId, clientId, { piEntryId }),
       ),
     beforeDispatchDirectUserTurn: (sessionId) => gitSnapshotCoordinator?.onTurnStart(sessionId),
+    assertSessionActiveForManualDispatch,
     assertBeforeVendorDispatch: (sessionId, sendOpts) => {
       const remote = isDeviceLinkInvoke();
       assertRemoteInputClearNotInFlight(sessionId, remote);
@@ -12855,6 +12875,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       fromMobileClient?: boolean;
       expectedClearBoundaryMs?: number | null;
       expectedInputGeneration?: number;
+      requireActiveSession?: boolean;
       expectedTurnSession?: object;
       expectedTurnGeneration?: number;
       readonly [MAIN_OWNED_SEND_CONTEXT]?: MainOwnedSendContext;
@@ -12935,6 +12956,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         assertCurrentInputClearBoundary(sessionId, precondition.expected);
       }
       assertCurrentInputGeneration(sessionId, readExpectedInputGeneration(sendOpts));
+      if (so.requireActiveSession) {
+        await assertSessionActiveForManualDispatch(sessionId);
+      }
       sess = readCurrentSteerSession();
       await sess.steer(steerPayload as never, {
         logTitle: meta?.title,
@@ -13812,14 +13836,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       await drainPersistQueue();
       return getRecoveryContextSnapshot(sessionId, userClientId);
     },
-    isSessionActiveForManualDispatch: async (sessionId) => {
-      const [row] = await getDbClient()
-        .drizzle.select({ status: sessions.status })
-        .from(sessions)
-        .where(eq(sessions.id, sessionId))
-        .limit(1);
-      return row?.status === 'active';
-    },
+    isSessionActiveForManualDispatch,
     // retry-supersede:零产出重试的克隆行落库并派发成功后,软删被取代的旧 user 行
     // 与其后的 error 行(实现与守卫见 localDb/ipc/messages.supersedeRetriedUserTurn)。
     // 只发 messages:deleted、不额外发 sessions:patched:软删既不改变会话列表的
@@ -14811,6 +14828,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       await assertReviewExternalInputAllowed(sid);
       const deviceLinkInvoke = isDeviceLinkInvoke();
       if (!deviceLinkInvoke) assertTrustedAppRendererEvent(event);
+      const enqueueOpts =
+        opts && typeof opts === 'object' && !Array.isArray(opts)
+          ? (opts as AgentInputEnqueueOpts)
+          : undefined;
       const parsed = requireQueuedMessage(item);
       assertRemoteInputClearNotInFlight(sid, deviceLinkInvoke);
       const clearBoundaryPrecondition = readRemoteInputClearBoundaryPrecondition(opts);
@@ -14896,9 +14917,12 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         // 「继续任务」durable ack 延后到 vendor dispatch 成功（onDispatchedUserTurn）：
         // 排队可取消时旧中断提示必须能恢复；accepted 但仍可能 cancelled-before-dispatch
         // 时也不能提前 ack。续跑项本身由 coordinator 插到队首（普通输入仍 FIFO）。
+        if (requiresActiveSessionForDispatch(enqueueOpts)) {
+          await assertSessionActiveForManualDispatch(sid);
+        }
         let duplicate = false;
         const projection = inputCoordinator.enqueue(sid, queued, {
-          ...(opts && typeof opts === 'object' ? (opts as { sendAtMs?: number }) : undefined),
+          ...(enqueueOpts?.sendAtMs !== undefined ? { sendAtMs: enqueueOpts.sendAtMs } : {}),
           // INPUT_ENQUEUE 只承载显式用户输入(composer 发送 / UI trigger / device-link
           // 被控端转投的用户消息):崩溃恢复出的暂停队列遇到显式输入即放行,解开
           // 「继续任务/新消息全部排队直到重启」的死锁。Orca 自动投递走 main 侧直调
@@ -14966,11 +14990,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       const deviceLinkInvoke = isDeviceLinkInvoke();
       if (!deviceLinkInvoke) assertTrustedAppRendererEvent(event);
       const steerOpts =
-        opts && typeof opts === 'object'
-          ? (opts as {
-              removeFromQueue?: boolean;
-              touchUserSend?: boolean;
-            } & AgentInputClearBoundaryOpts)
+        opts && typeof opts === 'object' && !Array.isArray(opts)
+          ? (opts as AgentInputSteerOpts)
           : undefined;
       const parsed = requireQueuedMessage(item, {
         // A device-link projection intentionally omits the trusted snapshot;
@@ -15115,6 +15136,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           }
           return true;
         }
+        if (requiresActiveSessionForDispatch(steerOpts)) {
+          await assertSessionActiveForManualDispatch(sid);
+        }
         // steer 与 enqueue 不同:它会因同会话已有在飞 steer / Stop 边界 / 输入锁而
         // 返回 false。必须等它落定、受理了才改名 —— 被拒的文本改掉默认名 / 合成占位 /
         // fork 占位就是凭空改名(review P1)。
@@ -15125,7 +15149,14 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
             attachmentOwnerId,
           );
         }
-        const runSteer = () => inputCoordinator.steer(sid, queued, steerOpts);
+        const coordinatorSteerOpts = steerOpts
+          ? {
+              ...(steerOpts.removeFromQueue ? { removeFromQueue: true } : {}),
+              ...(steerOpts.touchUserSend ? { touchUserSend: true } : {}),
+              ...(steerOpts.requireActiveSession ? { requireActiveSession: true } : {}),
+            }
+          : undefined;
+        const runSteer = () => inputCoordinator.steer(sid, queued, coordinatorSteerOpts);
         const accepted = await (deviceLinkInvoke
           ? runSteer()
           : trustedDesktopSteerText.run(queued.text, runSteer));

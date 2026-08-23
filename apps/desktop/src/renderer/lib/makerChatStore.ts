@@ -932,6 +932,7 @@ interface RemoteOptimisticSendRecord {
   attempt: number;
   beforeEnqueue?: () => Promise<boolean>;
   beforeDispatch?: () => Promise<boolean>;
+  requireActiveSession?: boolean;
   preflightCompleted: boolean;
   /** 标注附件仍在本机烧录；完成前必须挡住本条及后续 FIFO 派发。 */
   materializationPending: boolean;
@@ -1522,6 +1523,7 @@ function registerRemoteOptimisticSend(
     attempt: 0,
     beforeEnqueue: opts?.beforeEnqueue,
     beforeDispatch: opts?.beforeDispatch,
+    requireActiveSession: opts?.requireActiveSession,
     preflightCompleted: opts?.beforeEnqueue === undefined,
     materializationPending,
     steerDispatchUncertain: false,
@@ -9866,6 +9868,7 @@ async function dispatchRemoteOptimisticSend(
       if (!isRemoteOptimisticSendRegistered(sessionId, record)) return { kind: 'cancelled' };
       const accepted = await operation.api.input.steer(sessionId, record.queued, {
         touchUserSend: true,
+        ...(record.requireActiveSession ? { requireActiveSession: true } : {}),
         ...(record.expectedClearBoundaryMs !== undefined
           ? { expectedClearBoundaryMs: record.expectedClearBoundaryMs }
           : {}),
@@ -9882,6 +9885,7 @@ async function dispatchRemoteOptimisticSend(
     if (!isRemoteOptimisticSendRegistered(sessionId, record)) return { kind: 'cancelled' };
     const projection = await operation.api.input.enqueue(sessionId, record.queued, {
       sendAtMs: Date.now(),
+      ...(record.requireActiveSession ? { requireActiveSession: true } : {}),
       ...(record.expectedClearBoundaryMs !== undefined
         ? { expectedClearBoundaryMs: record.expectedClearBoundaryMs }
         : {}),
@@ -12552,6 +12556,8 @@ type SendMessageOpts = {
   beforeEnqueue?: () => Promise<boolean>;
   /** device-link 每次实际派发前重跑的生命周期门禁；重连重试不得复用旧结果。 */
   beforeDispatch?: () => Promise<boolean>;
+  /** Main 在最终入队／插话边界复核持久化任务仍为 active。 */
+  requireActiveSession?: boolean;
   /** 远程乐观发送在稍后确认永久失败时恢复 composer。 */
   onRemoteOptimisticFailure?: (clientId: string, error?: unknown) => void;
 };
@@ -12895,7 +12901,10 @@ async function sendMessageCore(
 
   const operation = beginInputProjectionOperation(sessionId);
   return operation.api.input
-    .enqueue(sessionId, queued, { sendAtMs: Date.now() })
+    .enqueue(sessionId, queued, {
+      sendAtMs: Date.now(),
+      ...(opts?.requireActiveSession ? { requireActiveSession: true } : {}),
+    })
     .then((projection) => {
       if (opts?.authRetryPersistOnProjectionError) {
         setState(sessionId, (s) => ({
@@ -13004,6 +13013,8 @@ function steerMessage(
     pastedTextRanges?: PastedTextRange[];
     slashCommandRanges?: SlashCommandRange[];
     beforeEnqueue?: () => Promise<boolean>;
+    beforeDispatch?: () => Promise<boolean>;
+    requireActiveSession?: boolean;
     onRemoteOptimisticFailure?: (clientId: string, error?: unknown) => void;
   },
 ): Promise<boolean> {
@@ -13150,6 +13161,8 @@ async function steerMessageCore(
     pastedTextRanges?: PastedTextRange[];
     slashCommandRanges?: SlashCommandRange[];
     beforeEnqueue?: () => Promise<boolean>;
+    beforeDispatch?: () => Promise<boolean>;
+    requireActiveSession?: boolean;
     onRemoteOptimisticFailure?: (clientId: string, error?: unknown) => void;
   },
   clearGenerationAtStart = 0,
@@ -13251,7 +13264,10 @@ async function steerMessageCore(
 
   const steerApi = remoteDeviceId ? makerApiForDevice(remoteDeviceId) : makerApiFor(sessionId);
   return steerApi.input
-    .steer(sessionId, queued, { touchUserSend: true })
+    .steer(sessionId, queued, {
+      touchUserSend: true,
+      ...(opts?.requireActiveSession ? { requireActiveSession: true } : {}),
+    })
     .then(async (ok) => {
       if (ok) {
         commitAutoTitle();
@@ -13383,7 +13399,11 @@ async function resendBlockedMessage(
   }
 }
 
-function steerQueuedMessage(sessionId: string, clientId: string): Promise<boolean> {
+function steerQueuedMessage(
+  sessionId: string,
+  clientId: string,
+  opts?: { requireActiveSession?: boolean },
+): Promise<boolean> {
   if (!sessionId || !clientId) return Promise.resolve(false);
   // Capture the target before entering the dispatch coordinator. A relay
   // reconnect may clear remoteProjectsStore while the coordinator is waiting;
@@ -13425,6 +13445,7 @@ function steerQueuedMessage(sessionId: string, clientId: string): Promise<boolea
       return steerApi.input
         .steer(sessionId, queued, {
           removeFromQueue: true,
+          ...(opts?.requireActiveSession ? { requireActiveSession: true } : {}),
           ...getRemoteInputClearBoundaryOpts(sessionId),
         })
         .then((ok) => {
@@ -13787,6 +13808,7 @@ function retryLastError(
  */
 interface SyntheticTriggerOptions {
   beforeEnqueue?: () => Promise<boolean>;
+  requireActiveSession?: boolean;
 }
 
 function continueAfterSilentStop(sessionId: string, opts?: SyntheticTriggerOptions): void {
@@ -14971,6 +14993,7 @@ function sendUiTriggerCore(
           triggerApi
             .send(sessionId, { type: 'user', content: prompt }, undefined, {
               userName: currentUserName ?? undefined,
+              ...(opts?.requireActiveSession ? { requireActiveSession: true } : {}),
               ...(ackInterruptedTurnOnDispatch ? { ackInterruptedTurnOnDispatch: true } : {}),
             })
             .then((result) => {
@@ -15022,7 +15045,10 @@ function sendUiTriggerCore(
       markLocalSentUserMessage(sessionId, queued.clientId);
       const operation = beginInputProjectionOperation(sessionId, remoteDeviceId);
       return operation.api.input
-        .enqueue(sessionId, queued, { sendAtMs: Date.now() })
+        .enqueue(sessionId, queued, {
+          sendAtMs: Date.now(),
+          ...(opts?.requireActiveSession ? { requireActiveSession: true } : {}),
+        })
         .then((projection) => {
           applyInputProjectionOperationResponse(sessionId, operation, projection);
           return true;

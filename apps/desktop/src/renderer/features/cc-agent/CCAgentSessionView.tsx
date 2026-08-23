@@ -1263,8 +1263,8 @@ export function CCAgentSessionView({
     if (!sessionId) return;
     if (session?.status !== 'archived') return;
     if (!isSecondaryWindow()) return;
-    splitGroupStore.removeSession(sessionId);
     if (!ownsWindowRoute) {
+      splitGroupStore.removeSession(sessionId);
       log.info('archived session removed from embedded secondary-window pane', { sessionId });
       return;
     }
@@ -1797,7 +1797,7 @@ export function CCAgentSessionView({
   const handleArchivedSafeQueueSteer = useCallback(
     (clientId: string) => {
       if (isArchivedSecondaryWindowInputBlocked()) return Promise.resolve(false);
-      return steerQueuedMessage(clientId);
+      return steerQueuedMessage(clientId, { requireActiveSession: isSecondaryWindow() });
     },
     [isArchivedSecondaryWindowInputBlocked, steerQueuedMessage],
   );
@@ -2123,7 +2123,10 @@ export function CCAgentSessionView({
         errorTailKind === 'interrupted'
           ? CONTINUE_AFTER_APP_EXIT_PROMPT
           : CONTINUE_AFTER_ERROR_PROMPT,
-        { beforeEnqueue: allowArchivedSecondaryWindowEnqueue },
+        {
+          beforeEnqueue: allowArchivedSecondaryWindowEnqueue,
+          requireActiveSession: isSecondaryWindow(),
+        },
       );
       if (!accepted) {
         setErrorTailBannerHiddenFor(null);
@@ -2264,6 +2267,7 @@ export function CCAgentSessionView({
         CONTINUE_AFTER_APP_EXIT_PROMPT,
         {
           beforeEnqueue: allowArchivedSecondaryWindowEnqueue,
+          requireActiveSession: isSecondaryWindow(),
         },
       );
       if (!accepted) {
@@ -3286,6 +3290,7 @@ export function CCAgentSessionView({
                     ? {
                         beforeEnqueue: allowArchivedSecondaryWindowEnqueue,
                         beforeDispatch: allowArchivedSecondaryWindowEnqueue,
+                        requireActiveSession: true,
                       }
                     : {}),
                   ...(pending.vendorOptions ? { vendorOptions: pending.vendorOptions } : {}),
@@ -3595,6 +3600,7 @@ export function CCAgentSessionView({
           ? {
               beforeEnqueue: allowArchivedSecondaryWindowEnqueue,
               beforeDispatch: allowArchivedSecondaryWindowEnqueue,
+              requireActiveSession: true,
             }
           : {}),
         ...(opts?.quotesEncoded ? { quotesEncoded: true } : {}),
@@ -3954,7 +3960,10 @@ export function CCAgentSessionView({
 
   const handleSilentStopContinue = useCallback(() => {
     if (isArchivedSecondaryWindowInputBlocked()) return;
-    continueAfterSilentStop({ beforeEnqueue: allowArchivedSecondaryWindowEnqueue });
+    continueAfterSilentStop({
+      beforeEnqueue: allowArchivedSecondaryWindowEnqueue,
+      requireActiveSession: isSecondaryWindow(),
+    });
   }, [
     allowArchivedSecondaryWindowEnqueue,
     continueAfterSilentStop,
@@ -4233,6 +4242,7 @@ export function CCAgentSessionView({
                     ? {
                         beforeEnqueue: allowArchivedSecondaryWindowEnqueue,
                         beforeDispatch: allowArchivedSecondaryWindowEnqueue,
+                        requireActiveSession: true,
                       }
                     : {}),
                   ...(pending.vendorOptions ? { vendorOptions: pending.vendorOptions } : {}),
