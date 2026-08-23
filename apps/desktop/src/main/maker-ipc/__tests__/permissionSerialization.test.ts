@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { PermissionQueue } from '../register.js';
 import type { InteractionDecision } from '@cindy/maker-core';
@@ -208,5 +208,49 @@ describe('PermissionQueue (issue #3092)', () => {
     await later;
     expect(laterRan).toBe(true);
     expect(queue.isCancelled()).toBe(false);
+  });
+
+  it('counts queue wait against the per-request timeout (no N×timeout buildup)', async () => {
+    // Two unanswered parallel permissions must not extend the effective cap
+    // to 2× timeout: the second one is queued behind the first, and its
+    // overall timeout covers wait + execution. We model a first run that
+    // never resolves and assert the second dispatch settles denied within
+    // ~its timeout, not double.
+    vi.useFakeTimers();
+    try {
+      const queue = new PermissionQueue();
+      let releaseA: ((() => void) | null) | undefined;
+      // First permission: never resolves (user walked away).
+      queue.dispatch(
+        () =>
+          new Promise((resolve) => {
+            releaseA = () => resolve(allow());
+          }),
+        { timeoutMs: 1000 },
+      );
+      // Second permission: queued behind A, same timeout.
+      const start = Date.now();
+      const secondPromise = queue.dispatch(
+        async () => allow(),
+        { timeoutMs: 1000 },
+      );
+      let settledAt: number | null = null;
+      void secondPromise.then(() => {
+        settledAt = Date.now() - start;
+      });
+
+      // Advance well past one timeout but not two.
+      await vi.advanceTimersByTimeAsync(1500);
+      expect(settledAt).not.toBeNull();
+      // It should have settled around the 1000ms cap (queue wait counted),
+      // certainly not near 2000ms.
+      expect(settledAt!).toBeLessThan(1500);
+
+      // Clean up the dangling first promise.
+      releaseA?.();
+      await vi.runAllTimersAsync();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

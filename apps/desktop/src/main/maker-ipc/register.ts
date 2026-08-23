@@ -3701,7 +3701,13 @@ export function installDesktopInteractionListener(session: {
 
   installDesktopInteractionHandler(session, async (req: InteractionRequest) => {
     if (req.kind === 'permission') {
-      return queue.dispatch(() => handleDesktopInteractionRequest(req));
+      // The overall timeout covers queue wait + execution so that N parallel,
+      // unanswered permissions can't extend the 10-minute cap to N×10 minutes
+      // (each card's in-handler timer only starts when it reaches the front).
+      return queue.dispatch(
+        () => handleDesktopInteractionRequest(req),
+        { timeoutMs: PERMISSION_INTERACTION_TIMEOUT_MS },
+      );
     }
     return handleDesktopInteractionRequest(req);
   });
@@ -3798,77 +3804,144 @@ function permissionQueueSeed(): InteractionDecision {
  * contract without spinning up the full Desktop fallback handler.
  */
 export class PermissionQueue {
+  // Tail of the serialization chain. Each dispatch chains onto this so
+  // runs execute one at a time in arrival order. It is replaced on
+  // resetForNewTurn so new-turn dispatches don't wait behind the drained
+  // previous turn.
   private tail: Promise<InteractionDecision> = Promise.resolve(permissionQueueSeed());
-  private cancelled: InteractionDecision | null = null;
+  // Monotonic generation. Bumped on every reset/cancel. A run captured
+  // its enqueue generation; when it gets to run, if the generation moved
+  // on (reset happened while queued), it settles with the drain decision
+  // instead of broadcasting.
+  private generation = 0;
+  // Decision to serve runs from a drained generation, keyed by the
+  // generation it was set for. Survives until the generation ages out so
+  // queued runs always observe the decision that drained their cohort.
+  private drainedDecisionByGen = new Map<number, InteractionDecision>();
+  // Set on terminal cancel (session_closed): every dispatch settles with
+  // this forever, regardless of generation.
+  private closedDecision: InteractionDecision | null = null;
 
   /** Enqueue a permission run. Resolves with the run's own decision. */
-  dispatch(run: () => Promise<InteractionDecision>): Promise<InteractionDecision> {
-    // If cancellation already fired, do NOT chain onto the tail — that would
-    // run after the current in-flight settles. Settle immediately with the
-    // cancellation decision.
-    if (this.cancelled) return Promise.resolve(this.cancelled);
-    const cancelled = this.cancelled;
+  dispatch(
+    run: () => Promise<InteractionDecision>,
+    opts?: { timeoutMs?: number },
+  ): Promise<InteractionDecision> {
+    // Terminal close: never run again.
+    if (this.closedDecision) return Promise.resolve(this.closedDecision);
+    this.reapDrainedDecisions();
+    const myGen = this.generation;
+    const timeoutMs = opts?.timeoutMs;
+
+    // The gate resolves when it's this run's turn AND it is still current,
+    // or rejects if the previous run threw (we still proceed to run()).
     const next = this.tail.then(
-      () => {
-        // Re-check after the await: cancellation may have fired while we
-        // were queued behind the previous permission. If so, skip the run.
-        if (this.cancelled) return this.cancelled;
-        return run();
-      },
-      () => {
-        if (this.cancelled) return this.cancelled;
-        return run();
-      },
+      () => this.runIfCurrent(myGen, run),
+      () => this.runIfCurrent(myGen, run),
     );
-    // Keep the tail alive regardless of a run's outcome so a rejected run
-    // never poisons subsequent dispatches.
+
+    // Advance the tail. On rejection recover so a throwing run doesn't
+    // poison the queue.
     this.tail = next.then(
       (d) => d,
-      () => this.cancelled ?? permissionQueueSeed(),
+      () =>
+        this.closedDecision
+        ?? permissionQueueSeed(),
     );
+
+    // Apply an overall timeout that counts QUEUE WAIT + execution, not
+    // just execution. Without this, N parallel permissions with no user
+    // present could extend the 10-minute renderer timeout to N×10 minutes
+    // because each card's own timer only starts when it reaches the front
+    // (issue #3092 review).
+    if (timeoutMs && timeoutMs > 0 && timeoutMs < Number.POSITIVE_INFINITY) {
+      return new Promise<InteractionDecision>((resolve) => {
+        const timer = setTimeout(() => {
+          resolve({
+            kind: 'permission',
+            behavior: 'deny',
+            reason: 'timeout',
+          });
+        }, timeoutMs);
+        next.then(
+          (decision) => {
+            clearTimeout(timer);
+            resolve(decision);
+          },
+          () => {
+            clearTimeout(timer);
+            resolve({
+              kind: 'permission',
+              behavior: 'deny',
+              reason: 'timeout',
+            });
+          },
+        );
+      });
+    }
     return next;
   }
 
-  /** True once cancel() has been called. */
+  /** Run `run` only if no reset/close happened while queued. */
+  private runIfCurrent(
+    myGen: number,
+    run: () => Promise<InteractionDecision>,
+  ): Promise<InteractionDecision> {
+    if (this.closedDecision) return Promise.resolve(this.closedDecision);
+    if (myGen !== this.generation) {
+      // A reset happened while we were queued. Settle with the drain
+      // decision recorded for our generation instead of running.
+      return Promise.resolve(
+        this.drainedDecisionByGen.get(myGen) ?? permissionQueueSeed(),
+      );
+    }
+    return run();
+  }
+
+  /** True once cancel() has been called (terminal session close). */
   isCancelled(): boolean {
-    return this.cancelled !== null;
+    return this.closedDecision !== null;
   }
 
   /**
-   * Settle all queued (not yet started) permissions with `decision` and
-   * prevent any future dispatch from running. Safe to call multiple times;
-   * the first decision wins. Use this for terminal session teardown
-   * (session_closed), where no further turn will run on this queue.
+   * Terminal teardown (session_closed): settle every queued/run with
+   * `decision` permanently and prevent any future dispatch from running.
    */
   cancel(decision: InteractionDecision): void {
-    if (this.cancelled) return;
-    this.cancelled = decision;
+    if (this.closedDecision) return;
+    this.closedDecision = decision;
+    this.drainedDecisionByGen.set(this.generation, decision);
+    this.generation++;
   }
 
   /**
-   * Settle all queued (not yet started) permissions with `decision`, but
-   * leave the queue usable for future dispatches. Use this for transient
-   * turn teardown (session_aborted / turn_idle_reconcile / orca_disable):
-   * the agent's current turn is over and queued cards belong to it, but
-   * the next user turn on the same session must still be able to show
-   * permission cards. Cancelling permanently here would make every later
-   * permission dispatch return a stale deny (issue #3092 review P1).
+   * Transient turn teardown (session_aborted / turn_idle_reconcile /
+   * orca_disable / channel takeover): settle runs queued for the old turn
+   * with `decision`, but make the queue immediately usable for the next
+   * turn. The tail is reset synchronously so a dispatch that arrives
+   * while the old in-flight run is still settling runs on a fresh
+   * generation and shows its card (issue #3092 review P1 / Greptile).
    */
   resetForNewTurn(decision: InteractionDecision): void {
-    // Drain any queued runs by flipping the cancelled flag; the tail
-    // carries the drained decision. Then clear the flag and start a fresh
-    // tail so dispatches after this point run their handlers normally.
-    this.cancelled = decision;
-    this.tail = this.tail.then(
-      () => {
-        this.cancelled = null;
-        return permissionQueueSeed();
-      },
-      () => {
-        this.cancelled = null;
-        return permissionQueueSeed();
-      },
-    );
+    const drainedGen = this.generation;
+    this.drainedDecisionByGen.set(drainedGen, decision);
+    this.generation++;
+    // Replace the tail immediately: old queued runs (from drainedGen)
+    // see the bumped generation and settle with `decision`; new
+    // dispatches chain onto a fresh resolved seed and execute without
+    // waiting for the old in-flight run.
+    this.tail = Promise.resolve(permissionQueueSeed());
+    // Best-effort reap of stale drain decisions on the next dispatch
+    // (done in dispatch rather than a timer so queued .then callbacks
+    // always observe their cohort's decision first).
+  }
+
+  /** Remove drain decisions from generations that have fully passed. */
+  private reapDrainedDecisions(): void {
+    if (this.drainedDecisionByGen.size <= 4) return;
+    for (const gen of this.drainedDecisionByGen.keys()) {
+      if (gen < this.generation - 1) this.drainedDecisionByGen.delete(gen);
+    }
   }
 }
 
