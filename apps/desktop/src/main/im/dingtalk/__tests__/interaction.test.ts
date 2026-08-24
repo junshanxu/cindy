@@ -110,8 +110,26 @@ describe('dingtalk text interactions', () => {
       expect.any(String),
       expect.any(Function),
       expect.any(Number),
+      'request-timeout',
     );
     expect(requestTextReply.mock.calls[0]?.[3]).toBeLessThanOrEqual(1_234);
     expect(requestTextReply.mock.calls[0]?.[3]).toBeGreaterThan(0);
+  });
+
+  it('returns the router cancellation decision instead of an interaction handler failure', async () => {
+    const cancellation = Object.assign(new Error('DINGTALK_INTERACTION_CANCELLED'), {
+      decision: { kind: 'permission' as const, behavior: 'deny' as const, reason: 'session_cleanup' },
+    });
+    const im = {
+      requestTextReply: vi.fn(async () => Promise.reject(cancellation)),
+    } as unknown as DingTalkIM;
+    await expect(
+      handleDingTalkTextInteraction(im, 'owner-1', {
+        kind: 'permission',
+        requestId: 'request-cancel',
+        toolName: 'shell_command',
+        input: {},
+      }),
+    ).resolves.toEqual(cancellation.decision);
   });
 });

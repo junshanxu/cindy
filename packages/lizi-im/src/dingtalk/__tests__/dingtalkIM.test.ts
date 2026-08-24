@@ -438,6 +438,41 @@ describe("DingTalkIM", () => {
     expect(received).toHaveLength(2);
   });
 
+  it("routes /stop to the normal handler and lets the adapter cancel a pending reply", async () => {
+    const { host } = makeHost();
+    const client = new FakeClient();
+    const im = new DingTalkIM(host, {
+      clientFactory: () => client,
+      fetcher: validCredentialFetcher(),
+    });
+    const received: IMMessageEvent[] = [];
+    im.onMessage((event) => received.push(event));
+    await im.init();
+    client.emit(directMessage());
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+
+    const reply = im.requestTextReply(
+      "owner-1",
+      "输入 y",
+      (text) => (text === "y" ? "accepted" : null),
+      1_000,
+      "request-stop",
+    );
+    client.emit(
+      directMessage({
+        msgId: "stop-message",
+        text: { content: "/stop" },
+      }),
+      "callback-stop",
+    );
+
+    await vi.waitFor(() => expect(received).toHaveLength(2));
+    expect(received[1]?.text).toBe("/stop");
+    expect(im.cancelTextReply("owner-1", "different-request")).toBe(false);
+    expect(im.cancelTextReply("owner-1", "request-stop", { kind: "permission" })).toBe(true);
+    await expect(reply).rejects.toThrow("DINGTALK_INTERACTION_CANCELLED");
+  });
+
   it("does not expose the app secret through public state", async () => {
     const { host } = makeHost();
     const client = new FakeClient();

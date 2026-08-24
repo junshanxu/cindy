@@ -1802,6 +1802,22 @@ export function createTurnRunner(
       return;
     }
 
+    // Takeover is another channel confirmation surface, not a way around the
+    // channel hard-deny policy. Keep destructive commands out of every
+    // migrated route before either a text waiter or a rich card is published.
+    if (req.kind === 'permission') {
+      const guard = checkChannelDestructiveToolCall(req.toolName, req.input);
+      if (guard.destructive) {
+        log.warn(`destructive migrated tool blocked: ${req.toolName} (${guard.reason})`);
+        resolve({
+          kind: 'permission',
+          behavior: 'deny',
+          reason: `[destructiveGuard] ${guard.reason}`,
+        });
+        return;
+      }
+    }
+
     if (!richIm) {
       try {
         if (adapter.handleTextInteraction) {
@@ -1896,7 +1912,7 @@ export function createTurnRunner(
       return;
     }
 
-    const remainingTimeoutMs =
+    let remainingTimeoutMs =
       req.kind === 'permission' && entry.expiresAt !== undefined
         ? entry.expiresAt - Date.now()
         : undefined;
@@ -1923,6 +1939,17 @@ export function createTurnRunner(
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           log.warn(`dm routed notice send failed (non-fatal): ${msg}`);
+        }
+      }
+      // The group notice is an awaited network send. Re-evaluate the absolute
+      // expiry afterwards so an already-expired permission is not registered
+      // with a stale positive timeout.
+      if (req.kind === 'permission' && entry.expiresAt !== undefined) {
+        remainingTimeoutMs = entry.expiresAt - Date.now();
+        if (remainingTimeoutMs <= 0) {
+          resolve({ kind: 'permission', behavior: 'deny', reason: 'interaction_timeout' });
+          patchExpiredInteractionCard(req.requestId, messageId);
+          return;
         }
       }
       registerPendingExternal(

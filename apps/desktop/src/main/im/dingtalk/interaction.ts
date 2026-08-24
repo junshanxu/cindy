@@ -3,7 +3,7 @@ import type { DingTalkIM } from '@cindy/im';
 
 import { autoReviewUnavailablePromptLine } from '../shared/autoReviewUnavailablePrompt';
 
-export function handleDingTalkTextInteraction(
+export async function handleDingTalkTextInteraction(
   im: DingTalkIM,
   userId: string,
   request: InteractionRequest,
@@ -13,15 +13,22 @@ export function handleDingTalkTextInteraction(
     options?.timeoutMs !== undefined
       ? Date.now() + Math.max(1, options.timeoutMs)
       : undefined;
-  if (request.kind === 'ask_user_question') {
-    return answerQuestions(im, userId, request, deadline);
+  try {
+    if (request.kind === 'ask_user_question') {
+      return await answerQuestions(im, userId, request, deadline);
+    }
+    return await im.requestTextReply(
+      userId,
+      formatInteractionPrompt(request),
+      (text) => parseInteractionReply(request, text),
+      remainingTimeoutMs(deadline),
+      request.requestId,
+    );
+  } catch (error) {
+    const decision = (error as { decision?: unknown }).decision;
+    if (isInteractionDecision(decision)) return decision;
+    throw error;
   }
-  return im.requestTextReply(
-    userId,
-    formatInteractionPrompt(request),
-    (text) => parseInteractionReply(request, text),
-    remainingTimeoutMs(deadline),
-  );
 }
 
 async function answerQuestions(
@@ -37,9 +44,18 @@ async function answerQuestions(
       formatQuestionPrompt(question, index, request.questions.length),
       (text) => parseQuestionAnswer(question, text),
       remainingTimeoutMs(deadline),
+      request.requestId,
     );
   }
   return { kind: 'ask_user_question', answers };
+}
+
+function isInteractionDecision(value: unknown): value is InteractionDecision {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { kind?: unknown }).kind === 'string'
+  );
 }
 
 function remainingTimeoutMs(deadline: number | undefined): number | undefined {

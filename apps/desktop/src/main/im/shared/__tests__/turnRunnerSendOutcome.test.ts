@@ -824,6 +824,107 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
     }
   });
 
+  it('hard-denies destructive permissions before publishing a migrated text interaction', async () => {
+    const h = setupAttachedSession(async () => ({ accepted: true }));
+    const resolve = vi.fn();
+    const handleTextInteraction = vi.fn<NonNullable<ImChannelAdapter['handleTextInteraction']>>();
+    mocks.checkDestructiveToolCall.mockReturnValue({
+      destructive: true,
+      reason: 'shell command contains `rm`',
+    });
+    mocks.takePendingInteractionsForSession.mockReturnValue([
+      {
+        requestId: 'migrated-destructive',
+        request: {
+          kind: 'permission',
+          requestId: 'migrated-destructive',
+          toolName: 'bash',
+          input: { command: 'rm -rf generated' },
+        },
+        resolve,
+      },
+    ]);
+    const textAdapter: ImChannelAdapter = {
+      ...fakeAdapter,
+      channel: 'wecom',
+      output: {
+        kind: 'chunked-text',
+        im: mocks.feishuIm as unknown as ChannelIM,
+        commitFinal: vi.fn(async () => undefined),
+      },
+      handleTextInteraction,
+    };
+    const localRunner = createTurnRunner(textAdapter, fakeRepo, fakeCards);
+
+    try {
+      await localRunner.runAgentTurn({
+        botContextId: 'cli_test_bot',
+        userId: 'ou_user',
+        userMessageId: 'msg-migrated-destructive',
+        text: 'take over',
+        attachments: [],
+      });
+      await waitForAssertion(() => expect(resolve).toHaveBeenCalledOnce());
+      expect(resolve).toHaveBeenCalledWith({
+        kind: 'permission',
+        behavior: 'deny',
+        reason: '[destructiveGuard] shell command contains `rm`',
+      });
+      expect(handleTextInteraction).not.toHaveBeenCalled();
+    } finally {
+      h.emit({ type: 'done', data: {} });
+      await localRunner.disposeAllSessions();
+    }
+  });
+
+  it('does not register a migrated group permission after its DM notice crosses the deadline', async () => {
+    const h = setupAttachedSession(async () => ({ accepted: true }));
+    const resolve = vi.fn();
+    let now = 1_000;
+    const expiresAt = 1_010;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    mocks.takePendingInteractionsForSession.mockReturnValue([
+      {
+        requestId: 'migrated-expired-notice',
+        request: {
+          kind: 'permission',
+          requestId: 'migrated-expired-notice',
+          toolName: 'bash',
+          input: { command: 'after notice' },
+        },
+        resolve,
+        expiresAt,
+      },
+    ]);
+    mocks.buildPermissionCard.mockReturnValue({ title: 'Permission', body: 'Allow?', buttons: [] });
+    mocks.feishuIm.sendInteractiveCard.mockResolvedValue({ messageId: 'migrated-card' });
+    mocks.feishuIm.sendText.mockImplementation(async () => {
+      now = expiresAt;
+    });
+    const localRunner = createTurnRunner(fakeAdapter, fakeRepo, fakeCards);
+
+    try {
+      await localRunner.runAgentTurn({
+        botContextId: 'cli_test_bot',
+        userId: 'g/oc_group1/omt_t1',
+        userMessageId: 'msg-migrated-expired',
+        text: 'take over',
+        attachments: [],
+      });
+      await waitForAssertion(() => expect(resolve).toHaveBeenCalledOnce());
+      expect(resolve).toHaveBeenCalledWith({
+        kind: 'permission',
+        behavior: 'deny',
+        reason: 'interaction_timeout',
+      });
+      expect(mocks.registerPendingExternal).not.toHaveBeenCalled();
+    } finally {
+      nowSpy.mockRestore();
+      h.emit({ type: 'done', data: {} });
+      await localRunner.disposeAllSessions();
+    }
+  });
+
   it('keeps channel-native IM turns on their existing non-marker path', async () => {
     const h = setupSession(async () => ({ accepted: true }));
 
