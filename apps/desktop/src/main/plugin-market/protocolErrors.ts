@@ -1,5 +1,7 @@
 import { GHOST_MANIFEST_SCHEMA_VERSION, GHOST_SLOTS } from '@cindy/plugin-protocol';
 
+import { GHOST_SLOTS as DESKTOP_GHOST_SLOTS } from '../../shared/ghost.js';
+
 const CURRENT_RELEASE_MANIFEST_MARKER = 'currentRelease.manifest';
 const MANIFEST_SCHEMA_REASON_PREFIX = `schemaVersion 必须是 ${GHOST_MANIFEST_SCHEMA_VERSION},得到 `;
 const UNKNOWN_SLOT_REASON_PREFIX = 'slots 含未知卡槽 ';
@@ -79,5 +81,10 @@ export function isPluginHostUnsupportedError(error: unknown): boolean {
     reason.length - UNKNOWN_SLOT_REASON_SUFFIX.length,
   );
   const parsed = parseJsonLiteral(serialized);
-  return parsed.ok && typeof parsed.value === 'string';
+  if (!parsed.ok || typeof parsed.value !== 'string') return false;
+  // `library` 等是当前桌面已知、但 plugin-protocol 白名单尚未纳入的 Desktop-only
+  // slot:协议层把它报成"未知卡槽",但本端 Cindy 已支持它,升级无济于事。这类 slot
+  // 必须落为 manifest invalid(GHOST_FILE_INVALID),不能提示用户升级。
+  if ((DESKTOP_GHOST_SLOTS as readonly string[]).includes(parsed.value)) return false;
+  return true;
 }

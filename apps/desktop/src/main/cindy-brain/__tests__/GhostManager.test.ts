@@ -4675,6 +4675,25 @@ describe('GhostManager · inspect(只验不装)', () => {
     });
     await expectRejection(await manager.inspect(malformed), 'file-invalid');
   });
+
+  it('未知字符串 slot 叠加其它字段畸形时,先报包本身的问题而非提示升级', async () => {
+    // 字符串未知 slot 本可提示"宿主不支持、请升级",但同一清单 tools 字段也畸形——
+    // 必须先完整校验其它字段,返回 file-invalid(tools 错误),不能被升级提示掩盖
+    // (与市场路径 protocolErrors 同一条边界;Codex P2 回归)。
+    const malformed = await makeCindy('unknown-slot-bad-tools.cindy', {
+      ...goodManifest(),
+      slots: ['future-host-capability'],
+      // 声明未知 slot 时不再有 tool 槽,但 tools 仍被显式塞成畸形值。
+      tools: 'not an array',
+    });
+    const result = await manager.inspect(malformed);
+    expect((result as { rejection: { code: string; reason: string } }).rejection.code).toBe(
+      'file-invalid',
+    );
+    expect(
+      (result as { rejection: { reason: string } }).rejection.reason,
+    ).toContain('tools 必须是 1–16 项的数组');
+  });
 });
 
 describe('GhostManager · author / icon(身份卡展示字段)', () => {

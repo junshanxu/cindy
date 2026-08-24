@@ -11,7 +11,6 @@ import {
   GHOST_LOCALE_MAX_BYTES,
   GHOST_ICON_MAX_BYTES,
   GHOST_INSTALL_MANIFEST_MAX_BYTES,
-  GHOST_SLOTS,
   GHOST_MANUAL_ENTRY_FILE,
   GHOST_MANUAL_MD_MAX_BYTES,
   GHOST_SKILL_MD_MAX_BYTES,
@@ -488,29 +487,48 @@ export interface GhostExclusiveMutation {
   uninstall(id: string, options?: GhostUninstallOptions): Promise<UninstallResult>;
 }
 
+/** 校验器在「除未知字符串 slot 外其余字段全合法」时给出的延后诊断前缀。 */
+const UNKNOWN_SLOT_REASON_PREFIX = 'slots 含未知卡槽 ';
+
 /**
  * 区分“包本身坏了”和“包使用了更新版 Cindy 才认识的契约”。
  *
- * 这里只收窄识别两个可证明是 Host 版本差异的形状：未来 schemaVersion，或
- * 字符串形态的未知 capability slot。其它畸形输入仍交给完整 manifest 校验，
- * 不能借友好提示放松安装安全边界。
+ * 必须在完整 `validateGhostManifest` 之后调用:校验器已先于此处拦掉 tools 等
+ * 其它字段畸形,并把字符串未知 slot 的上报延后到所有字段合法之后。这里只识别
+ * 两个可证明是 Host 版本差异的形状:
+ *  1. 未来 schemaVersion(整数且 > 2);
+ *  2. 校验器延后到收尾才报的「字符串未知 capability slot」诊断。
+ * 直接扫描 raw.slots 会在 tools 也畸形时抢先返回升级提示、掩盖包本身的问题,
+ * 故改为消费校验器已经收敛过的 reason。
  */
-export function ghostManifestHostUnsupportedReason(raw: unknown): string | null {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const record = raw as Record<string, unknown>;
-  if (
-    typeof record.schemaVersion === 'number' &&
-    Number.isInteger(record.schemaVersion) &&
-    record.schemaVersion > 2
-  ) {
-    return `插件使用了更新的清单格式(schemaVersion ${record.schemaVersion})`;
+export function ghostManifestHostUnsupportedReason(
+  raw: unknown,
+  reason: string,
+): string | null {
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    const record = raw as Record<string, unknown>;
+    if (
+      typeof record.schemaVersion === 'number' &&
+      Number.isInteger(record.schemaVersion) &&
+      record.schemaVersion > 2
+    ) {
+      return `插件使用了更新的清单格式(schemaVersion ${record.schemaVersion})`;
+    }
   }
-  if (!Array.isArray(record.slots)) return null;
-  const supported = new Set<string>([...GHOST_SLOTS, 'model']);
-  const unknown = [
-    ...new Set(record.slots.filter((slot): slot is string => typeof slot === 'string')),
-  ].filter((slot) => !supported.has(slot));
-  return unknown.length > 0 ? `插件需要当前 Cindy 尚不支持的能力:${unknown.join(' / ')}` : null;
+  // 该 reason 只可能由校验器在「其余字段全合法」的收尾路径产生(见 shared/ghost.ts
+  // 的 unknownStringSlot 延后逻辑),故见到它即可安全归类为宿主不支持。
+  if (reason.startsWith(UNKNOWN_SLOT_REASON_PREFIX)) {
+    const serialized = reason.slice(UNKNOWN_SLOT_REASON_PREFIX.length).split('(可用:', 1)[0];
+    try {
+      const slot = JSON.parse(serialized) as unknown;
+      if (typeof slot === 'string') {
+        return `插件需要当前 Cindy 尚不支持的能力:${slot}`;
+      }
+    } catch {
+      // fall through to null
+    }
+  }
+  return null;
 }
 
 /**
@@ -2640,12 +2658,15 @@ export class GhostManager {
         rejection: { code: 'file-invalid', reason: `${GHOST_MANIFEST_FILE} 不是合法 JSON` },
       };
     }
-    const hostUnsupportedReason = ghostManifestHostUnsupportedReason(manifestRaw);
-    if (hostUnsupportedReason) {
-      return { rejection: { code: 'host-unsupported', reason: hostUnsupportedReason } };
-    }
+    // 先完整校验再分类:校验器已先于 host-unsupported 拦掉 tools 等其它字段畸形,
+    // 并把字符串未知 slot 的上报延后到所有字段合法之后。直接扫 raw.slots 会在
+    // 未知 slot + tools 畸形时抢先返回升级提示、掩盖包本身的问题。
     const v = validateGhostManifest(manifestRaw);
     if (!v.ok) {
+      const hostUnsupportedReason = ghostManifestHostUnsupportedReason(manifestRaw, v.reason);
+      if (hostUnsupportedReason) {
+        return { rejection: { code: 'host-unsupported', reason: hostUnsupportedReason } };
+      }
       return { rejection: { code: 'file-invalid', reason: `清单不合格:${v.reason}` } };
     }
     if (!v.manifest.node && buf.byteLength > MAX_BASIC_CINDY_FILE_BYTES) {

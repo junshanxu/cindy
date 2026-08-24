@@ -182,6 +182,18 @@ describe('Plugin Market IPC error boundary', () => {
       manifestIncompatible: false,
     },
     {
+      label: 'a Desktop-only slot the protocol does not yet whitelist (library)',
+      // 'library' 是当前桌面已知但 plugin-protocol 白名单尚未纳入的 Desktop-only
+      // slot:协议层把它报成"未知卡槽",但本端 Cindy 已支持它,升级无济于事。必须
+      // 落为 GHOST_FILE_INVALID,不能提示用户升级(Codex P2 回归)。
+      response: invalidManifestResponse(GHOST_MANIFEST_SCHEMA_VERSION, {
+        slots: ['library'],
+        tools: undefined,
+      }),
+      hostUnsupported: false,
+      manifestIncompatible: true,
+    },
+    {
       label: 'a duplicated unknown string slot',
       // 同一个未知 slot 出现两次:新 Host 识别后仍会因重复声明而拒包,所以不该
       // 提示升级,应判为包本身无效(GHOST_FILE_INVALID)。

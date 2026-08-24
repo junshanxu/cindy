@@ -1020,6 +1020,39 @@ describe('ghost · 芯片型清单(schemaVersion 2)', () => {
     expect(validateGhostManifest(noPanel).ok).toBe(true);
   });
 
+  it('字符串未知卡槽延后到其余字段校验通过后才报,畸形字段优先', () => {
+    // Desktop 镜像必须与 packages/plugin-protocol 清单校验器同一条边界:
+    // 未知字符串 slot 先记下并跳过,让 tools 等其它字段继续校验。
+    const base = {
+      schemaVersion: 2,
+      id: 'hello-chip',
+      name: 'Hello 芯片',
+      version: '1.0.0',
+      kind: 'chip',
+      entry: 'main.js',
+      slots: ['subscribe'],
+    };
+    // 未知 slot + tools 畸形:必须先报 tools 错误,不能被升级提示掩盖。
+    expect(
+      validateGhostManifest({ ...base, slots: ['future-capability'], tools: 'not an array' }),
+    ).toMatchObject({
+      ok: false,
+      reason: expect.stringContaining('tools 必须是 1–16 项的数组'),
+    });
+    // 除未知 slot 外完全合法:收尾才报未知卡槽(供装入侧映射为宿主不支持)。
+    expect(validateGhostManifest({ ...base, slots: ['future-capability'] })).toMatchObject({
+      ok: false,
+      reason: expect.stringContaining('未知卡槽 "future-capability"'),
+    });
+    // 重复的未知 slot:新 Host 识别后仍会因重复声明拒包,必须判包无效而非升级。
+    expect(
+      validateGhostManifest({ ...base, slots: ['future-capability', 'future-capability'] }),
+    ).toMatchObject({
+      ok: false,
+      reason: expect.stringContaining('重复卡槽'),
+    });
+  });
+
   it('agent 槽默认只允许真人点击；background 是单独的高风险加档', () => {
     const userActionOnly = validateGhostManifest({
       ...goodChipManifest(),
