@@ -295,4 +295,76 @@ describe('goal remote lifecycle fence', () => {
     expect(assertSessionActive).toHaveBeenCalledWith('rs');
     expect(mocks.clearGoal).toHaveBeenCalledWith('rs');
   });
+
+  it('does not fence GOAL_RESUME for a bare sessionId string (old wire shape, primary remote)', async () => {
+    const resumeHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_RESUME)!;
+    await resumeHandler({}, 'rs');
+
+    expect(withSessionLock).not.toHaveBeenCalled();
+    expect(assertSessionActive).not.toHaveBeenCalled();
+    expect(mocks.resumeGoal).toHaveBeenCalledWith('rs');
+  });
+
+  it('fences GOAL_RESUME only when the trailing fenceOpts.requireActiveSession is true', async () => {
+    const resumeHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_RESUME)!;
+    await resumeHandler({}, 'rs', { requireActiveSession: true });
+
+    expect(withSessionLock).toHaveBeenCalledWith('rs', expect.any(Function));
+    expect(assertSessionActive).toHaveBeenCalledWith('rs');
+    expect(mocks.resumeGoal).toHaveBeenCalledWith('rs');
+  });
+
+  it('fences a device-link GOAL_UPDATE only when requireActiveSession is explicitly requested', async () => {
+    mocks.updateGoal.mockResolvedValueOnce({ sessionId: 'rs' });
+    const updateHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_UPDATE)!;
+    await updateHandler({}, {
+      sessionId: 'rs',
+      patch: { objective: 'updated objective' },
+      requireActiveSession: true,
+    });
+
+    expect(withSessionLock).toHaveBeenCalledWith('rs', expect.any(Function));
+    expect(assertSessionActive).toHaveBeenCalledWith('rs');
+    expect(mocks.updateGoal).toHaveBeenCalledWith('rs', { objective: 'updated objective' });
+  });
+
+  it('does not fence a primary remote GOAL_UPDATE without requireActiveSession', async () => {
+    mocks.updateGoal.mockResolvedValueOnce({ sessionId: 'rs' });
+    const updateHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_UPDATE)!;
+    await updateHandler({}, {
+      sessionId: 'rs',
+      patch: { objective: 'updated objective' },
+    });
+
+    expect(withSessionLock).not.toHaveBeenCalled();
+    expect(assertSessionActive).not.toHaveBeenCalled();
+    expect(mocks.updateGoal).toHaveBeenCalledWith('rs', { objective: 'updated objective' });
+  });
+
+  it('blocks GOAL_RESUME for an archived session when the active-session assertion rejects', async () => {
+    assertSessionActive.mockRejectedValueOnce(new Error('session is archived'));
+    const resumeHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_RESUME)!;
+
+    await expect(resumeHandler({}, 'rs', { requireActiveSession: true })).rejects.toThrow(
+      'session is archived',
+    );
+    expect(withSessionLock).toHaveBeenCalledWith('rs', expect.any(Function));
+    expect(mocks.resumeGoal).not.toHaveBeenCalled();
+  });
+
+  it('blocks GOAL_UPDATE for an archived session when the active-session assertion rejects', async () => {
+    assertSessionActive.mockRejectedValueOnce(new Error('session is archived'));
+    mocks.updateGoal.mockResolvedValueOnce({ sessionId: 'rs' });
+    const updateHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_UPDATE)!;
+
+    await expect(
+      updateHandler({}, {
+        sessionId: 'rs',
+        patch: { objective: 'updated objective' },
+        requireActiveSession: true,
+      }),
+    ).rejects.toThrow('session is archived');
+    expect(withSessionLock).toHaveBeenCalledWith('rs', expect.any(Function));
+    expect(mocks.updateGoal).not.toHaveBeenCalled();
+  });
 });

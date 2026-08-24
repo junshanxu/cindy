@@ -214,16 +214,31 @@ export function registerGoalHandlers(
   });
 
   // 恢复 paused/blocked 目标(GoalIndicator ▶ 按钮 / resume-on-open 确认)。
-  // 保留计数继续;终态/active 是 no-op。
-  ipcMain.handle(MAKER_INVOKE.GOAL_RESUME, async (_e, sessionId: unknown) => {
-    const id = requireString(sessionId, 'sessionId');
-    try {
-      await getGoalController()?.resumeGoal(id);
-    } catch (error) {
-      throwGoalControllerIpcError(error);
-    }
-    return { ok: true };
-  });
+  // 保留计数继续;终态/active 是 no-op。第一个参数保持裸 sessionId 字符串的 wire
+  // 形态(append-only 协议兼容;旧被控端 / 本机按钮发裸字符串,按 requireString 解析,
+  // 多余尾参被忽略);副窗口经隧道时在第二参带 { requireActiveSession: true },此时
+  // 才在 device-link 下走 route lock + 持久化 active 复核(与 GOAL_CLEAR 同口径)。
+  // primary remote 不带标记,保留"向已归档任务发命令可恢复任务"的历史语义。
+  ipcMain.handle(
+    MAKER_INVOKE.GOAL_RESUME,
+    async (_e, sessionId: unknown, fenceOpts?: unknown) => {
+      const id = requireString(sessionId, 'sessionId');
+      const requireActiveSession =
+        fenceOpts !== null &&
+        typeof fenceOpts === 'object' &&
+        (fenceOpts as { requireActiveSession?: boolean }).requireActiveSession === true;
+      try {
+        await runWithLifecycleGuard(
+          id,
+          () => getGoalController()?.resumeGoal(id) ?? Promise.resolve(),
+          requireActiveSession,
+        );
+      } catch (error) {
+        throwGoalControllerIpcError(error);
+      }
+      return { ok: true };
+    },
+  );
 
   ipcMain.handle(MAKER_INVOKE.GOAL_UPDATE, async (_e, input: unknown) => {
     const obj = requireObject(input, 'goal');
@@ -239,7 +254,14 @@ export function registerGoalHandlers(
     const controller = getGoalController();
     if (!controller) throwIpcError('INTERNAL', 'goal controller not started');
     try {
-      const updated = await controller.updateGoal(sessionId, patch);
+      // 与 GOAL_SET 同口径:仅 device-link 调用且原始 renderer 显式带
+      // requireActiveSession 时才加 route lock + 持久化 active 复核;主窗口 / primary
+      // remote 不带标记,保留"编辑已归档任务目标可重新激活任务"的历史语义。
+      const updated = await runWithLifecycleGuard(
+        sessionId,
+        () => controller.updateGoal(sessionId, patch),
+        obj.requireActiveSession === true,
+      );
       if (!updated) throwIpcError('GOAL_NOT_FOUND', 'goal not found');
       return { ok: true };
     } catch (err) {
