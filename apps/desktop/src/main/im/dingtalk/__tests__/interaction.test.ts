@@ -82,4 +82,29 @@ describe('dingtalk text interactions', () => {
     });
     expect(requestTextReply).toHaveBeenCalledTimes(2);
   });
+
+  it('uses the migrated interaction remaining timeout', async () => {
+    const requestTextReply = vi.fn(async () => ({
+      kind: 'permission' as const,
+      behavior: 'allow' as const,
+    }));
+    const im = { requestTextReply } as unknown as DingTalkIM;
+    const request = {
+      kind: 'permission' as const,
+      requestId: 'request-timeout',
+      toolName: 'shell_command',
+      input: {},
+    };
+
+    await handleDingTalkTextInteraction(im, 'owner-1', request, { timeoutMs: 1_234 });
+
+    expect(requestTextReply).toHaveBeenCalledWith(
+      'owner-1',
+      expect.any(String),
+      expect.any(Function),
+      expect.any(Number),
+    );
+    expect(requestTextReply.mock.calls[0]?.[3]).toBeLessThanOrEqual(1_234);
+    expect(requestTextReply.mock.calls[0]?.[3]).toBeGreaterThan(0);
+  });
 });

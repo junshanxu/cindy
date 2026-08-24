@@ -55,6 +55,7 @@ export function buildWecomAdapter(
       source: 'wecom',
       wecomConversationId: userId,
     }),
-    handleTextInteraction: (userId, request) => interactions.handle(userId, request),
+    handleTextInteraction: (userId, request, options) =>
+      interactions.handle(userId, request, options),
   };
 }

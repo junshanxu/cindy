@@ -1726,8 +1726,23 @@ export function createTurnRunner(
     // 返回空数组直接跳过。
     if (attached) {
       const taken = takePendingInteractionsForSession(row.id);
-      for (const entry of taken) {
-        void publishMigratedInteraction(entry, userId, row.id, target.scopeKey);
+      if (richIm) {
+        for (const entry of taken) {
+          void publishMigratedInteraction(entry, userId, row.id, target.scopeKey);
+        }
+      } else {
+        // Text-only adapters have a single waiter per user. Preserve the
+        // Desktop permission queue's ordering after takeover instead of
+        // publishing the whole migrated cohort concurrently and replacing or
+        // rejecting every waiter after the first one.
+        void (async () => {
+          for (const entry of taken) {
+            await publishMigratedInteraction(entry, userId, row.id, target.scopeKey);
+          }
+        })().catch((err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.error(`publish migrated text interaction queue failed: ${msg}`);
+        });
       }
       if (taken.length > 0) {
         log.info(

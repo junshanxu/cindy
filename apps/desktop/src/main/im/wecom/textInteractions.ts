@@ -25,7 +25,11 @@ export class WecomTextInteractions {
     });
   }
 
-  async handle(userId: string, request: InteractionRequest): Promise<InteractionDecision> {
+  async handle(
+    userId: string,
+    request: InteractionRequest,
+    options?: { timeoutMs?: number },
+  ): Promise<InteractionDecision> {
     const previous = this.pending.get(userId);
     if (previous) {
       clearTimeout(previous.timer);
@@ -36,10 +40,11 @@ export class WecomTextInteractions {
     const result = new Promise<InteractionDecision>((resolve) => {
       resolvePending = resolve;
     });
+    const timeoutMs = Math.max(1, options?.timeoutMs ?? INTERACTION_TIMEOUT_MS);
     const timer = setTimeout(() => {
       this.pending.delete(userId);
       resolvePending(defaultDecision(request, 'wecom_interaction_timeout'));
-    }, INTERACTION_TIMEOUT_MS);
+    }, timeoutMs);
     timer.unref?.();
     this.pending.set(userId, { request, resolve: resolvePending, timer });
 

@@ -7,12 +7,20 @@ export function handleDingTalkTextInteraction(
   im: DingTalkIM,
   userId: string,
   request: InteractionRequest,
+  options?: { timeoutMs?: number },
 ): Promise<InteractionDecision> {
+  const deadline =
+    options?.timeoutMs !== undefined
+      ? Date.now() + Math.max(1, options.timeoutMs)
+      : undefined;
   if (request.kind === 'ask_user_question') {
-    return answerQuestions(im, userId, request);
+    return answerQuestions(im, userId, request, deadline);
   }
-  return im.requestTextReply(userId, formatInteractionPrompt(request), (text) =>
-    parseInteractionReply(request, text),
+  return im.requestTextReply(
+    userId,
+    formatInteractionPrompt(request),
+    (text) => parseInteractionReply(request, text),
+    remainingTimeoutMs(deadline),
   );
 }
 
@@ -20,6 +28,7 @@ async function answerQuestions(
   im: DingTalkIM,
   userId: string,
   request: Extract<InteractionRequest, { kind: 'ask_user_question' }>,
+  deadline?: number,
 ): Promise<InteractionDecision> {
   const answers: Record<string, string> = {};
   for (const [index, question] of request.questions.entries()) {
@@ -27,9 +36,14 @@ async function answerQuestions(
       userId,
       formatQuestionPrompt(question, index, request.questions.length),
       (text) => parseQuestionAnswer(question, text),
+      remainingTimeoutMs(deadline),
     );
   }
   return { kind: 'ask_user_question', answers };
+}
+
+function remainingTimeoutMs(deadline: number | undefined): number | undefined {
+  return deadline === undefined ? undefined : Math.max(1, deadline - Date.now());
 }
 
 function formatInteractionPrompt(request: InteractionRequest): string {

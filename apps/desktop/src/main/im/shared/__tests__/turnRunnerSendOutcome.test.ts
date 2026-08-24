@@ -753,6 +753,77 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
     });
   });
 
+  it('publishes migrated text-only interactions sequentially', async () => {
+    const h = setupAttachedSession(async () => ({ accepted: true }));
+    const firstDecision = deferred<InteractionDecision>();
+    const secondDecision = deferred<InteractionDecision>();
+    const handleTextInteraction = vi
+      .fn<ImChannelAdapter['handleTextInteraction']>()
+      .mockImplementationOnce(async () => firstDecision.promise)
+      .mockImplementationOnce(async () => secondDecision.promise);
+    const resolveFirst = vi.fn();
+    const resolveSecond = vi.fn();
+    const expiresAt = Date.now() + 30_000;
+    mocks.takePendingInteractionsForSession.mockReturnValue([
+      {
+        requestId: 'migrated-1',
+        request: {
+          kind: 'permission',
+          requestId: 'migrated-1',
+          toolName: 'bash',
+          input: { command: 'first' },
+        },
+        resolve: resolveFirst,
+        expiresAt,
+      },
+      {
+        requestId: 'migrated-2',
+        request: {
+          kind: 'permission',
+          requestId: 'migrated-2',
+          toolName: 'bash',
+          input: { command: 'second' },
+        },
+        resolve: resolveSecond,
+        expiresAt,
+      },
+    ]);
+    const textAdapter: ImChannelAdapter = {
+      ...fakeAdapter,
+      channel: 'wecom',
+      output: {
+        kind: 'chunked-text',
+        im: mocks.feishuIm as unknown as ChannelIM,
+        commitFinal: vi.fn(async () => undefined),
+      },
+      handleTextInteraction,
+    };
+    const localRunner = createTurnRunner(textAdapter, fakeRepo, fakeCards);
+
+    try {
+      await localRunner.runAgentTurn({
+        botContextId: 'cli_test_bot',
+        userId: 'ou_user',
+        userMessageId: 'msg-migrated-queue',
+        text: 'take over',
+        attachments: [],
+      });
+      await waitForAssertion(() => expect(handleTextInteraction).toHaveBeenCalledOnce());
+      expect(handleTextInteraction.mock.calls[0]?.[1].requestId).toBe('migrated-1');
+
+      firstDecision.resolve({ kind: 'permission', behavior: 'allow' });
+      await waitForAssertion(() => expect(handleTextInteraction).toHaveBeenCalledTimes(2));
+      expect(resolveFirst).toHaveBeenCalledWith({ kind: 'permission', behavior: 'allow' });
+      expect(handleTextInteraction.mock.calls[1]?.[1].requestId).toBe('migrated-2');
+
+      secondDecision.resolve({ kind: 'permission', behavior: 'deny', reason: 'user_denied' });
+      await waitForAssertion(() => expect(resolveSecond).toHaveBeenCalledOnce());
+    } finally {
+      h.emit({ type: 'done', data: {} });
+      await localRunner.disposeAllSessions();
+    }
+  });
+
   it('keeps channel-native IM turns on their existing non-marker path', async () => {
     const h = setupSession(async () => ({ accepted: true }));
 
