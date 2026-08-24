@@ -925,6 +925,73 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
     }
   });
 
+  it('settles a migrated rich card with a safe deny when the session is disposed', async () => {
+    const h = setupAttachedSession(async () => ({ accepted: true }));
+    const resolve = vi.fn();
+    mocks.takePendingInteractionsForSession.mockReturnValue([
+      {
+        requestId: 'migrated-rich-cleanup',
+        request: {
+          kind: 'permission',
+          requestId: 'migrated-rich-cleanup',
+          toolName: 'bash',
+          input: { command: 'pnpm build' },
+        },
+        resolve,
+      },
+    ]);
+    mocks.buildPermissionCard.mockReturnValue({
+      title: 'Permission',
+      body: 'Allow?',
+      buttons: [],
+    });
+    mocks.feishuIm.sendInteractiveCard.mockResolvedValue({ messageId: 'migrated-rich-card' });
+    // Mirror the real pendingInteractions table: capture the resolve fn handed
+    // to registerPendingExternal and have cancelPending invoke it with a deny.
+    let registeredResolve: ((decision: InteractionDecision) => void) | null = null;
+    mocks.registerPendingExternal.mockImplementation(
+      (_requestId, _kind, _messageId, resolveFn: (decision: InteractionDecision) => void) => {
+        registeredResolve = resolveFn;
+      },
+    );
+    (mocks.cancelPending as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      (requestId: string, reason: string) => {
+        if (requestId !== 'migrated-rich-cleanup' || !registeredResolve) return null;
+        registeredResolve({ kind: 'permission', behavior: 'deny', reason });
+        return { messageId: 'migrated-rich-card' };
+      },
+    );
+    const localRunner = createTurnRunner(fakeAdapter, fakeRepo, fakeCards);
+
+    try {
+      await localRunner.runAgentTurn({
+        botContextId: 'cli_test_bot',
+        userId: 'ou_user',
+        userMessageId: 'msg-migrated-rich-cleanup',
+        text: 'take over',
+        attachments: [],
+      });
+      await waitForAssertion(() => expect(mocks.registerPendingExternal).toHaveBeenCalledOnce());
+      expect(resolve).not.toHaveBeenCalled();
+
+      await localRunner.disposeAllSessions();
+
+      await waitForAssertion(() => expect(resolve).toHaveBeenCalledOnce());
+      expect(resolve).toHaveBeenCalledWith({
+        kind: 'permission',
+        behavior: 'deny',
+        reason: 'session_cleanup',
+      });
+      expect(mocks.cancelPending).toHaveBeenCalledWith(
+        'migrated-rich-cleanup',
+        'session_cleanup',
+      );
+    } finally {
+      h.emit({ type: 'done', data: {} });
+      await localRunner.disposeAllSessions();
+    }
+  });
+
   it('keeps channel-native IM turns on their existing non-marker path', async () => {
     const h = setupSession(async () => ({ accepted: true }));
 
