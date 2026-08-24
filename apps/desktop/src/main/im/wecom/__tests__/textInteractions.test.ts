@@ -223,3 +223,63 @@ describe('wecom text interaction timeout', () => {
     expect(handle).toHaveBeenCalledWith('owner', request, { timeoutMs: 2_000 });
   });
 });
+
+describe('WecomTextInteractions.cancel (migrated cleanup)', () => {
+  function makeInteractions() {
+    const sendMarkdownText = vi.fn(async () => ({ messageId: 'message-1' }));
+    const im = {
+      onTextMessageIntercept: vi.fn(() => () => undefined),
+      onStatusChange: vi.fn(() => () => undefined),
+      sendMarkdownText,
+      sendText: vi.fn(),
+    } as unknown as WecomIM;
+    return { interactions: new WecomTextInteractions(im), sendMarkdownText };
+  }
+
+  it('resolves only the matching requestId and reports ownership', async () => {
+    const { interactions, sendMarkdownText } = makeInteractions();
+    const result = interactions.handle(
+      'owner',
+      permissionRequest({ command: 'pnpm test' }, { requestId: 'req-1' }),
+    );
+    await vi.waitFor(() => expect(sendMarkdownText).toHaveBeenCalledOnce());
+
+    // Wrong requestId / user → not handled, promise stays pending.
+    expect(
+      interactions.cancel('owner', 'req-other', {
+        kind: 'permission',
+        behavior: 'deny',
+        reason: 'session_cleanup',
+      }),
+    ).toBe(false);
+
+    expect(
+      interactions.cancel('owner', 'req-1', {
+        kind: 'permission',
+        behavior: 'deny',
+        reason: 'session_cleanup',
+      }),
+    ).toBe(true);
+    await expect(result).resolves.toEqual({
+      kind: 'permission',
+      behavior: 'deny',
+      reason: 'session_cleanup',
+    });
+  });
+
+  it('adapter forwards cancelTextInteraction to interactions.cancel', async () => {
+    const cancel = vi.fn(() => true);
+    const adapter = buildWecomAdapter(
+      {} as WecomIM,
+      { handle: vi.fn(), cancel } as unknown as WecomTextInteractions,
+      {
+        agentKind: 'claude-code',
+        defaultModel: 'claude-opus-4-7',
+        defaultPermissionMode: 'auto',
+      },
+    );
+    const decision = { kind: 'permission' as const, behavior: 'deny' as const, reason: 'x' };
+    expect(adapter.cancelTextInteraction?.('owner', 'req-1', decision)).toBe(true);
+    expect(cancel).toHaveBeenCalledWith('owner', 'req-1', decision);
+  });
+});

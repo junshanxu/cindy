@@ -992,6 +992,156 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
     }
   });
 
+  it('settles a migrated rich card with a safe deny when the active turn is stopped', async () => {
+    const h = setupAttachedSession(async () => ({ accepted: true }));
+    const resolve = vi.fn();
+    mocks.takePendingInteractionsForSession.mockReturnValue([
+      {
+        requestId: 'migrated-rich-stop',
+        request: {
+          kind: 'permission',
+          requestId: 'migrated-rich-stop',
+          toolName: 'bash',
+          input: { command: 'pnpm build' },
+        },
+        resolve,
+      },
+    ]);
+    mocks.buildPermissionCard.mockReturnValue({
+      title: 'Permission',
+      body: 'Allow?',
+      buttons: [],
+    });
+    mocks.feishuIm.sendInteractiveCard.mockResolvedValue({ messageId: 'migrated-stop-card' });
+    mocks.registerPendingExternal.mockImplementation(
+      (_requestId, _kind, _messageId, resolveFn: (decision: InteractionDecision) => void) => {
+        (mocks.cancelPending as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+          (requestId: string, reason: string) => {
+            if (requestId !== 'migrated-rich-stop') return null;
+            resolveFn({ kind: 'permission', behavior: 'deny', reason });
+            return { messageId: 'migrated-stop-card' };
+          },
+        );
+      },
+    );
+    const localRunner = createTurnRunner(fakeAdapter, fakeRepo, fakeCards);
+
+    try {
+      await localRunner.runAgentTurn({
+        botContextId: 'cli_test_bot',
+        userId: 'ou_user',
+        userMessageId: 'msg-migrated-rich-stop',
+        text: 'take over',
+        attachments: [],
+      });
+      await waitForAssertion(() => expect(mocks.registerPendingExternal).toHaveBeenCalledOnce());
+      expect(resolve).not.toHaveBeenCalled();
+
+      // The desktop turn is still awaiting the migrated permission, so !stop
+      // must deny it instead of waiting for its 10-minute timeout.
+      h.isTurnRunning.mockReturnValue(true);
+      const result = await localRunner.stopActiveTurn({
+        botContextId: 'cli_test_bot',
+        userId: 'ou_user',
+      });
+      expect(result.stopped).toBe(true);
+
+      await waitForAssertion(() => expect(resolve).toHaveBeenCalledOnce());
+      expect(resolve).toHaveBeenCalledWith({
+        kind: 'permission',
+        behavior: 'deny',
+        reason: 'session_cleanup',
+      });
+      expect(mocks.cancelPending).toHaveBeenCalledWith(
+        'migrated-rich-stop',
+        'session_cleanup',
+      );
+    } finally {
+      h.emit({ type: 'done', data: {} });
+      await localRunner.disposeAllSessions();
+    }
+  });
+
+  it('keeps migrated card ownership across detach and settles it on later session close', async () => {
+    const h = setupAttachedSession(async () => ({ accepted: true }));
+    const resolve = vi.fn();
+    mocks.takePendingInteractionsForSession.mockReturnValue([
+      {
+        requestId: 'migrated-rich-detach',
+        request: {
+          kind: 'permission',
+          requestId: 'migrated-rich-detach',
+          toolName: 'bash',
+          input: { command: 'pnpm build' },
+        },
+        resolve,
+      },
+    ]);
+    mocks.buildPermissionCard.mockReturnValue({
+      title: 'Permission',
+      body: 'Allow?',
+      buttons: [],
+    });
+    mocks.feishuIm.sendInteractiveCard.mockResolvedValue({ messageId: 'migrated-detach-card' });
+    let registeredResolve: ((decision: InteractionDecision) => void) | null = null;
+    mocks.registerPendingExternal.mockImplementation(
+      (_requestId, _kind, _messageId, resolveFn: (decision: InteractionDecision) => void) => {
+        registeredResolve = resolveFn;
+      },
+    );
+    (mocks.cancelPending as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      (requestId: string, reason: string) => {
+        if (requestId !== 'migrated-rich-detach' || !registeredResolve) return null;
+        registeredResolve({ kind: 'permission', behavior: 'deny', reason });
+        return { messageId: 'migrated-detach-card' };
+      },
+    );
+    const localRunner = createTurnRunner(fakeAdapter, fakeRepo, fakeCards);
+
+    try {
+      await localRunner.runAgentTurn({
+        botContextId: 'cli_test_bot',
+        userId: 'ou_user',
+        userMessageId: 'msg-migrated-rich-detach',
+        text: 'take over',
+        attachments: [],
+      });
+      await waitForAssertion(() => expect(mocks.registerPendingExternal).toHaveBeenCalledOnce());
+
+      // Detach rewires listeners but must NOT deny a card the user can still
+      // click through cardActionHandler.
+      localRunner.detachFromSession('desktop-attached-session');
+      await flushMicrotasks();
+      expect(mocks.cancelPending).not.toHaveBeenCalledWith(
+        'migrated-rich-detach',
+        'session_cleanup',
+      );
+      expect(resolve).not.toHaveBeenCalled();
+
+      // Later, the maker session closes (app quit / agent switch). Ownership
+      // survived detach, so the forgotten-session path still settles it.
+      emitMakerEvent({
+        type: 'session:closed',
+        sessionId: 'desktop-attached-session',
+        session: h.session,
+        reason: 'user-requested',
+      } as unknown as MakerEvent);
+      await waitForAssertion(() => expect(resolve).toHaveBeenCalledOnce());
+      expect(resolve).toHaveBeenCalledWith({
+        kind: 'permission',
+        behavior: 'deny',
+        reason: 'session_cleanup',
+      });
+      expect(mocks.cancelPending).toHaveBeenCalledWith(
+        'migrated-rich-detach',
+        'session_cleanup',
+      );
+    } finally {
+      h.emit({ type: 'done', data: {} });
+      await localRunner.disposeAllSessions();
+    }
+  });
+
   it('keeps channel-native IM turns on their existing non-marker path', async () => {
     const h = setupSession(async () => ({ accepted: true }));
 

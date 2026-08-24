@@ -71,6 +71,25 @@ export class WecomTextInteractions {
     this.pending.clear();
   }
 
+  /**
+   * Resolve only the exact pending request owned by the central interaction
+   * route (session cleanup / !stop). Request-id matching prevents a late
+   * cancellation from settling a newer one-shot confirmation for the same peer.
+   * Returns true when this class owned and settled the waiter.
+   */
+  cancel(
+    userId: string,
+    requestId: string,
+    decision: InteractionDecision,
+  ): boolean {
+    const pending = this.pending.get(userId);
+    if (!pending || pending.request.requestId !== requestId) return false;
+    clearTimeout(pending.timer);
+    this.pending.delete(userId);
+    pending.resolve(decision);
+    return true;
+  }
+
   private consume(event: IMMessageEvent): boolean {
     const pending = this.pending.get(event.senderId);
     if (!pending) return false;
