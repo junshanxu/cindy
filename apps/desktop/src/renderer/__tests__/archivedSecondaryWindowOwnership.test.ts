@@ -34,7 +34,7 @@ const makerChatStoreSource = readFileSync(
 const registerSource = readFileSync(
   resolve(__dirname, '..', '..', 'main', 'maker-ipc', 'register.ts'),
   'utf8',
-);
+).replace(/\r\n/g, '\n');
 const makerSendTransactionSource = readFileSync(
   resolve(__dirname, '..', '..', 'main', 'maker-ipc', 'makerSendTransaction.ts'),
   'utf8',
@@ -347,5 +347,31 @@ describe('archived secondary-window ownership', () => {
     );
     expect(registerSource).toContain('delete normalized.requireActiveSession;');
     expect(enqueueBody).toContain('{ requireActiveSession: true }');
+  });
+
+  it('fences desktop slash-command effects before their Main dispatch boundary', () => {
+    const helperStart = sessionViewSource.indexOf('const maybeDispatchDesktopSlashCommand = useCallback(');
+    const helperEnd = sessionViewSource.indexOf('const handleWorkingDirChange = useCallback(', helperStart);
+    const helperBody = sessionViewSource.slice(helperStart, helperEnd);
+    const reviewFence = helperBody.indexOf(
+      'await options.beforeDesktopDispatch()',
+      helperBody.indexOf("hit.name === 'review'"),
+    );
+    const reviewDispatch = helperBody.indexOf('window.electronAPI.maker.startReview', reviewFence);
+    const commandFence = helperBody.indexOf('await options.beforeDesktopDispatch()', reviewDispatch);
+    const commandDispatch = helperBody.indexOf('await dispatchCommand(hit, {', commandFence);
+    const mainFence = registerSource.indexOf('await assertSessionActiveForManualDispatch(c.sessionId);');
+    const mainDispatch = registerSource.indexOf('getDesktopCommandRegistry().execute(name, c);', mainFence);
+
+    expect(reviewFence).toBeGreaterThan(-1);
+    expect(reviewDispatch).toBeGreaterThan(reviewFence);
+    expect(commandFence).toBeGreaterThan(reviewDispatch);
+    expect(commandDispatch).toBeGreaterThan(commandFence);
+    expect(mainFence).toBeGreaterThan(-1);
+    expect(mainDispatch).toBeGreaterThan(mainFence);
+    expect(sessionViewSource).toContain(
+      'beforeDesktopDispatch: allowArchivedSecondaryWindowEnqueue',
+    );
+    expect(helperBody).toContain('requireActiveSession: true');
   });
 });

@@ -3053,6 +3053,8 @@ export function CCAgentSessionView({
         piRuntimeRetryDelaysMs?: readonly number[];
         workingDirOverride?: string;
         preparePiRuntime?: () => Promise<void>;
+        /** Recheck the owning window's lifecycle immediately before side effects. */
+        beforeDesktopDispatch?: () => Promise<boolean>;
       },
     ): Promise<{ handled: boolean; accepted: boolean; message: string }> => {
       const slashMatch = message.match(/^\/(\S+)(?:\s+(.*))?$/s);
@@ -3124,6 +3126,9 @@ export function CCAgentSessionView({
           return { handled: true, accepted: false, message };
         }
         const attachments = files?.length ? serializeAttachedFiles(files) : undefined;
+        if (options?.beforeDesktopDispatch && !(await options.beforeDesktopDispatch())) {
+          return { handled: true, accepted: false, message };
+        }
         try {
           await window.electronAPI.maker.startReview({
             sourceSessionId: sessionId,
@@ -3143,6 +3148,9 @@ export function CCAgentSessionView({
           return { handled: true, accepted: false, message };
         }
       }
+      if (options?.beforeDesktopDispatch && !(await options.beforeDesktopDispatch())) {
+        return { handled: true, accepted: false, message };
+      }
       // 仅 /issue 需要携带附件:snapshot 到 ref,DESKTOP_COMMAND_TRIGGERED 回流时消费。
       // 其它 desktop 命令(/help /clear /cmd ...)不涉及附件,不写 ref。
       if (hit.name === 'issue') {
@@ -3152,15 +3160,17 @@ export function CCAgentSessionView({
       // 经隧道路由到被控端执行(纯 UI 命令忽略该字段)。用视图的粘滞 remoteDeviceId
       // 而非现读快照:origin 注入 / 重连窗口内快照为 undefined,会误走本机路径
       // (/cmd 拿被控端路径本机 spawn、/goal /learn 在本机产生副作用;Codex review #548)。
-      void dispatchCommand(hit, {
+      await dispatchCommand(hit, {
         ...(sessionId ? { sessionId } : {}),
         ...(workingDir ? { workingDir } : {}),
         ...(args ? { args } : {}),
         ...(remoteDeviceId ? { deviceId: remoteDeviceId } : {}),
+        ...(!remoteDeviceId && isSecondaryWindow() ? { requireActiveSession: true } : {}),
       });
       return { handled: true, accepted: true, message };
     },
     [
+      allowArchivedSecondaryWindowEnqueue,
       getHelpCommandsSnapshot,
       isRemoteSession,
       session?.agentKind,
@@ -3192,6 +3202,7 @@ export function CCAgentSessionView({
             pending.files,
             {
               allowDesktopDispatch: pending.deliveryMode !== 'steer',
+              beforeDesktopDispatch: allowArchivedSecondaryWindowEnqueue,
               piRuntimeRetryDelaysMs: PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
               workingDirOverride: newDir,
               preparePiRuntime: async () => {
@@ -3459,9 +3470,11 @@ export function CCAgentSessionView({
         deliveryMode === 'steer'
           ? await maybeDispatchDesktopSlashCommand(message, files, {
               allowDesktopDispatch: false,
+              beforeDesktopDispatch: allowArchivedSecondaryWindowEnqueue,
               piRuntimeRetryDelaysMs: PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
             })
           : await maybeDispatchDesktopSlashCommand(message, files, {
+              beforeDesktopDispatch: allowArchivedSecondaryWindowEnqueue,
               piRuntimeRetryDelaysMs: PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
             });
       if (isArchivedSecondaryWindowInputBlocked()) return false;
@@ -4162,6 +4175,7 @@ export function CCAgentSessionView({
         // resolve false / 抛错都保留(见该函数注释)。
         let pendingText = pending.text;
         const slashDispatch = await maybeDispatchDesktopSlashCommand(pending.text, pending.files, {
+          beforeDesktopDispatch: allowArchivedSecondaryWindowEnqueue,
           piRuntimeRetryDelaysMs: PI_RUNTIME_SKILL_RETRY_DELAYS_MS,
         });
         pendingText = slashDispatch.message;

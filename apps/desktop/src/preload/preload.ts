@@ -5772,7 +5772,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     executeDesktopCommand: (
       name: string,
       // deviceId:device-link 远程会话的归属设备(main 侧 /goal /learn /cmd 据此隧道路由)。
-      ctx: { sessionId?: string; workingDir?: string; args?: string; deviceId?: string },
+      ctx: {
+        sessionId?: string;
+        workingDir?: string;
+        args?: string;
+        deviceId?: string;
+        requireActiveSession?: boolean;
+      },
     ): Promise<{ success: boolean; error?: string }> =>
       ipcRenderer.invoke('maker:execute-desktop-command', name, ctx),
 

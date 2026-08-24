@@ -466,6 +466,8 @@ export interface DispatchContext {
   /** device-link 远程会话的归属设备 id(本机会话缺省)。main 侧 /goal /learn /cmd
    *  据此把业务体经隧道路由到被控端执行。 */
   deviceId?: string;
+  /** Require Main to verify that a local session remains active before dispatch. */
+  requireActiveSession?: boolean;
 }
 
 /**
@@ -490,6 +492,7 @@ export async function dispatchCommand(
         ...(ctx.workingDir ? { workingDir: ctx.workingDir } : {}),
         ...(ctx.args ? { args: ctx.args } : {}),
         ...(ctx.deviceId ? { deviceId: ctx.deviceId } : {}),
+        ...(ctx.requireActiveSession ? { requireActiveSession: true } : {}),
       });
     } catch (err) {
       log.warn(

@@ -45,6 +45,12 @@ export interface DesktopCommandContext {
    * channel,权威校验在被控端三道 gate(remoteControlEnabled + 撤销黑名单 + allowlist)。
    */
   deviceId?: string;
+  /**
+   * Secondary windows set this for a local task command. It asks the Main
+   * process to reject dispatch when the task was archived after renderer-side
+   * command reconciliation; it never grants access on its own.
+   */
+  requireActiveSession?: boolean;
 }
 
 /**

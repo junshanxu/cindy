@@ -5197,7 +5197,13 @@ interface ElectronAPI {
 
     executeDesktopCommand: (
       name: string,
-      ctx: { sessionId?: string; workingDir?: string; args?: string; deviceId?: string },
+      ctx: {
+        sessionId?: string;
+        workingDir?: string;
+        args?: string;
+        deviceId?: string;
+        requireActiveSession?: boolean;
+      },
     ) => Promise<{ success: boolean; error?: string }>;
 
     startReview: (input: {

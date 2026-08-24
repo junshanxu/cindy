@@ -7360,12 +7360,25 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   });
 
   ipcMain.handle(MAKER_INVOKE.EXECUTE_DESKTOP_COMMAND, async (e, name: unknown, ctx: unknown) => {
+    assertTrustedAppRendererEvent(e);
     if (typeof name !== 'string' || name.length === 0) {
       throwIpcError('INVALID_PARAMS', 'name required');
     }
     // senderWebContentsId 由 main 从 event.sender 填入(覆盖 renderer 传入的任何值),
     // 供需要"只回发起窗口"的命令(/issue)做定向 send。
-    const c = { ...((ctx ?? {}) as DesktopCommandContext), senderWebContentsId: e.sender.id };
+    const rawContext = ctx !== null && typeof ctx === 'object' && !Array.isArray(ctx)
+      ? (ctx as DesktopCommandContext)
+      : {};
+    const c = {
+      ...rawContext,
+      senderWebContentsId: e.sender.id,
+    };
+    if (c.requireActiveSession === true) {
+      if (typeof c.sessionId !== 'string' || c.sessionId.length === 0) {
+        throwIpcError('INVALID_PARAMS', 'sessionId required when requireActiveSession is true');
+      }
+      await assertSessionActiveForManualDispatch(c.sessionId);
+    }
     await getDesktopCommandRegistry().execute(name, c);
   });
 
