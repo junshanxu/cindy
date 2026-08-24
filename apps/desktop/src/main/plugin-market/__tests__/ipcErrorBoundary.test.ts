@@ -194,6 +194,41 @@ describe('Plugin Market IPC error boundary', () => {
       manifestIncompatible: true,
     },
     {
+      label: 'a future slot preceding a Desktop-only slot (library) is not masked',
+      // 顺序相反的回归(Codex P1):校验器过去只保留第一个未知字符串 slot,若普通未来
+      // 能力排在 'library' 之前,分类器只看到前者就会误判"宿主不支持、请升级",
+      // 掩盖了本端已知、升级无济于事的 Desktop-only slot。任一 slot 命中本端已知
+      // 集合就必须落为 GHOST_FILE_INVALID。
+      response: invalidManifestResponse(GHOST_MANIFEST_SCHEMA_VERSION, {
+        slots: ['future-capability', 'library'],
+        tools: undefined,
+      }),
+      hostUnsupported: false,
+      manifestIncompatible: true,
+    },
+    {
+      label: 'a Desktop-only slot (library) preceding a future slot is not masked',
+      // 反向顺序同样必须正确:无论 library 排在前面还是后面,只要存在本端已知 slot,
+      // 就不能提示升级。
+      response: invalidManifestResponse(GHOST_MANIFEST_SCHEMA_VERSION, {
+        slots: ['library', 'future-capability'],
+        tools: undefined,
+      }),
+      hostUnsupported: false,
+      manifestIncompatible: true,
+    },
+    {
+      label: 'multiple distinct unknown slots all unknown to this Host',
+      // 多个不同的、本端确实不认识的未来能力:诊断序列化为 JSON 数组,分类器必须识别
+      // 全部为 genuine future 能力并提示升级,不能因为是数组形状就漏判。
+      response: invalidManifestResponse(GHOST_MANIFEST_SCHEMA_VERSION, {
+        slots: ['future-capability', 'another-future'],
+        tools: undefined,
+      }),
+      hostUnsupported: true,
+      manifestIncompatible: false,
+    },
+    {
       label: 'a duplicated unknown string slot',
       // 同一个未知 slot 出现两次:新 Host 识别后仍会因重复声明而拒包,所以不该
       // 提示升级,应判为包本身无效(GHOST_FILE_INVALID)。

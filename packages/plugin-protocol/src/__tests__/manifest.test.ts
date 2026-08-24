@@ -967,6 +967,39 @@ describe('Ghost manifest contract', () => {
     });
   });
 
+  it('preserves every unknown string slot instead of keeping only the first', () => {
+    // 多个未知字符串 slot 时不能只留第一个:后面可能跟着市场协议白名单尚未纳入的
+    // Desktop-only slot(如 'library'),只留第一个会让桌面端把包无效误判成宿主不支持。
+    // 单 slot 诊断形状保持不变(`"<slot>"`);多 slot 序列化为 JSON 数组。
+    expect(
+      validateGhostManifest({
+        ...validManifest,
+        slots: ['future-capability', 'another-future'],
+        tools: undefined,
+      }),
+    ).toMatchObject({
+      ok: false,
+      reason: 'slots 含未知卡槽 ["future-capability","another-future"](可用:'
+        + `${GHOST_SLOTS.join(' / ')})`,
+    });
+  });
+
+  it('does not let an earlier ordinary unknown slot mask a later Desktop-only slot', () => {
+    // 顺序相反:普通未来能力排在 Desktop-only 'library' 之前。诊断必须同时携带两者,
+    // 桌面端分类器才能见到 'library' 并判包无效,而不是只看到前者提示升级。
+    expect(
+      validateGhostManifest({
+        ...validManifest,
+        slots: ['future-capability', 'library'],
+        tools: undefined,
+      }),
+    ).toMatchObject({
+      ok: false,
+      reason: 'slots 含未知卡槽 ["future-capability","library"](可用:'
+        + `${GHOST_SLOTS.join(' / ')})`,
+    });
+  });
+
   it('enforces node slot / detail pairing and entry discipline', () => {
     const base = {
       ...validManifest,

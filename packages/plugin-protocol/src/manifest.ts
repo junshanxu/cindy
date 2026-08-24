@@ -1441,7 +1441,10 @@ export function validateGhostManifest(raw: unknown): ManifestValidation {
   // (数字/null 等)是形状畸形,立即判包无效。字符串未知项先记下并跳过,让其余字段
   // 继续校验——只有除此之外清单完全合法时才在收尾处报"宿主不支持",避免 tools
   // 等其它字段也有错误时被升级提示掩盖(包本身坏了,不该让用户去升级 Cindy)。
-  let unknownStringSlot: string | null = null;
+  // 必须保留全部未知 slot 而非只留第一个:其中任一可能是市场协议白名单尚未纳入的
+  // Desktop-only slot(如 'library'),被前面的普通未知 slot 掩盖会让桌面端把
+  // 「包无效」误判成「宿主不支持、请升级」。
+  const unknownStringSlots: string[] = [];
   // 未知字符串 slot 也要查重:['future','future'] 不是「升级就能用」——新 Host 识别
   // 该 slot 后,同一校验器会因重复声明而拒包,所以重复值必须归为包无效而非宿主不支持。
   const seenUnknownStringSlots = new Set<string>();
@@ -1454,7 +1457,7 @@ export function validateGhostManifest(raw: unknown): ManifestValidation {
           return { ok: false, reason: `slots 含重复卡槽 ${JSON.stringify(s)}` };
         }
         seenUnknownStringSlots.add(s);
-        unknownStringSlot ??= s;
+        unknownStringSlots.push(s);
         continue;
       }
       return {
@@ -3449,10 +3452,18 @@ export function validateGhostManifest(raw: unknown): ManifestValidation {
 
   // 走到这里说明除字符串未知卡槽外的所有字段都合法:此时才报告"宿主不支持",
   // 给桌面端升级指引。若其它字段也有错误,上面早已返回具体的包无效原因。
-  if (unknownStringSlot !== null) {
+  // 单个未知 slot 时逐字沿用历史诊断形状(`"<slot>"`),桌面端分类器按单值解析;
+  // 多个未知 slot 时序列化为 JSON 数组(`["<a>","<b>"]`),桌面端必须逐一分流——
+  // 其中只要有一个 Desktop-only slot(本端已知、协议白名单未纳入),就应判包无效
+  // 而非提示升级,不能让排在前面的普通未知 slot 把它掩盖掉。
+  if (unknownStringSlots.length > 0) {
+    const slotLiteral =
+      unknownStringSlots.length === 1
+        ? JSON.stringify(unknownStringSlots[0])
+        : JSON.stringify(unknownStringSlots);
     return {
       ok: false,
-      reason: `slots 含未知卡槽 ${JSON.stringify(unknownStringSlot)}(可用:${GHOST_SLOTS.join(' / ')})`,
+      reason: `slots 含未知卡槽 ${slotLiteral}(可用:${GHOST_SLOTS.join(' / ')})`,
     };
   }
 

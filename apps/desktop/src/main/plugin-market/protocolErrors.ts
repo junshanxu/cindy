@@ -81,10 +81,20 @@ export function isPluginHostUnsupportedError(error: unknown): boolean {
     reason.length - UNKNOWN_SLOT_REASON_SUFFIX.length,
   );
   const parsed = parseJsonLiteral(serialized);
-  if (!parsed.ok || typeof parsed.value !== 'string') return false;
-  // `library` 等是当前桌面已知、但 plugin-protocol 白名单尚未纳入的 Desktop-only
-  // slot:协议层把它报成"未知卡槽",但本端 Cindy 已支持它,升级无济于事。这类 slot
-  // 必须落为 manifest invalid(GHOST_FILE_INVALID),不能提示用户升级。
-  if ((DESKTOP_GHOST_SLOTS as readonly string[]).includes(parsed.value)) return false;
-  return true;
+  if (!parsed.ok) return false;
+  // 校验器对单个未知 slot 输出 JSON 字符串(`"<slot>"`),对多个未知 slot 输出 JSON
+  // 字符串数组(`["<a>","<b>"]`)。逐一分流:其中任一 slot 是本端已知但市场协议
+  // 白名单尚未纳入的 Desktop-only slot(如 `library`),都必须落为 manifest invalid
+  // (GHOST_FILE_INVALID)——升级 Cindy 无济于事,不能让排在前面的普通未知 slot 把
+  // 它掩盖成"宿主不支持、请升级"。只有全部 slot 都是本端确实不认识的未来能力时,
+  // 才提示升级。
+  const unknownSlots = Array.isArray(parsed.value)
+    ? parsed.value
+    : typeof parsed.value === 'string'
+      ? [parsed.value]
+      : [];
+  if (unknownSlots.length === 0 || !unknownSlots.every((slot) => typeof slot === 'string')) {
+    return false;
+  }
+  return !unknownSlots.some((slot) => (DESKTOP_GHOST_SLOTS as readonly string[]).includes(slot));
 }
