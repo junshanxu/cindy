@@ -4668,6 +4668,24 @@ describe('GhostManager · inspect(只验不装)', () => {
     await expectRejection(await manager.inspect(futureCapability), 'host-unsupported');
   });
 
+  it('未知字符串 slot 名内含 "(可用:" 时仍正确归类为 host-unsupported', async () => {
+    // 回归:旧实现用 split("(可用:", 1) 反解析 slot 名,slot 名自身含该文本会
+    // 截断 JSON 导致 parse 失败,把该升级的包误判为 file-invalid。后缀必须锚定到
+    // 诊断末尾(与 plugin-market/protocolErrors.ts 同一条边界)。
+    const trickySlot = 'future(可用:x)';
+    const futureCapability = await makeCindy('future-capability-tricky-slot.cindy', {
+      ...goodManifest(),
+      slots: ['tool', trickySlot],
+    });
+    const result = await manager.inspect(futureCapability);
+    expect((result as { rejection: { code: string; reason: string } }).rejection.code).toBe(
+      'host-unsupported',
+    );
+    expect(
+      (result as { rejection: { reason: string } }).rejection.reason,
+    ).toContain(trickySlot);
+  });
+
   it('slot 形状畸形仍按非法文件拒绝，友好提示不放松安全校验', async () => {
     const malformed = await makeCindy('malformed-slot.cindy', {
       ...goodManifest(),

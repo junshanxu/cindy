@@ -8,6 +8,7 @@ import JSZip from 'jszip';
 import {
   GHOST_MANIFEST_FILE,
   GHOST_MANIFEST_MAX_BYTES,
+  GHOST_SLOTS,
   GHOST_LOCALE_MAX_BYTES,
   GHOST_ICON_MAX_BYTES,
   GHOST_INSTALL_MANIFEST_MAX_BYTES,
@@ -489,6 +490,12 @@ export interface GhostExclusiveMutation {
 
 /** 校验器在「除未知字符串 slot 外其余字段全合法」时给出的延后诊断前缀。 */
 const UNKNOWN_SLOT_REASON_PREFIX = 'slots 含未知卡槽 ';
+// 与 shared/ghost.ts 的诊断构造同源:`slots 含未知卡槽
+// <JSON.stringify(slot)>(可用:<GHOST_SLOTS join ' / ')`。后缀必须锚定到诊断
+// 末尾,不能用 split('(可用:')——合法未知 slot 名本身可能包含 "(可用:" 文本
+// (如 `future(可用:x)`),从 slot 名内部任意位置反解析会切坏 JSON、把该升级的
+// 包误判为包无效。与 plugin-market/protocolErrors.ts 的锚定写法保持一致。
+const UNKNOWN_SLOT_REASON_SUFFIX = `(可用:${GHOST_SLOTS.join(' / ')})`;
 
 /**
  * 区分“包本身坏了”和“包使用了更新版 Cindy 才认识的契约”。
@@ -518,7 +525,13 @@ export function ghostManifestHostUnsupportedReason(
   // 该 reason 只可能由校验器在「其余字段全合法」的收尾路径产生(见 shared/ghost.ts
   // 的 unknownStringSlot 延后逻辑),故见到它即可安全归类为宿主不支持。
   if (reason.startsWith(UNKNOWN_SLOT_REASON_PREFIX)) {
-    const serialized = reason.slice(UNKNOWN_SLOT_REASON_PREFIX.length).split('(可用:', 1)[0];
+    // 后缀必须紧贴诊断末尾;长度不匹配说明不是这条已知形状(可能是其它清单错误,
+    // 也可能是用户可控 slot 名里碰巧含 "(可用:" 文本),交给包无效分支。
+    if (!reason.endsWith(UNKNOWN_SLOT_REASON_SUFFIX)) return null;
+    const serialized = reason.slice(
+      UNKNOWN_SLOT_REASON_PREFIX.length,
+      reason.length - UNKNOWN_SLOT_REASON_SUFFIX.length,
+    );
     try {
       const slot = JSON.parse(serialized) as unknown;
       if (typeof slot === 'string') {
