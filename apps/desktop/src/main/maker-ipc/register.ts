@@ -2230,6 +2230,8 @@ const PERMISSION_INTERACTION_TIMEOUT_MS = 10 * 60 * 1000;
 interface PendingInteractionEntry {
   sessionId: string;
   kind: InteractionRequest['kind'];
+  /** Monotonic request-arrival order shared with the permission queue. */
+  arrivalSequence: number;
   resolve: (decision: InteractionDecision) => void;
   /**
    * 原始 InteractionRequest —— 留着是为了 feishu 接管时能"重发"卡片到飞书,
@@ -2247,6 +2249,12 @@ interface PendingInteractionEntry {
 }
 
 const pendingInteractionResolvers = new Map<string, PendingInteractionEntry>();
+let pendingInteractionArrivalSequence = 0;
+
+function nextPendingInteractionArrivalSequence(): number {
+  pendingInteractionArrivalSequence += 1;
+  return pendingInteractionArrivalSequence;
+}
 
 /**
  * submit_github_issue 工具的提交前确认桥(kind='issue_confirm')。独立于
@@ -2647,6 +2655,7 @@ export function takePendingInteractionsForSession(sessionId: string): Array<{
   requestId: string;
   request: InteractionRequest;
   resolve: (decision: InteractionDecision) => void;
+  arrivalSequence: number;
   expiresAt?: number;
 }> {
   const entries = Array.from(pendingInteractionResolvers.entries()).filter(
@@ -2656,6 +2665,7 @@ export function takePendingInteractionsForSession(sessionId: string): Array<{
     requestId: string;
     request: InteractionRequest;
     resolve: (decision: InteractionDecision) => void;
+    arrivalSequence: number;
     expiresAt?: number;
   }> = [];
   for (const [requestId, entry] of entries) {
@@ -2664,6 +2674,7 @@ export function takePendingInteractionsForSession(sessionId: string): Array<{
       requestId,
       request: entry.request,
       resolve: entry.resolve,
+      arrivalSequence: entry.arrivalSequence,
       ...(entry.expiresAt !== undefined ? { expiresAt: entry.expiresAt } : {}),
     });
     handleAgentIslandInteractionDismissed(entry.sessionId, requestId);
@@ -2679,13 +2690,21 @@ export function takePendingInteractionsForSession(sessionId: string): Array<{
   // but have not reached the renderer yet. Take them atomically with the
   // displayed request so channel takeover preserves every user decision and
   // the original deadline instead of silently denying the queued cohort.
-  taken.push(
-    ...takePermissionQueueForSession(
+  return mergeInteractionTakeoverEntriesByArrival(
+    taken,
+    takePermissionQueueForSession(
       sessionId,
       defaultDecisionForPending('permission', 'session_migrated'),
     ),
   );
-  return taken;
+}
+
+export function mergeInteractionTakeoverEntriesByArrival<
+  T extends { arrivalSequence: number },
+>(displayed: readonly T[], queued: readonly T[]): T[] {
+  return [...displayed, ...queued].sort(
+    (left, right) => left.arrivalSequence - right.arrivalSequence,
+  );
 }
 
 type WiredSession = NonNullable<ReturnType<Maker['getSession']>>;
@@ -3706,6 +3725,7 @@ export function installDesktopInteractionListener(session: {
   const queue = ensurePermissionQueue(session.id);
 
   installDesktopInteractionHandler(session, async (req: InteractionRequest) => {
+    const arrivalSequence = nextPendingInteractionArrivalSequence();
     if (req.kind === 'permission') {
       // The overall timeout covers queue wait + execution so that N parallel,
       // unanswered permissions can't extend the 10-minute cap to N×10 minutes
@@ -3713,14 +3733,16 @@ export function installDesktopInteractionListener(session: {
       return queue.dispatch((ctx) => handleDesktopInteractionRequest(req, ctx), {
         timeoutMs: PERMISSION_INTERACTION_TIMEOUT_MS,
         takeoverRequest: req,
+        arrivalSequence,
       });
     }
-    return handleDesktopInteractionRequest(req);
+    return handleDesktopInteractionRequest(req, undefined, arrivalSequence);
   });
 
   async function handleDesktopInteractionRequest(
     req: InteractionRequest,
     ctx?: PermissionRunContext,
+    arrivalSequence = nextPendingInteractionArrivalSequence(),
   ): Promise<InteractionDecision> {
     const agentIslandInteractionEpoch = shouldNotifyAgentIslandForSession(session.id)
       ? (getAgentIslandService()?.captureInteractionEpoch(session.id) ?? null)
@@ -3754,6 +3776,7 @@ export function installDesktopInteractionListener(session: {
       const entry: PendingInteractionEntry = {
         sessionId: session.id,
         kind: req.kind,
+        arrivalSequence,
         resolve,
         request: req,
         persistId: interactionPersistId ?? undefined,
@@ -3852,6 +3875,7 @@ export interface PermissionQueueTakeoverEntry {
   requestId: string;
   request: PermissionRequest;
   resolve: (decision: InteractionDecision) => void;
+  arrivalSequence: number;
   expiresAt?: number;
 }
 
@@ -3861,6 +3885,7 @@ interface PermissionQueueDispatchState {
   migrated: boolean;
   settled: boolean;
   request?: PermissionRequest;
+  arrivalSequence: number;
   expiresAt?: number;
   resolve: (decision: InteractionDecision) => void;
 }
@@ -3890,7 +3915,11 @@ export class PermissionQueue {
   /** Enqueue a permission run. Resolves with the run's own decision. */
   dispatch(
     run: (ctx: PermissionRunContext) => Promise<InteractionDecision>,
-    opts?: { timeoutMs?: number; takeoverRequest?: PermissionRequest },
+    opts?: {
+      timeoutMs?: number;
+      takeoverRequest?: PermissionRequest;
+      arrivalSequence?: number;
+    },
   ): Promise<InteractionDecision> {
     // Terminal close: never run again.
     if (this.closedDecision) return Promise.resolve(this.closedDecision);
@@ -3947,6 +3976,7 @@ export class PermissionQueue {
       started: false,
       migrated: false,
       settled: false,
+      arrivalSequence: opts?.arrivalSequence ?? nextPendingInteractionArrivalSequence(),
       ...(opts?.takeoverRequest ? { request: opts.takeoverRequest } : {}),
       ...(expiresAt !== undefined ? { expiresAt } : {}),
       resolve: settleDecision,
@@ -4130,6 +4160,7 @@ export class PermissionQueue {
         requestId: state.request.requestId,
         request: state.request,
         resolve: state.resolve,
+        arrivalSequence: state.arrivalSequence,
         ...(state.expiresAt !== undefined ? { expiresAt: state.expiresAt } : {}),
       });
     }

@@ -1781,6 +1781,7 @@ export function createTurnRunner(
       requestId: string;
       request: InteractionRequest;
       resolve: (decision: InteractionDecision) => void;
+      arrivalSequence: number;
       expiresAt?: number;
     },
     userId: string,

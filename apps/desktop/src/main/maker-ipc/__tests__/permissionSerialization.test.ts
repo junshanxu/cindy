@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { PermissionQueue } from '../register.js';
+import { mergeInteractionTakeoverEntriesByArrival, PermissionQueue } from '../register.js';
 import type { InteractionDecision, InteractionRequest } from '@cindy/maker-core';
 
 function allow(): InteractionDecision {
@@ -14,6 +14,20 @@ function permissionRequest(requestId: string): Extract<InteractionRequest, { kin
 }
 
 describe('PermissionQueue (issue #3092)', () => {
+  it('merges displayed and queued interactions by original arrival order', () => {
+    const entry = (requestId: string, arrivalSequence: number) => ({
+      requestId,
+      arrivalSequence,
+    });
+
+    expect(
+      mergeInteractionTakeoverEntriesByArrival(
+        [entry('permission-a', 1), entry('ask-c', 3)],
+        [entry('permission-b', 2)],
+      ).map((candidate) => candidate.requestId),
+    ).toEqual(['permission-a', 'permission-b', 'ask-c']);
+  });
+
   it('runs two permission requests sequentially, not in parallel', async () => {
     // The renderer has a single pending-permission slot, so two parallel
     // permission requests must NOT be broadcast concurrently. This is the
@@ -334,7 +348,7 @@ describe('PermissionQueue (issue #3092)', () => {
         new Promise((resolve) => {
           releaseA = () => resolve(allow());
         }),
-      { timeoutMs: 1000, takeoverRequest: permissionRequest('req-a') },
+      { timeoutMs: 1000, takeoverRequest: permissionRequest('req-a'), arrivalSequence: 1 },
     );
     await Promise.resolve();
     await Promise.resolve();
@@ -347,18 +361,19 @@ describe('PermissionQueue (issue #3092)', () => {
         bRan = true;
         return allow();
       },
-      { timeoutMs: 1000, takeoverRequest: permissionRequest('req-b') },
+      { timeoutMs: 1000, takeoverRequest: permissionRequest('req-b'), arrivalSequence: 2 },
     );
     const c = queue.dispatch(
       async () => {
         cRan = true;
         return allow();
       },
-      { timeoutMs: 1000, takeoverRequest: permissionRequest('req-c') },
+      { timeoutMs: 1000, takeoverRequest: permissionRequest('req-c'), arrivalSequence: 3 },
     );
 
     const taken = queue.takeForTakeover(deny('session_migrated'));
     expect(taken.map((entry) => entry.requestId)).toEqual(['req-b', 'req-c']);
+    expect(taken.map((entry) => entry.arrivalSequence)).toEqual([2, 3]);
     expect(taken.every((entry) => entry.expiresAt !== undefined)).toBe(true);
 
     taken[0]?.resolve(allow());
