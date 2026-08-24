@@ -278,11 +278,30 @@ export function registerReviewStartHandler(
     const runId = deps.createRunId();
     const reviewerSessionId = deps.createReviewerSessionId();
     const sourceCardClientId = `review:${runId}`;
-    const releaseSourceSessionLifecycle = await deps.acquireSourceSessionLifecycle(
-      event,
-      request.sourceSessionId,
-    );
+    // Reserve the in-process slot BEFORE awaiting the lifecycle lock. has()+set()
+    // run synchronously with no await between them, so under the single-threaded
+    // event loop this check-and-set is atomic: a second caller cannot also pass
+    // has() and overwrite this entry. The durable acquireSourceLease below remains
+    // the cross-process gate; reserving here only keeps an in-process loser from
+    // clobbering the winner's map entry, which would otherwise let the winner's
+    // failure path skip its runId match and leak the durable lease.
     activeReviewsBySource.set(request.sourceSessionId, { runId, reviewerSessionId });
+    let releaseSourceSessionLifecycle: () => void = () => {};
+    try {
+      releaseSourceSessionLifecycle = await deps.acquireSourceSessionLifecycle(
+        event,
+        request.sourceSessionId,
+      );
+    } catch (error) {
+      // acquireSourceSessionLifecycle can yield (secondary-window route lock).
+      // If it fails, release only our own reservation — never a slot another
+      // caller may have taken (it cannot, with the upfront set, but stay
+      // fail-closed in case a future path force-clears entries).
+      if (activeReviewsBySource.get(request.sourceSessionId)?.runId === runId) {
+        activeReviewsBySource.delete(request.sourceSessionId);
+      }
+      throw error;
+    }
 
     let disposeReviewEvents: (() => void) | null = null;
     let disposeReviewStatus: (() => void) | null = null;

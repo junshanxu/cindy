@@ -422,4 +422,49 @@ describe('archived secondary-window ownership', () => {
     expect(enqueueBody).toContain('{ requireActiveSession: true }');
   });
 
+  it('fences secondary-window /context at the Main dispatch boundary without changing primary semantics', () => {
+    const handlerStart = registerSource.indexOf('MAKER_INVOKE.GET_CONTEXT_USAGE');
+    expect(handlerStart).toBeGreaterThan(-1);
+    const handlerEnd = registerSource.indexOf(
+      'ipcMain.handle(',
+      handlerStart + 'MAKER_INVOKE.GET_CONTEXT_USAGE'.length,
+    );
+    const handlerBody = registerSource.slice(handlerStart, handlerEnd);
+
+    // 副窗口判定必须在任何 session 查找 / lazy-bootstrap 之前。
+    const secondaryProbe = handlerBody.indexOf('isSecondarySessionWindowEvent(');
+    expect(secondaryProbe).toBeGreaterThan(-1);
+    const sessionLookup = handlerBody.indexOf('maker.getSession(sessionId)');
+    expect(sessionLookup).toBeGreaterThan(secondaryProbe);
+
+    // 副窗口路径走与 send/steer 同一条 route lock + durable active 复核。
+    expect(handlerBody).toContain('if (!fromSecondary) return run();');
+    const lockStart = handlerBody.indexOf(
+      'return withSendToSessionLock(sessionId, async () => {',
+      secondaryProbe,
+    );
+    expect(lockStart).toBeGreaterThan(-1);
+    const activeCheck = handlerBody.indexOf(
+      'await assertSessionActiveForManualDispatch(sessionId);',
+      lockStart,
+    );
+    expect(activeCheck).toBeGreaterThan(lockStart);
+    const runInsideLock = handlerBody.indexOf('return run();', activeCheck);
+    expect(runInsideLock).toBeGreaterThan(activeCheck);
+
+    // lazy-bootstrap(会重建 agent 进程)被包在 run() 内,所以副窗口在已归档任务上
+    // 会在拿到锁后被 active 复核拦截,bootstrapSession 不可能执行。
+    expect(handlerBody.indexOf('await bootstrapSession(co)')).toBeGreaterThan(sessionLookup);
+    expect(handlerBody.indexOf('await reconcileCreateOptsAgainstDb(sessionId, co)')).toBeGreaterThan(
+      sessionLookup,
+    );
+
+    // 主窗口 / device-link 路径不被新 fence 包裹,保留历史 /context 可重新激活会话的语义。
+    // 具体表现:`if (!fromSecondary) return run();` 是主窗口唯一出口,且主窗口路径没有
+    // 进入 withSendToSessionLock 分支。
+    const nonSecondaryReturn = handlerBody.indexOf('if (!fromSecondary) return run();');
+    expect(nonSecondaryReturn).toBeGreaterThan(-1);
+    expect(nonSecondaryReturn).toBeLessThan(lockStart);
+  });
+
 });

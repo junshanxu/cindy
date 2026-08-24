@@ -13143,92 +13143,103 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
 
   ipcMain.handle(
     MAKER_INVOKE.GET_CONTEXT_USAGE,
-    async (_e, sessionId: unknown, createOpts?: unknown): Promise<ContextUsageData> => {
+    async (e, sessionId: unknown, createOpts?: unknown): Promise<ContextUsageData> => {
       if (typeof sessionId !== 'string' || sessionId.length === 0) {
         throwIpcError('INVALID_PARAMS', 'sessionId required');
       }
-      let sess = maker.getSession(sessionId);
-      if (!sess) {
-        if (!createOpts) {
-          throwIpcError('NOT_FOUND', `Session ${sessionId} is not running`);
-        }
-        const co = buildCreateOptsWithStderr({ ...(createOpts as CreateOpts), id: sessionId });
-        // session-agent-switch:先按 DB 行校正再判 claude-only——否则切到 codex 后
-        // 残留的 claude createOpts 会在这里 spawn 出旧引擎的 live session 并被后续
-        // send 复用(会话被劫持回旧引擎,2026-07-20 审计实锤)。
-        await reconcileCreateOptsAgainstDb(sessionId, co);
-        if (co.agentKind !== 'claude-code') {
-          throwIpcError(
-            'UNSUPPORTED_CAPABILITY',
-            `Agent ${co.agentKind} does not support context usage`,
+      // 副窗口对已归档任务的 `/context` 必须走 durable fence:lazy-bootstrap 分支
+      // 会为该任务重建 agent 进程,不能让渲染端的缓存归档判断独自守门。主窗口的历史
+      // 语义(/context 可重新激活已归档任务)保持不变。
+      const fromSecondary = isSecondarySessionWindowEvent(e);
+      const run = async (): Promise<ContextUsageData> => {
+        let sess = maker.getSession(sessionId);
+        if (!sess) {
+          if (!createOpts) {
+            throwIpcError('NOT_FOUND', `Session ${sessionId} is not running`);
+          }
+          const co = buildCreateOptsWithStderr({ ...(createOpts as CreateOpts), id: sessionId });
+          // session-agent-switch:先按 DB 行校正再判 claude-only——否则切到 codex 后
+          // 残留的 claude createOpts 会在这里 spawn 出旧引擎的 live session 并被后续
+          // send 复用(会话被劫持回旧引擎,2026-07-20 审计实锤)。
+          await reconcileCreateOptsAgainstDb(sessionId, co);
+          if (co.agentKind !== 'claude-code') {
+            throwIpcError(
+              'UNSUPPORTED_CAPABILITY',
+              `Agent ${co.agentKind} does not support context usage`,
+            );
+          }
+          const okLazy = await checkWorkDirExists(
+            sessionId,
+            co.workingDir,
+            co.agentKind,
+            co.remoteHostId,
           );
-        }
-        const okLazy = await checkWorkDirExists(
-          sessionId,
-          co.workingDir,
-          co.agentKind,
-          co.remoteHostId,
-        );
-        if (!okLazy) {
-          throwIpcError('NOT_FOUND', `Working directory is missing for session ${sessionId}`);
-        }
-        await synthesizeOrcaVendorOptionsFromDb(sessionId, co);
-        if (co.extraDirs === undefined) {
+          if (!okLazy) {
+            throwIpcError('NOT_FOUND', `Working directory is missing for session ${sessionId}`);
+          }
+          await synthesizeOrcaVendorOptionsFromDb(sessionId, co);
+          if (co.extraDirs === undefined) {
+            try {
+              const row = await readSessionExtraDirsFromDb(sessionId);
+              if (row.length > 0) co.extraDirs = extraDirsForRuntime(row);
+            } catch (err) {
+              log.warn('context-usage lazy-create: read extra_dirs from DB failed (non-fatal)', {
+                sessionId,
+                err: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+          if (co.writableDirs === undefined) {
+            const row = await readSessionWritableDirsFromDb(sessionId).catch(() => []);
+            if (row.length > 0) co.writableDirs = row;
+          }
           try {
-            const row = await readSessionExtraDirsFromDb(sessionId);
-            if (row.length > 0) co.extraDirs = extraDirsForRuntime(row);
-          } catch (err) {
-            log.warn('context-usage lazy-create: read extra_dirs from DB failed (non-fatal)', {
+            await ensureRemoteReadyForSessionStart({ createOpts: co });
+            const {
+              session: lazySess,
+              didInjectOrcaInstructions,
+              didInjectProjectContext,
+            } = await bootstrapSession(co);
+            await markOrcaRoleIfNeeded(lazySess.id, co.orcaRole);
+            log.info('context-usage: lazy create-session', {
               sessionId,
-              err: err instanceof Error ? err.message : String(err),
+              agentKind: co.agentKind,
+              model: co.model,
+              usedOrcaInstructions: didInjectOrcaInstructions,
+              usedProjectContext: didInjectProjectContext,
+              extraDirsCount: co.extraDirs?.length ?? 0,
             });
+            sess = lazySess;
+          } catch (err) {
+            throwIpcError(
+              'INTERNAL',
+              err instanceof Error ? err.message : 'context usage lazy create failed',
+            );
           }
         }
-        if (co.writableDirs === undefined) {
-          const row = await readSessionWritableDirsFromDb(sessionId).catch(() => []);
-          if (row.length > 0) co.writableDirs = row;
-        }
-        try {
-          await ensureRemoteReadyForSessionStart({ createOpts: co });
-          const {
-            session: lazySess,
-            didInjectOrcaInstructions,
-            didInjectProjectContext,
-          } = await bootstrapSession(co);
-          await markOrcaRoleIfNeeded(lazySess.id, co.orcaRole);
-          log.info('context-usage: lazy create-session', {
-            sessionId,
-            agentKind: co.agentKind,
-            model: co.model,
-            usedOrcaInstructions: didInjectOrcaInstructions,
-            usedProjectContext: didInjectProjectContext,
-            extraDirsCount: co.extraDirs?.length ?? 0,
-          });
-          sess = lazySess;
-        } catch (err) {
+        if (sess.agentKind !== 'claude-code' && sess.agentKind !== 'pi') {
           throwIpcError(
-            'INTERNAL',
-            err instanceof Error ? err.message : 'context usage lazy create failed',
+            'UNSUPPORTED_CAPABILITY',
+            `Agent ${sess.agentKind} does not support context usage`,
           );
         }
-      }
-      if (sess.agentKind !== 'claude-code' && sess.agentKind !== 'pi') {
-        throwIpcError(
-          'UNSUPPORTED_CAPABILITY',
-          `Agent ${sess.agentKind} does not support context usage`,
-        );
-      }
-      try {
-        return await sess.getContextUsage();
-      } catch (err) {
-        if (err instanceof Error && err.name === 'NotSupportedError') {
-          throwIpcError('UNSUPPORTED_CAPABILITY', err.message);
+        try {
+          return await sess.getContextUsage();
+        } catch (err) {
+          if (err instanceof Error && err.name === 'NotSupportedError') {
+            throwIpcError('UNSUPPORTED_CAPABILITY', err.message);
+          }
+          throwIpcError(
+            'INTERNAL',
+            err instanceof Error ? err.message : 'context usage query failed',
+          );
         }
-        throwIpcError(
-          'INTERNAL',
-          err instanceof Error ? err.message : 'context usage query failed',
-        );
-      }
+      };
+      if (!fromSecondary) return run();
+      return withSendToSessionLock(sessionId, async () => {
+        await assertSessionActiveForManualDispatch(sessionId);
+        return run();
+      });
     },
   );
 

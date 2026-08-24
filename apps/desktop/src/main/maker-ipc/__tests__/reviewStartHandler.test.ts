@@ -434,6 +434,60 @@ describe('maker:review:start IPC lifecycle', () => {
     expect(deps.startReviewer).toHaveBeenCalledTimes(1);
   });
 
+  it('reserves the in-process slot before awaiting the lifecycle lock so a concurrent start cannot clobber it', async () => {
+    const harness = new IpcHarness();
+    const reviewer = new FakeReviewer();
+    let releaseLifecycle!: () => void;
+    const lifecyclePending = new Promise<void>((resolve) => {
+      releaseLifecycle = resolve;
+    });
+    const acquireSourceSessionLifecycle = vi
+      .fn<ReviewStartHandlerDeps['acquireSourceSessionLifecycle']>()
+      .mockImplementationOnce(async () => {
+        await lifecyclePending;
+        return () => {};
+      })
+      .mockResolvedValue(() => {});
+    const deps = makeDeps(reviewer, { acquireSourceSessionLifecycle });
+    registerReviewStartHandler(harness, deps);
+
+    // A enters and parks on the lifecycle lock (first await after the slot set).
+    const first = harness.invoke(MAKER_INVOKE.START_REVIEW, reviewRequest());
+    await vi.waitFor(() => expect(acquireSourceSessionLifecycle).toHaveBeenCalledTimes(1));
+
+    // B arrives while A is still awaiting the lock. With the upfront reservation
+    // it must be rejected at has() and never reach acquireSourceSessionLifecycle.
+    await expect(harness.invoke(MAKER_INVOKE.START_REVIEW, reviewRequest())).rejects.toMatchObject({
+      code: 'SESSION_RUNNING',
+    });
+    expect(acquireSourceSessionLifecycle).toHaveBeenCalledTimes(1);
+    expect(deps.prepareRun).not.toHaveBeenCalled();
+
+    releaseLifecycle();
+    await expect(first).resolves.toMatchObject({ ok: true, runId: 'run-1' });
+  });
+
+  it('releases its in-process reservation if acquiring the lifecycle lock fails, allowing a retry', async () => {
+    const harness = new IpcHarness();
+    const reviewer = new FakeReviewer();
+    const acquireSourceSessionLifecycle = vi
+      .fn<ReviewStartHandlerDeps['acquireSourceSessionLifecycle']>()
+      .mockRejectedValueOnce(new Error('source task archived'))
+      .mockResolvedValueOnce(() => {});
+    const deps = makeDeps(reviewer, { acquireSourceSessionLifecycle });
+    registerReviewStartHandler(harness, deps);
+
+    await expect(harness.invoke(MAKER_INVOKE.START_REVIEW, reviewRequest())).rejects.toThrow(
+      'source task archived',
+    );
+    // No leaked reservation → the retry passes has() and succeeds.
+    await expect(harness.invoke(MAKER_INVOKE.START_REVIEW, reviewRequest())).resolves.toMatchObject({
+      ok: true,
+      runId: 'run-2',
+    });
+    expect(acquireSourceSessionLifecycle).toHaveBeenCalledTimes(2);
+  });
+
   it('rejects a provider send failure before dispatch and permits retry', async () => {
     const harness = new IpcHarness();
     const reviewer = new FakeReviewer();
