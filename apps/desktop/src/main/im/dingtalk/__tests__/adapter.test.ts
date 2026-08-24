@@ -101,10 +101,17 @@ describe('dingtalk turn permission boundary', () => {
 
 describe('dingtalk text interaction timeout', () => {
   it('forwards the remaining timeout through the adapter', async () => {
-    const requestTextReply = vi.fn(async () => ({
-      kind: 'permission' as const,
-      behavior: 'allow' as const,
-    }));
+    const requestTextReply = vi.fn(
+      async (
+        _userId: string,
+        _prompt: string,
+        _parse: (text: string) => unknown,
+        _timeoutMs?: number,
+      ) => ({
+        kind: 'permission' as const,
+        behavior: 'allow' as const,
+      }),
+    );
     const adapter = buildDingTalkAdapter(
       { requestTextReply } as unknown as DingTalkIM,
       CONFIG,

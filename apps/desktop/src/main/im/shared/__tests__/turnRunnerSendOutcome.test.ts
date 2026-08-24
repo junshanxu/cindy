@@ -758,7 +758,7 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
     const firstDecision = deferred<InteractionDecision>();
     const secondDecision = deferred<InteractionDecision>();
     const handleTextInteraction = vi
-      .fn<ImChannelAdapter['handleTextInteraction']>()
+      .fn<NonNullable<ImChannelAdapter['handleTextInteraction']>>()
       .mockImplementationOnce(async () => firstDecision.promise)
       .mockImplementationOnce(async () => secondDecision.promise);
     const resolveFirst = vi.fn();

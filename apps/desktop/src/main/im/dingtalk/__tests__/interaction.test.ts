@@ -84,10 +84,17 @@ describe('dingtalk text interactions', () => {
   });
 
   it('uses the migrated interaction remaining timeout', async () => {
-    const requestTextReply = vi.fn(async () => ({
-      kind: 'permission' as const,
-      behavior: 'allow' as const,
-    }));
+    const requestTextReply = vi.fn(
+      async (
+        _userId: string,
+        _prompt: string,
+        _parse: (text: string) => unknown,
+        _timeoutMs?: number,
+      ) => ({
+        kind: 'permission' as const,
+        behavior: 'allow' as const,
+      }),
+    );
     const im = { requestTextReply } as unknown as DingTalkIM;
     const request = {
       kind: 'permission' as const,
