@@ -6130,8 +6130,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
         remoteHostId?: string;
         resumeSessionId?: string;
       },
+      fenceOpts?: { requireActiveSession?: boolean },
     ): Promise<import('@cindy/maker-core').ContextUsageData> =>
-      ipcRenderer.invoke('maker:get-context-usage', sessionId, createOpts),
+      ipcRenderer.invoke('maker:get-context-usage', sessionId, createOpts, fenceOpts),
 
     abortSession: (sessionId: string): Promise<void> =>
       ipcRenderer.invoke('maker:abort-session', sessionId),

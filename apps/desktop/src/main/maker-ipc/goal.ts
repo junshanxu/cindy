@@ -102,11 +102,15 @@ export function broadcastGoalStatus(update: GoalStatusUpdate): void {
 export function registerGoalHandlers(
   lifecycle: GoalHandlerLifecycleDeps = NOOP_GOAL_LIFECYCLE_DEPS,
 ): void {
+  // 仅当调用方(原始 renderer,经隧道 args 透传)显式请求 active-session fence 时
+  // 才加 route lock + 持久化复核。device-link 合成 event 的 sender 为空,不能用窗口
+  // 归属判定 secondary;primary remote task(主窗口)不带此标记,保持历史恢复语义。
   const runWithLifecycleGuard = <T>(
     sessionId: string,
     task: () => Promise<T>,
+    requireActiveSession?: boolean,
   ): Promise<T> => {
-    if (!lifecycle.isDeviceLinkInvoke()) return task();
+    if (!lifecycle.isDeviceLinkInvoke() || !requireActiveSession) return task();
     return lifecycle.withSessionLock(sessionId, async () => {
       await lifecycle.assertSessionActive(sessionId);
       return task();
@@ -132,13 +136,18 @@ export function registerGoalHandlers(
     const controller = getGoalController();
     if (!controller) throwIpcError('INTERNAL', 'goal controller not started');
     try {
-      await runWithLifecycleGuard(sessionId, () =>
-        controller.setGoal({
-          sessionId,
-          objective,
-          ...(limits ? { limits } : {}),
-          ...(lifecycle.isDeviceLinkInvoke() ? { sessionRouteLockHeld: true } : {}),
-        }),
+      await runWithLifecycleGuard(
+        sessionId,
+        () =>
+          controller.setGoal({
+            sessionId,
+            objective,
+            ...(limits ? { limits } : {}),
+            ...(lifecycle.isDeviceLinkInvoke() && obj.requireActiveSession === true
+              ? { sessionRouteLockHeld: true }
+              : {}),
+          }),
+        obj.requireActiveSession === true,
       );
     } catch (err) {
       throwGoalControllerIpcError(err);
@@ -146,12 +155,27 @@ export function registerGoalHandlers(
     return { ok: true };
   });
 
-  // 用户清除目标(GoalIndicator ✕ 按钮)。
-  ipcMain.handle(MAKER_INVOKE.GOAL_CLEAR, async (_e, sessionId: unknown) => {
-    const id = requireString(sessionId, 'sessionId');
-    await runWithLifecycleGuard(id, () => getGoalController()?.clearGoal(id) ?? Promise.resolve());
-    return { ok: true };
-  });
+  // 用户清除目标(GoalIndicator ✕ 按钮)。第一个参数保持裸 sessionId 字符串的 wire
+  // 形态(append-only 协议兼容;旧被控端 / 本机按钮发裸字符串,按 requireString 解析,
+  // 多余尾参被忽略);副窗口经隧道时在第二参带 { requireActiveSession: true },此时
+  // 才在 device-link 下走 route lock + 持久化 active 复核(与 GOAL_SET 同口径)。
+  // primary remote 不带标记,保留"向已归档任务发命令可恢复任务"的历史语义。
+  ipcMain.handle(
+    MAKER_INVOKE.GOAL_CLEAR,
+    async (_e, sessionId: unknown, fenceOpts?: unknown) => {
+      const id = requireString(sessionId, 'sessionId');
+      const requireActiveSession =
+        fenceOpts !== null &&
+        typeof fenceOpts === 'object' &&
+        (fenceOpts as { requireActiveSession?: boolean }).requireActiveSession === true;
+      await runWithLifecycleGuard(
+        id,
+        () => getGoalController()?.clearGoal(id) ?? Promise.resolve(),
+        requireActiveSession,
+      );
+      return { ok: true };
+    },
+  );
 
   // 取当前状态(useGoalStatus hook 挂载时拉一次 = 用户打开该会话)。无 goal 返回 null。
   ipcMain.handle(MAKER_INVOKE.GOAL_GET_STATUS, async (_e, sessionId: unknown) => {

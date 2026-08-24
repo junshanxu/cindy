@@ -52,6 +52,10 @@ export function registerRemoteCmdIpc(deps: RemoteCmdIpcDeps): void {
       const cmdLine = requireString(obj.cmdLine, 'cmdLine').trim();
       const cwd = requireString(obj.cwd, 'cwd');
       const sessionId = typeof obj.sessionId === 'string' ? obj.sessionId.trim() : '';
+      // Main-owned fence marker:device-link 合成 event 的 sender 为空,无法用窗口归属
+      // 判定 secondary;只有原始 renderer(控制端副窗口)显式请求时才 fence。primary
+      // remote task(主窗口)不带此标记,保持"向已归档任务发 /cmd 可恢复任务"的历史语义。
+      const requireActiveSession = obj.requireActiveSession === true;
       if (!cmdLine) throwIpcError('INVALID_PARAMS', 'cmdLine must not be empty');
       const run = async (): Promise<CmdExecutionResult> => {
         if (!(await isRemoteWorkingDirAllowed(cwd))) {
@@ -70,7 +74,9 @@ export function registerRemoteCmdIpc(deps: RemoteCmdIpcDeps): void {
         });
         return result;
       };
-      if (!deps.isDeviceLinkInvoke()) return run();
+      // 仅显式请求 active-session fence 的 device-link 调用走 route lock + 持久化复核;
+      // 本机 handler 调用(isDeviceLinkInvoke false)与未带标记的 primary remote 直通。
+      if (!deps.isDeviceLinkInvoke() || !requireActiveSession) return run();
       if (!sessionId) throwIpcError('INVALID_PARAMS', 'sessionId required for remote /cmd');
       return deps.withSessionLock(sessionId, async () => {
         await deps.assertSessionActive(sessionId);

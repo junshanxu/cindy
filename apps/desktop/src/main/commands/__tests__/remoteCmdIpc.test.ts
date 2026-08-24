@@ -84,18 +84,31 @@ describe('desktop-cmd:run handler', () => {
     expect(result.stdout).toBe('ok');
   });
 
-  it('device-link 调用在同一 session route lock 内复核 active', async () => {
+  it('device-link 调用带显式 requireActiveSession 时在 route lock 内复核 active', async () => {
     h.isDeviceLinkInvoke.mockReturnValue(true);
-    await invokeHandler({ sessionId: 's1', cmdLine: 'ls', cwd: '/known/dir' });
+    await invokeHandler({
+      sessionId: 's1',
+      cmdLine: 'ls',
+      cwd: '/known/dir',
+      requireActiveSession: true,
+    });
     expect(h.withSessionLock).toHaveBeenCalledWith('s1', expect.any(Function));
     expect(h.assertSessionActive).toHaveBeenCalledWith('s1');
   });
 
-  it('device-link 调用缺 sessionId 时 fail closed', async () => {
+  it('device-link 调用缺 requireActiveSession 时直通(primary remote 历史语义),不加锁', async () => {
     h.isDeviceLinkInvoke.mockReturnValue(true);
-    await expect(invokeHandler({ cmdLine: 'ls', cwd: '/known/dir' })).rejects.toThrow(
-      /\[INVALID_PARAMS\]/,
-    );
+    await invokeHandler({ sessionId: 's1', cmdLine: 'ls', cwd: '/known/dir' });
+    expect(h.withSessionLock).not.toHaveBeenCalled();
+    expect(h.assertSessionActive).not.toHaveBeenCalled();
+    expect(h.runShellCommand).toHaveBeenCalledWith({ cmdLine: 'ls', cwd: '/known/dir' });
+  });
+
+  it('device-link 调用带 requireActiveSession 但缺 sessionId 时 fail closed', async () => {
+    h.isDeviceLinkInvoke.mockReturnValue(true);
+    await expect(
+      invokeHandler({ cmdLine: 'ls', cwd: '/known/dir', requireActiveSession: true }),
+    ).rejects.toThrow(/\[INVALID_PARAMS\]/);
     expect(h.runShellCommand).not.toHaveBeenCalled();
   });
 

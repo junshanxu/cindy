@@ -89,9 +89,17 @@ export function registerLearnIpc(
   _learnIpcRegistered = true;
   ipcMain.handle(LEARN_CHANNELS.START, async (_event, req: LearnStartRequest) => {
     try {
-      const start = () => mustController().startLearn(req);
       const sourceSessionId = req.originSessionId?.trim();
-      if (!lifecycle.isDeviceLinkInvoke() || !sourceSessionId) return await start();
+      // device-link 合成 event sender 为空,不能按窗口归属判定 secondary;只在原始
+      // renderer(经隧道 req 透传)显式请求时 fence,primary remote task 保持历史语义。
+      const requireActiveSession = req.requireActiveSession === true;
+      // requireActiveSession 是 IPC dispatch-only 标记,不进入 LearnController:
+      // 剥离后再传,避免污染 controller 的 run 记录 / 证据打包。
+      const { requireActiveSession: _omit, ...controllerReq } = req;
+      void _omit;
+      const start = () => mustController().startLearn(controllerReq);
+      if (!lifecycle.isDeviceLinkInvoke() || !requireActiveSession || !sourceSessionId)
+        return await start();
       return await lifecycle.withSessionLock(sourceSessionId, async () => {
         await lifecycle.assertSessionActive(sourceSessionId);
         return start();

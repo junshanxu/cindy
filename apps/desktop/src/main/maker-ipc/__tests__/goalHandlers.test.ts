@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   resumeOnOpen: vi.fn(),
   resumeGoal: vi.fn(),
   updateGoal: vi.fn(),
+  clearGoal: vi.fn(),
 }));
 
 vi.mock('electron', () => ({
@@ -27,6 +28,7 @@ vi.mock('../../goal-host/index.js', () => ({
         resumeOnOpen: mocks.resumeOnOpen,
         resumeGoal: mocks.resumeGoal,
         updateGoal: mocks.updateGoal,
+        clearGoal: mocks.clearGoal,
       }
     : null,
 }));
@@ -45,7 +47,7 @@ import {
   GoalUpdateSupersededError,
 } from '../../goal-host/controller.js';
 import { MAKER_INVOKE } from '../channels.js';
-import { registerGoalHandlers } from '../goal.js';
+import { registerGoalHandlers, type GoalHandlerLifecycleDeps } from '../goal.js';
 
 function handlerFor(channel: string): (...args: unknown[]) => unknown {
   const handler = mocks.handlers.get(channel);
@@ -228,5 +230,69 @@ describe('goal update IPC errors', () => {
     );
 
     await expect(result).rejects.toMatchObject({ code: 'GOAL_NOT_FOUND' });
+  });
+});
+
+describe('goal remote lifecycle fence', () => {
+  type SessionLock = <T>(sessionId: string, task: () => Promise<T>) => Promise<T>;
+  const isDeviceLinkInvoke = vi.fn(() => true);
+  const withSessionLock = vi.fn<SessionLock>(
+    async (_sessionId, task) => task(),
+  );
+  const assertSessionActive = vi.fn(async (_sessionId: string) => undefined);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.handlers.clear();
+    mocks.controllerAvailable = true;
+    isDeviceLinkInvoke.mockReturnValue(true);
+    registerGoalHandlers({
+      isDeviceLinkInvoke,
+      withSessionLock: withSessionLock as unknown as GoalHandlerLifecycleDeps['withSessionLock'],
+      assertSessionActive,
+    });
+  });
+
+  it('fences a device-link GOAL_SET only when requireActiveSession is explicitly requested', async () => {
+    const setHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_SET)!;
+    await setHandler({}, { sessionId: 'rs', objective: '目标', requireActiveSession: true });
+
+    expect(withSessionLock).toHaveBeenCalledWith('rs', expect.any(Function));
+    expect(assertSessionActive).toHaveBeenCalledWith('rs');
+    expect(mocks.setGoal).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'rs', objective: '目标', sessionRouteLockHeld: true }),
+    );
+  });
+
+  it('does not fence a primary remote GOAL_SET without requireActiveSession', async () => {
+    const setHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_SET)!;
+    await setHandler({}, { sessionId: 'rs', objective: '目标' });
+
+    expect(withSessionLock).not.toHaveBeenCalled();
+    expect(assertSessionActive).not.toHaveBeenCalled();
+    expect(mocks.setGoal).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'rs', objective: '目标' }),
+    );
+    expect(mocks.setGoal).not.toHaveBeenCalledWith(
+      expect.objectContaining({ sessionRouteLockHeld: true }),
+    );
+  });
+
+  it('does not fence GOAL_CLEAR for a bare sessionId string (old wire shape, primary remote)', async () => {
+    const clearHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_CLEAR)!;
+    await clearHandler({}, 'rs');
+
+    expect(withSessionLock).not.toHaveBeenCalled();
+    expect(assertSessionActive).not.toHaveBeenCalled();
+    expect(mocks.clearGoal).toHaveBeenCalledWith('rs');
+  });
+
+  it('fences GOAL_CLEAR only when the trailing fenceOpts.requireActiveSession is true', async () => {
+    const clearHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_CLEAR)!;
+    await clearHandler({}, 'rs', { requireActiveSession: true });
+
+    expect(withSessionLock).toHaveBeenCalledWith('rs', expect.any(Function));
+    expect(assertSessionActive).toHaveBeenCalledWith('rs');
+    expect(mocks.clearGoal).toHaveBeenCalledWith('rs');
   });
 });

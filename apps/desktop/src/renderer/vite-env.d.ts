@@ -5493,6 +5493,7 @@ interface ElectronAPI {
         remoteHostId?: string;
         resumeSessionId?: string;
       },
+      fenceOpts?: { requireActiveSession?: boolean },
     ) => Promise<import('@cindy/maker-core').ContextUsageData>;
 
     abortSession: (sessionId: string) => Promise<void>;

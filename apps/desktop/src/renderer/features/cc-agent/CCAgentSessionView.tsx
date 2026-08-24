@@ -3172,7 +3172,9 @@ export function CCAgentSessionView({
         ...(workingDir ? { workingDir } : {}),
         ...(args ? { args } : {}),
         ...(remoteDeviceId ? { deviceId: remoteDeviceId } : {}),
-        ...(!remoteDeviceId && isSecondaryWindow() ? { requireActiveSession: true } : {}),
+        // 副窗口无论本机还是远程都要 fence:本机由 Main 按 sender 判定,远程则把此
+        // 显式标记经隧道传到被控端 Main(sender 为空,无法按窗口归属判定)。
+        ...(isSecondaryWindow() ? { requireActiveSession: true } : {}),
       });
       if (dispatchResult === 'rejected') {
         if (hit.name === 'issue') pendingIssueFilesRef.current = undefined;
@@ -3406,8 +3408,12 @@ export function CCAgentSessionView({
         : undefined;
       const cardClientId = insertSystemCard('context', { usage: undefined });
       if (!cardClientId) return true;
+      // 副窗口(含 device-link 远程)对已归档任务的 /context 必须 fence:本机副窗口
+      // Main 按 sender 判定,远程副窗口 sender 为空,靠此显式 requireActiveSession
+      // 经隧道传到被控端 Main 复核;主窗口不传,保留历史恢复语义。
+      const fenceOpts = isSecondaryWindow() ? { requireActiveSession: true } : undefined;
       void makerApiFor(sessionId)
-        .getContextUsage(sessionId, createOpts)
+        .getContextUsage(sessionId, createOpts, fenceOpts)
         .then((usage) => {
           updateSystemCardData(cardClientId, { usage });
         })

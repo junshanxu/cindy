@@ -13143,14 +13143,28 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
 
   ipcMain.handle(
     MAKER_INVOKE.GET_CONTEXT_USAGE,
-    async (e, sessionId: unknown, createOpts?: unknown): Promise<ContextUsageData> => {
+    async (
+      e,
+      sessionId: unknown,
+      createOpts?: unknown,
+      fenceOpts?: unknown,
+    ): Promise<ContextUsageData> => {
       if (typeof sessionId !== 'string' || sessionId.length === 0) {
         throwIpcError('INVALID_PARAMS', 'sessionId required');
       }
       // 副窗口对已归档任务的 `/context` 必须走 durable fence:lazy-bootstrap 分支
       // 会为该任务重建 agent 进程,不能让渲染端的缓存归档判断独自守门。主窗口的历史
       // 语义(/context 可重新激活已归档任务)保持不变。
-      const fromSecondary = isSecondarySessionWindowEvent(e);
+      //
+      // device-link 远程派发经 dispatchLocalInvoke 传入合成 event(sender 为空),
+      // isSecondarySessionWindowEvent 无法识别——此时由原始 renderer 显式带入的
+      // requireActiveSession(Main-owned,不采信窗口归属)驱动 fence;本机副窗口仍由
+      // sender 判定,两条路都覆盖。
+      const requireActiveFence =
+        isSecondarySessionWindowEvent(e) ||
+        (fenceOpts !== null &&
+          typeof fenceOpts === 'object' &&
+          (fenceOpts as { requireActiveSession?: boolean }).requireActiveSession === true);
       const run = async (): Promise<ContextUsageData> => {
         let sess = maker.getSession(sessionId);
         if (!sess) {
@@ -13235,7 +13249,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           );
         }
       };
-      if (!fromSecondary) return run();
+      if (!requireActiveFence) return run();
       return withSendToSessionLock(sessionId, async () => {
         await assertSessionActiveForManualDispatch(sessionId);
         return run();

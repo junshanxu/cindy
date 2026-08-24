@@ -399,7 +399,14 @@ export function registerBuiltinDesktopCommands(
         let result: CmdExecutionResult;
         try {
           result = (await deps.remoteInvoke(ctx.deviceId, 'desktop-cmd:run', [
-            { sessionId: ctx.sessionId, cmdLine, cwd },
+            {
+              sessionId: ctx.sessionId,
+              cmdLine,
+              cwd,
+              // 控制端 Main 不持有被控端 route lock;把副窗口显式 fence 标记透传给
+              // 被控端,由其在 route lock 内复核持久化 active 状态。
+              ...(ctx.requireActiveSession ? { requireActiveSession: true } : {}),
+            },
           ])) as CmdExecutionResult;
         } catch (err) {
           log.warn('/cmd remote exec failed', err);
@@ -476,9 +483,23 @@ export function registerBuiltinDesktopCommands(
       // renderer 按会话来源路由)。本机路径与远程路径的动作语义一一对应。
       const remoteGoal = ctx.deviceId
         ? {
-            clearGoal: (id: string) => deps.remoteInvoke(ctx.deviceId!, 'maker:goal:clear', [id]),
+            // 第一参保持裸 sessionId(旧被控端按 requireString 解析、忽略尾参);
+            // 仅副窗口显式 fence 时追加第二参 { requireActiveSession },新被控端据此加锁。
+            clearGoal: (id: string) =>
+              deps.remoteInvoke(
+                ctx.deviceId!,
+                'maker:goal:clear',
+                ctx.requireActiveSession ? [id, { requireActiveSession: true }] : [id],
+              ),
             setGoal: (input: { sessionId: string; objective: string }) =>
-              deps.remoteInvoke(ctx.deviceId!, 'maker:goal:set', [input]),
+              deps.remoteInvoke(ctx.deviceId!, 'maker:goal:set', [
+                {
+                  ...input,
+                  // 副窗口显式 fence 标记透传给被控端 Main(append-only 字段,
+                  // 旧被控端忽略);被控端据此在 route lock 内复核持久化 active。
+                  ...(ctx.requireActiveSession ? { requireActiveSession: true } : {}),
+                },
+              ]),
           }
         : null;
       const controller = deps.getGoalController();
@@ -566,8 +587,15 @@ export function registerBuiltinDesktopCommands(
             ...(ctx.sessionId ? { originSessionId: ctx.sessionId } : {}),
           };
       try {
+        // 远程副窗口:把显式 fence 标记经隧道透传给被控端 Main(append-only 字段,
+        // 旧被控端忽略);被控端据此在 route lock 内复核持久化 active 状态。
+        const remoteReq = ctx.deviceId
+          ? { ...req, ...(ctx.requireActiveSession ? { requireActiveSession: true } : {}) }
+          : req;
         const { runId } = ctx.deviceId
-          ? ((await deps.remoteInvoke(ctx.deviceId, 'learn:start', [req])) as { runId: string })
+          ? ((await deps.remoteInvoke(ctx.deviceId, 'learn:start', [remoteReq])) as {
+              runId: string;
+            })
           : await controller!.startLearn(req);
         sendDesktopCommandToSender(ctx, { ...buildPayload('learn', ctx), learnRunId: runId });
       } catch (err) {
