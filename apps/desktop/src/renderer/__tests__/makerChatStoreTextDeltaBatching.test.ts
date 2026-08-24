@@ -2106,6 +2106,14 @@ describe('makerChatStore text delta batching', () => {
     expect(makerChatStore.getSnapshot(SESSION_ID).messages).toEqual([]);
   });
 
+  it('forwards the secondary-window active-session fence to the final local clear boundary', async () => {
+    await makerChatStore.clearSession(SESSION_ID, { requireActiveSession: true });
+
+    expect(input.clearSession).toHaveBeenCalledWith(SESSION_ID, expect.any(String), {
+      requireActiveSession: true,
+    });
+  });
+
   it('continues clearing local state when the clear guard hangs', async () => {
     input.clearSession.mockReturnValueOnce(new Promise<AgentInputProjection>(() => {}));
 

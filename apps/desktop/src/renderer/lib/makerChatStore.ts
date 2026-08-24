@@ -13881,24 +13881,32 @@ function dismissErrorTailMessage(sessionId: string, clientId: string): Promise<b
  *   are permanently hidden and the next query starts a fresh conversation
  * - Stays on the same session (no navigation, no new session created)
  */
-function clearSession(sessionId: string): Promise<void> {
+function clearSession(sessionId: string, opts?: { requireActiveSession?: boolean }): Promise<void> {
   if (!sessionId) return Promise.resolve();
   const clearedAt = new Date().toISOString();
 
-  return clearSessionAfterGuard(sessionId, clearedAt);
+  return clearSessionAfterGuard(sessionId, clearedAt, opts);
 }
 
-async function clearSessionAfterGuard(sessionId: string, clearedAt: string): Promise<void> {
+async function clearSessionAfterGuard(
+  sessionId: string,
+  clearedAt: string,
+  opts?: { requireActiveSession?: boolean },
+): Promise<void> {
   if (remoteClearInFlight.has(sessionId)) return;
   remoteClearInFlight.add(sessionId);
   try {
-    await clearSessionAfterGuardImpl(sessionId, clearedAt);
+    await clearSessionAfterGuardImpl(sessionId, clearedAt, opts);
   } finally {
     remoteClearInFlight.delete(sessionId);
   }
 }
 
-async function clearSessionAfterGuardImpl(sessionId: string, clearedAt: string): Promise<void> {
+async function clearSessionAfterGuardImpl(
+  sessionId: string,
+  clearedAt: string,
+  opts?: { requireActiveSession?: boolean },
+): Promise<void> {
   // /clear 清空会话：清掉该 session 的「正在识别图片中」toast，防残留。
   dismissVisionBridgeToast(sessionId);
   // Pin the clear lifecycle to the last known device before any await. The
@@ -13934,9 +13942,13 @@ async function clearSessionAfterGuardImpl(sessionId: string, clearedAt: string):
     | { kind: 'error'; err: unknown }
     | { kind: 'timeout' };
   const clearOperation = beginInputProjectionOperation(sessionId, remoteDeviceId);
+  const clearSessionRequest =
+    opts && !remoteDeviceId
+      ? clearOperation.api.input.clearSession(sessionId, clearedAt, opts)
+      : clearOperation.api.input.clearSession(sessionId, clearedAt);
   try {
     guardResult = await Promise.race([
-      clearOperation.api.input.clearSession(sessionId, clearedAt).then(
+      clearSessionRequest.then(
         (projection) => ({ kind: 'projection' as const, projection }),
         (err) => ({ kind: 'error' as const, err }),
       ),

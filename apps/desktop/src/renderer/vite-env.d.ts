@@ -5271,6 +5271,7 @@ interface ElectronAPI {
         goalAction?: 'set' | 'cleared' | 'open-dialog';
         /** /learn 专用:启动成功时的 runId(关联 learn:event 状态流)。 */
         learnRunId?: string;
+        requireActiveSession?: boolean;
       }) => void,
     ) => () => void;
 
@@ -5596,6 +5597,7 @@ interface ElectronAPI {
       clearSession: (
         sessionId: string,
         clearedAt?: string,
+        opts?: import('../shared/agentInputQueue').AgentInputRequireActiveSessionOpts,
       ) => Promise<import('../shared/agentInputQueue').AgentInputProjection>;
     };
 

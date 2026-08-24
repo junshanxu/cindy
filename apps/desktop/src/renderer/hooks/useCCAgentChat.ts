@@ -170,7 +170,7 @@ interface UseCCAgentChatReturn {
   /** User-initiated stop: aborts the current SDK query and clears streaming state */
   stopSession: () => void;
   /** F-CLEAR-1: Clear conversation — hides old messages, resets SDK context, stays on same session */
-  clearSession: () => void;
+  clearSession: (opts?: { requireActiveSession?: boolean }) => void;
   /** Dismiss the error banner without retrying. */
   clearError: () => void;
   /** Retry the main-owned typed recovery target. */
@@ -524,10 +524,13 @@ export function useCCAgentChat(
     makerChatStore.stopSession(sessionId);
   }, [sessionId]);
 
-  const clearSession = useCallback(() => {
-    if (!sessionId) return;
-    makerChatStore.clearSession(sessionId);
-  }, [sessionId]);
+  const clearSession = useCallback(
+    (opts?: { requireActiveSession?: boolean }) => {
+      if (!sessionId) return;
+      makerChatStore.clearSession(sessionId, opts);
+    },
+    [sessionId],
+  );
 
   const clearError = useCallback(() => {
     if (!sessionId) return;

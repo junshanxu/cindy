@@ -46,6 +46,8 @@ export interface DesktopCommandTriggeredPayload {
   goalAction?: 'set' | 'cleared' | 'open-dialog';
   /** /learn 专用 —— 启动成功时的 runId(renderer 据此关联 learn:event 状态流)。 */
   learnRunId?: string;
+  /** Main-owned lifecycle fence propagated to every renderer in a broadcast. */
+  requireActiveSession?: boolean;
 }
 
 export interface CmdExecutionResult {
@@ -100,6 +102,7 @@ function buildPayload(
     ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
     ...(ctx.workingDir ? { workingDir: ctx.workingDir } : {}),
     ...(ctx.args ? { args: ctx.args } : {}),
+    ...(ctx.sessionRouteLockHeld ? { requireActiveSession: true } : {}),
   };
 }
 
@@ -396,7 +399,7 @@ export function registerBuiltinDesktopCommands(
         let result: CmdExecutionResult;
         try {
           result = (await deps.remoteInvoke(ctx.deviceId, 'desktop-cmd:run', [
-            { cmdLine, cwd },
+            { sessionId: ctx.sessionId, cmdLine, cwd },
           ])) as CmdExecutionResult;
         } catch (err) {
           log.warn('/cmd remote exec failed', err);
@@ -506,8 +509,15 @@ export function registerBuiltinDesktopCommands(
       }
       // /goal <objective> → 直接设/编辑目标并续跑。
       try {
-        if (remoteGoal) await remoteGoal.setGoal({ sessionId, objective: arg });
-        else await controller!.setGoal({ sessionId, objective: arg });
+        if (remoteGoal) {
+          await remoteGoal.setGoal({ sessionId, objective: arg });
+        } else {
+          await controller!.setGoal({
+            sessionId,
+            objective: arg,
+            ...(ctx.sessionRouteLockHeld ? { sessionRouteLockHeld: true } : {}),
+          });
+        }
         broadcastDesktopCommand({ ...buildPayload('goal', ctx), goalAction: 'set' });
       } catch (err) {
         log.warn('/goal setGoal failed', err);

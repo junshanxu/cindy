@@ -89,6 +89,7 @@ function makeDeps(
   return {
     assertCaller: vi.fn(),
     waitUntilReady: vi.fn(async () => undefined),
+    acquireSourceSessionLifecycle: vi.fn(async () => () => {}),
     createRunId: vi.fn(() => `run-${++id}`),
     createReviewerSessionId: vi.fn(() => `reviewer-${id}`),
     owner: { instanceId: 'main-instance-1', processId: 123 },
@@ -186,6 +187,26 @@ describe('maker:review:start IPC lifecycle', () => {
     expect(deps.assertCaller).toHaveBeenCalledTimes(2);
     expect(deps.waitUntilReady).not.toHaveBeenCalled();
     expect(deps.prepareRun).not.toHaveBeenCalled();
+  });
+
+  it('runs the source lifecycle fence before preparing any Review side effect', async () => {
+    const harness = new IpcHarness();
+    const reviewer = new FakeReviewer();
+    const acquireSourceSessionLifecycle = vi.fn(async () => {
+      throw new Error('source task archived');
+    });
+    const deps = makeDeps(reviewer, { acquireSourceSessionLifecycle });
+    registerReviewStartHandler(harness, deps);
+
+    await expect(harness.invoke(MAKER_INVOKE.START_REVIEW, reviewRequest())).rejects.toThrow(
+      'source task archived',
+    );
+
+    expect(acquireSourceSessionLifecycle).toHaveBeenCalledWith(expect.anything(), 'source-1');
+    expect(deps.prepareRun).not.toHaveBeenCalled();
+    expect(deps.acquireSourceLease).not.toHaveBeenCalled();
+    expect(deps.createSourceCard).not.toHaveBeenCalled();
+    expect(deps.startReviewer).not.toHaveBeenCalled();
   });
 
   it('runs card, bootstrap, accepted send, and completed result through the real handler', async () => {

@@ -173,6 +173,10 @@ export interface ReviewCardWrite {
 export interface ReviewStartHandlerDeps {
   assertCaller(event: unknown): void;
   waitUntilReady(sourceSessionId: string): Promise<void>;
+  acquireSourceSessionLifecycle(
+    event: unknown,
+    sourceSessionId: string,
+  ): Promise<() => void>;
   createRunId(): string;
   createReviewerSessionId(): string;
   owner: ReviewRunOwner;
@@ -274,6 +278,10 @@ export function registerReviewStartHandler(
     const runId = deps.createRunId();
     const reviewerSessionId = deps.createReviewerSessionId();
     const sourceCardClientId = `review:${runId}`;
+    const releaseSourceSessionLifecycle = await deps.acquireSourceSessionLifecycle(
+      event,
+      request.sourceSessionId,
+    );
     activeReviewsBySource.set(request.sourceSessionId, { runId, reviewerSessionId });
 
     let disposeReviewEvents: (() => void) | null = null;
@@ -685,6 +693,8 @@ export function registerReviewStartHandler(
         throwIpcError('PRECONDITION_FAILED', error.message);
       }
       throw error;
+    } finally {
+      releaseSourceSessionLifecycle();
     }
   });
 

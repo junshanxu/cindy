@@ -651,7 +651,10 @@ export class GoalController {
         this.attachListener(sessionId);
         this.emit(updated);
         if (this.turns.get(sessionId) === activeBoundary) {
-          await this.fireTurn(sessionId, { throwOnRestoreFailure: true });
+          await this.fireTurn(sessionId, {
+            throwOnRestoreFailure: true,
+            sessionRouteLockHeld: input.sessionRouteLockHeld,
+          });
         }
       } catch (error) {
         if (this.turns.get(sessionId) === editBoundary) {
@@ -731,7 +734,10 @@ export class GoalController {
       this.attachListener(sessionId);
       this.emit(state);
       if (this.turns.get(sessionId) === activeBoundary) {
-        await this.fireTurn(sessionId, { throwOnRestoreFailure: true });
+        await this.fireTurn(sessionId, {
+          throwOnRestoreFailure: true,
+          sessionRouteLockHeld: input.sessionRouteLockHeld,
+        });
       }
     } catch (error) {
       if (this.turns.get(sessionId) === createBoundary) this.turns.delete(sessionId);
@@ -2295,6 +2301,7 @@ export class GoalController {
     opts?: {
       throwOnRestoreFailure?: boolean;
       throwOnUnpersistedRestoreFailure?: boolean;
+      sessionRouteLockHeld?: boolean;
     },
   ): Promise<void> {
     if (this.disposed) return;
@@ -2401,7 +2408,11 @@ export class GoalController {
       // apply、重新读取 live session 和 Session.send；否则并发 SET_MODEL 能在 fresh
       // session 创建后、send 前再次换 route，让本轮落到 UI 未显示的来源。
       releaseAgentSwitchLock =
-        (await this.deps.acquirePendingAgentSwitch?.(sessionId)) ?? (() => {});
+        (await (opts?.sessionRouteLockHeld
+          ? this.deps.acquirePendingAgentSwitch?.(sessionId, {
+              sessionRouteLockHeld: true,
+            })
+          : this.deps.acquirePendingAgentSwitch?.(sessionId))) ?? (() => {});
       if (!isCurrentLifecycle()) return;
       const session = await this.deps.ensureSession(sessionId);
       if (!isCurrentLifecycle()) return;

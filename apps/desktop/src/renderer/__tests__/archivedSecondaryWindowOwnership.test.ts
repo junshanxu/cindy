@@ -210,6 +210,79 @@ describe('archived secondary-window ownership', () => {
     }
   });
 
+  it('rechecks the archive lifecycle after slash reconciliation and before every desktop side effect', () => {
+    const slashDispatch = sessionViewSource.slice(
+      sessionViewSource.indexOf('const maybeDispatchDesktopSlashCommand = useCallback('),
+      sessionViewSource.indexOf('const handleWorkingDirChange = useCallback('),
+    );
+    const reconciliation = slashDispatch.indexOf('const reconciled =');
+    const lifecycleFence = slashDispatch.indexOf('await options.beforeDesktopDispatch()');
+    const startReview = slashDispatch.indexOf('await window.electronAPI.maker.startReview({');
+    const executeDesktopCommand = slashDispatch.indexOf(
+      'const dispatchResult = await dispatchCommand(hit',
+    );
+
+    expect(reconciliation).toBeGreaterThan(-1);
+    expect(lifecycleFence).toBeGreaterThan(reconciliation);
+    expect(startReview).toBeGreaterThan(lifecycleFence);
+    expect(executeDesktopCommand).toBeGreaterThan(startReview);
+    expect(slashDispatch).toContain("if (dispatchResult === 'rejected')");
+    expect(slashDispatch).toContain('requireActiveSession: true');
+
+    for (const source of [
+      sessionViewSource.slice(
+        sessionViewSource.indexOf('const handleWorkingDirChange = useCallback('),
+        sessionViewSource.indexOf('const maybeShowContextUsage = useCallback('),
+      ),
+      sessionViewSource.slice(
+        sessionViewSource.indexOf('const handleSend = useCallback('),
+        sessionViewSource.indexOf('const handleStopSession = useCallback('),
+      ),
+      sessionViewSource.slice(
+        sessionViewSource.indexOf('const restoreRecoverableHandoff = useCallback('),
+        sessionViewSource.indexOf('const pendingGoalConsumedRef = useRef(false);'),
+      ),
+    ]) {
+      expect(source).toContain('beforeDesktopDispatch: allowArchivedSecondaryWindowEnqueue');
+    }
+  });
+
+  it('serializes secondary-window desktop commands, Review, and clear against archival in Main', () => {
+    const desktopHandler = registerSource.slice(
+      registerSource.indexOf('MAKER_INVOKE.EXECUTE_DESKTOP_COMMAND'),
+      registerSource.indexOf('MAKER_INVOKE.LIST_AGENT_COMMANDS'),
+    );
+    const reviewRegistration = registerSource.slice(
+      registerSource.indexOf('registerReviewStartHandler(makerSessionRegistry'),
+      registerSource.indexOf(
+        'registerPrecreatedWorktreeDiscardHandler',
+        registerSource.indexOf('registerReviewStartHandler(makerSessionRegistry'),
+      ),
+    );
+    const clearHandler = registerSource.slice(
+      registerSource.indexOf('MAKER_INVOKE.INPUT_CLEAR_SESSION'),
+      registerSource.indexOf('MAKER_INVOKE.ABORT_SESSION'),
+    );
+
+    expect(desktopHandler).toContain('assertTrustedAppRendererEvent(e)');
+    expect(desktopHandler).toContain('isSecondarySessionWindowEvent(e)');
+    expect(desktopHandler).toContain('const mustFenceActiveSession =');
+    expect(desktopHandler).toContain('await withSendToSessionLock(sessionId, async () => {');
+    expect(desktopHandler).toContain('await assertSessionActiveForManualDispatch(sessionId)');
+    expect(desktopHandler).toContain('sessionRouteLockHeld: true');
+    expect(desktopHandler).toContain('rawContext.requireActiveSession === true');
+    expect(reviewRegistration).toContain('acquireSourceSessionLifecycle: async');
+    expect(reviewRegistration).toContain(
+      'if (!isSecondarySessionWindowEvent(ipcEvent)) return () => {}',
+    );
+    expect(reviewRegistration).toContain('await acquireSendToSessionLock(sourceSessionId)');
+    expect(clearHandler).toContain(
+      'isSecondarySessionWindowEvent(e) || requiresActiveSessionForDispatch(opts)',
+    );
+    expect(clearHandler).toContain('await assertSessionActiveForManualDispatch(sid)');
+    expect(registerSource).toContain('if (options?.sessionRouteLockHeld) {');
+  });
+
   it('removes queue resume and steer dispatchers while an archived secondary window stays open', () => {
     const resumeHandler = sessionViewSource.slice(
       sessionViewSource.indexOf('const handleArchivedSafeQueueResume = useCallback('),
@@ -349,29 +422,4 @@ describe('archived secondary-window ownership', () => {
     expect(enqueueBody).toContain('{ requireActiveSession: true }');
   });
 
-  it('fences desktop slash-command effects before their Main dispatch boundary', () => {
-    const helperStart = sessionViewSource.indexOf('const maybeDispatchDesktopSlashCommand = useCallback(');
-    const helperEnd = sessionViewSource.indexOf('const handleWorkingDirChange = useCallback(', helperStart);
-    const helperBody = sessionViewSource.slice(helperStart, helperEnd);
-    const reviewFence = helperBody.indexOf(
-      'await options.beforeDesktopDispatch()',
-      helperBody.indexOf("hit.name === 'review'"),
-    );
-    const reviewDispatch = helperBody.indexOf('window.electronAPI.maker.startReview', reviewFence);
-    const commandFence = helperBody.indexOf('await options.beforeDesktopDispatch()', reviewDispatch);
-    const commandDispatch = helperBody.indexOf('await dispatchCommand(hit, {', commandFence);
-    const mainFence = registerSource.indexOf('await assertSessionActiveForManualDispatch(c.sessionId);');
-    const mainDispatch = registerSource.indexOf('getDesktopCommandRegistry().execute(name, c);', mainFence);
-
-    expect(reviewFence).toBeGreaterThan(-1);
-    expect(reviewDispatch).toBeGreaterThan(reviewFence);
-    expect(commandFence).toBeGreaterThan(reviewDispatch);
-    expect(commandDispatch).toBeGreaterThan(commandFence);
-    expect(mainFence).toBeGreaterThan(-1);
-    expect(mainDispatch).toBeGreaterThan(mainFence);
-    expect(sessionViewSource).toContain(
-      'beforeDesktopDispatch: allowArchivedSecondaryWindowEnqueue',
-    );
-    expect(helperBody).toContain('requireActiveSession: true');
-  });
 });

@@ -2459,12 +2459,15 @@ export function CCAgentSessionView({
   useEffect(() => {
     const unsub = window.electronAPI.maker.onDesktopCommandTriggered((payload) => {
       if (payload.sessionId && payload.sessionId !== sessionId) return;
+      if (isArchivedSecondaryWindowInputBlocked()) return;
       if (payload.command === 'help') {
         void insertHelpCard();
         return;
       }
       if (payload.command === 'clear') {
-        clearSession();
+        clearSession({
+          requireActiveSession: payload.requireActiveSession === true || isSecondaryWindow(),
+        });
         return;
       }
       if (payload.command === 'cmd') {
@@ -2521,7 +2524,14 @@ export function CCAgentSessionView({
       // 'issue' 命令由下方独立 effect 处理(需要 handleSend,其声明在本 effect 之后)。
     });
     return unsub;
-  }, [insertHelpCard, clearSession, insertSystemCard, sessionId, t]);
+  }, [
+    insertHelpCard,
+    clearSession,
+    insertSystemCard,
+    isArchivedSecondaryWindowInputBlocked,
+    sessionId,
+    t,
+  ]);
 
   // F-COLLAB: 协同模式真实状态。enabled 来自 session.orcaRole === 'lead';
   // worker(显示用)从 active workflow 的 Worker session 列表查到 agentKind。
@@ -3114,6 +3124,9 @@ export function CCAgentSessionView({
       // Desktop commands stay `^/` only. A whitespace-prefixed `/help` is not a dispatch.
       if (!slashMatch) return { handled: false, accepted: false, message };
       if (!allowDesktopDispatch) return { handled: false, accepted: false, message };
+      if (options?.beforeDesktopDispatch && !(await options.beforeDesktopDispatch())) {
+        return { handled: true, accepted: false, message };
+      }
       // Review is handed to Main immediately with this invocation's serialized
       // attachments. It must not depend on this React view remaining mounted,
       // nor share a mutable attachment ref with a later command.
@@ -3126,9 +3139,6 @@ export function CCAgentSessionView({
           return { handled: true, accepted: false, message };
         }
         const attachments = files?.length ? serializeAttachedFiles(files) : undefined;
-        if (options?.beforeDesktopDispatch && !(await options.beforeDesktopDispatch())) {
-          return { handled: true, accepted: false, message };
-        }
         try {
           await window.electronAPI.maker.startReview({
             sourceSessionId: sessionId,
@@ -3148,9 +3158,6 @@ export function CCAgentSessionView({
           return { handled: true, accepted: false, message };
         }
       }
-      if (options?.beforeDesktopDispatch && !(await options.beforeDesktopDispatch())) {
-        return { handled: true, accepted: false, message };
-      }
       // 仅 /issue 需要携带附件:snapshot 到 ref,DESKTOP_COMMAND_TRIGGERED 回流时消费。
       // 其它 desktop 命令(/help /clear /cmd ...)不涉及附件,不写 ref。
       if (hit.name === 'issue') {
@@ -3160,13 +3167,17 @@ export function CCAgentSessionView({
       // 经隧道路由到被控端执行(纯 UI 命令忽略该字段)。用视图的粘滞 remoteDeviceId
       // 而非现读快照:origin 注入 / 重连窗口内快照为 undefined,会误走本机路径
       // (/cmd 拿被控端路径本机 spawn、/goal /learn 在本机产生副作用;Codex review #548)。
-      await dispatchCommand(hit, {
+      const dispatchResult = await dispatchCommand(hit, {
         ...(sessionId ? { sessionId } : {}),
         ...(workingDir ? { workingDir } : {}),
         ...(args ? { args } : {}),
         ...(remoteDeviceId ? { deviceId: remoteDeviceId } : {}),
         ...(!remoteDeviceId && isSecondaryWindow() ? { requireActiveSession: true } : {}),
       });
+      if (dispatchResult === 'rejected') {
+        if (hit.name === 'issue') pendingIssueFilesRef.current = undefined;
+        return { handled: true, accepted: false, message };
+      }
       return { handled: true, accepted: true, message };
     },
     [
@@ -3714,6 +3725,7 @@ export function CCAgentSessionView({
     const unsub = window.electronAPI.maker.onDesktopCommandTriggered((payload) => {
       if (payload.command !== 'issue') return;
       if (!payload.sessionId || payload.sessionId !== sessionId || !session) return;
+      if (isArchivedSecondaryWindowInputBlocked()) return;
       const details = payload.args?.trim()
         ? t('issueAgent.command.detailsPrefix', { details: payload.args.trim() })
         : '';
@@ -3730,7 +3742,7 @@ export function CCAgentSessionView({
       );
     });
     return unsub;
-  }, [sessionId, session, handleSend, t]);
+  }, [sessionId, session, handleSend, isArchivedSecondaryWindowInputBlocked, t]);
 
   const { confirm: confirmDialog } = useConfirmDialog();
   // 防双击重入:ConfirmDialogProvider 是队列语义,弹窗 mount 前的连续点击会入队

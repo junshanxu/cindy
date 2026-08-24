@@ -30,10 +30,19 @@ const log = createLogger('desktop-commands:remote-cmd');
 /** desktop-cmd:run channel 常量(allowlist / 控制端 builtins 同名字符串消费)。 */
 export const DESKTOP_CMD_RUN_CHANNEL = 'desktop-cmd:run';
 
+export interface RemoteCmdIpcDeps {
+  /** Trusted source marker from the device-link async context. */
+  isDeviceLinkInvoke(): boolean;
+  /** Serialize the remote command with archive/close for this session. */
+  withSessionLock<T>(sessionId: string, task: () => Promise<T>): Promise<T>;
+  /** Re-read the persisted session lifecycle while the lock is held. */
+  assertSessionActive(sessionId: string): Promise<void>;
+}
+
 /** 幂等保护:与 registerLearnIpc 同款 —— 可重试注册块内二次执行不 throw。 */
 let _registered = false;
 
-export function registerRemoteCmdIpc(): void {
+export function registerRemoteCmdIpc(deps: RemoteCmdIpcDeps): void {
   if (_registered) return;
   _registered = true;
   ipcMain.handle(
@@ -42,21 +51,31 @@ export function registerRemoteCmdIpc(): void {
       const obj = requireObject(input, 'input');
       const cmdLine = requireString(obj.cmdLine, 'cmdLine').trim();
       const cwd = requireString(obj.cwd, 'cwd');
+      const sessionId = typeof obj.sessionId === 'string' ? obj.sessionId.trim() : '';
       if (!cmdLine) throwIpcError('INVALID_PARAMS', 'cmdLine must not be empty');
-      if (!(await isRemoteWorkingDirAllowed(cwd))) {
-        throwIpcError('INVALID_PARAMS', `working directory not allowed: ${cwd}`);
-      }
-      log.info('remote /cmd exec ▶', { cmdLine, cwd });
-      const result = await runShellCommand({ cmdLine, cwd });
-      log.info('remote /cmd exec ◀', {
-        cmdLine,
-        cwd,
-        exitCode: result.exitCode,
-        elapsedMs: result.elapsedMs,
-        timedOut: result.timedOut,
-        spawnError: result.spawnError ?? null,
+      const run = async (): Promise<CmdExecutionResult> => {
+        if (!(await isRemoteWorkingDirAllowed(cwd))) {
+          throwIpcError('INVALID_PARAMS', `working directory not allowed: ${cwd}`);
+        }
+        log.info('remote /cmd exec ▶', { cmdLine, cwd, sessionId: sessionId || undefined });
+        const result = await runShellCommand({ cmdLine, cwd });
+        log.info('remote /cmd exec ◀', {
+          cmdLine,
+          cwd,
+          sessionId: sessionId || undefined,
+          exitCode: result.exitCode,
+          elapsedMs: result.elapsedMs,
+          timedOut: result.timedOut,
+          spawnError: result.spawnError ?? null,
+        });
+        return result;
+      };
+      if (!deps.isDeviceLinkInvoke()) return run();
+      if (!sessionId) throwIpcError('INVALID_PARAMS', 'sessionId required for remote /cmd');
+      return deps.withSessionLock(sessionId, async () => {
+        await deps.assertSessionActive(sessionId);
+        return run();
       });
-      return result;
     },
   );
   log.info('remote cmd IPC handler registered');

@@ -81,6 +81,20 @@ describe('/goal 远程路由', () => {
     expect(remoteInvoke).not.toHaveBeenCalled();
   });
 
+  it('Main 已持有 session route lock 时把所有权传给 Goal 首轮派发', async () => {
+    const { registry, goalController } = makeHarness();
+    await registry.execute('goal', {
+      sessionId: 'ls',
+      args: '目标 Z',
+      sessionRouteLockHeld: true,
+    });
+    expect(goalController.setGoal).toHaveBeenCalledWith({
+      sessionId: 'ls',
+      objective: '目标 Z',
+      sessionRouteLockHeld: true,
+    });
+  });
+
   it('被控端版本过旧(CHANNEL_NOT_ALLOWED)→ remote-unsupported', async () => {
     const { registry } = makeHarness({
       remoteInvoke: async () => {
@@ -173,7 +187,7 @@ describe('/cmd 远程路由', () => {
       args: 'ls',
     });
     expect(remoteInvoke).toHaveBeenCalledWith('dev-1', 'desktop-cmd:run', [
-      { cmdLine: 'ls', cwd: '/remote/dir' },
+      { sessionId: 'rs', cmdLine: 'ls', cwd: '/remote/dir' },
     ]);
     expect(sentPayloads().at(-1)).toMatchObject({ command: 'cmd', result: remoteResult });
   });

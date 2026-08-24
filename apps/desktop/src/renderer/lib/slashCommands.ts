@@ -479,7 +479,7 @@ export interface DispatchContext {
  * 返回 'handled-locally' 表示已处理(调用方应阻止默认 send 行为);
  * 返回 'forward-to-agent' 表示让调用方继续走默认 send 路径。
  */
-export type DispatchResult = 'handled-locally' | 'forward-to-agent';
+export type DispatchResult = 'handled-locally' | 'forward-to-agent' | 'rejected';
 
 export async function dispatchCommand(
   cmd: UnifiedCommand,
@@ -498,6 +498,7 @@ export async function dispatchCommand(
       log.warn(
         `executeDesktopCommand /${cmd.name} failed: ${err instanceof Error ? err.message : String(err)}`,
       );
+      return 'rejected';
     }
     return 'handled-locally';
   }

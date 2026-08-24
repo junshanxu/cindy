@@ -620,6 +620,22 @@ describe('GoalController', () => {
     expect(releaseAgentSwitchLock).toHaveBeenCalledTimes(1);
   });
 
+  it('reuses a caller-held session route lock for the first Goal dispatch', async () => {
+    const acquirePendingAgentSwitch = vi.fn(async () => () => {});
+    const local = makeController({ acquirePendingAgentSwitch });
+
+    await local.controller.setGoal({
+      sessionId: 's1',
+      objective: 'continue under the accepted route',
+      sessionRouteLockHeld: true,
+    });
+
+    expect(acquirePendingAgentSwitch).toHaveBeenCalledWith('s1', {
+      sessionRouteLockHeld: true,
+    });
+    expect(local.session.sends).toHaveLength(1);
+  });
+
   it('migrates the Goal listener to the switched session so the new engine turn can finalize (reviewer P1)', async () => {
     const oldSession = new FakeSession('s1', 'claude-code');
     const switchedSession = new FakeSession('s1', 'codex');

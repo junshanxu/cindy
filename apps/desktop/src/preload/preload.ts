@@ -5862,6 +5862,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
         };
         error?: string;
         goalAction?: 'set' | 'cleared' | 'open-dialog';
+        requireActiveSession?: boolean;
       }) => void,
     ): (() => void) => {
       const channel = 'maker:desktop-command-triggered';
@@ -6773,8 +6774,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
       clearSession: (
         sessionId: string,
         clearedAt?: string,
+        opts?: import('../shared/agentInputQueue').AgentInputRequireActiveSessionOpts,
       ): Promise<import('../shared/agentInputQueue').AgentInputProjection> =>
-        ipcRenderer.invoke('maker:input:clear-session', sessionId, clearedAt),
+        opts === undefined
+          ? ipcRenderer.invoke('maker:input:clear-session', sessionId, clearedAt)
+          : ipcRenderer.invoke('maker:input:clear-session', sessionId, clearedAt, opts),
     },
 
     // Stage 2 C1: chat utility (前身 cc-agent:generate-title / cc-agent:plan-file-write)

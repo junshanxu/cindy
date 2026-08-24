@@ -38,6 +38,12 @@ export interface DesktopCommandContext {
    */
   senderWebContentsId?: number;
   /**
+   * Main-owned lifecycle marker. A secondary-window command sets this only
+   * after it has acquired the source session route lock and rechecked the
+   * persisted session status. Renderer input with the same field is ignored.
+   */
+  sessionRouteLockHeld?: boolean;
+  /**
    * device-link 远程会话的归属设备 id(renderer 从 remoteProjectsStore 注册表填入,
    * 本机会话缺省)。业务语义在"会话归属设备"的命令(/goal /learn /cmd)据此把
    * 执行经隧道路由到被控端;纯控制端 UI 命令(/help /clear 等)忽略它。

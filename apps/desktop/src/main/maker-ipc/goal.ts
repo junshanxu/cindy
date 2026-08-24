@@ -29,6 +29,18 @@ import { MAKER_INVOKE, MAKER_PUSH } from './channels.js';
 
 const log = createLogger('maker-ipc:goal');
 
+export interface GoalHandlerLifecycleDeps {
+  isDeviceLinkInvoke(): boolean;
+  withSessionLock<T>(sessionId: string, task: () => Promise<T>): Promise<T>;
+  assertSessionActive(sessionId: string): Promise<void>;
+}
+
+const NOOP_GOAL_LIFECYCLE_DEPS: GoalHandlerLifecycleDeps = {
+  isDeviceLinkInvoke: () => false,
+  withSessionLock: async (_sessionId, task) => task(),
+  assertSessionActive: async (_sessionId) => undefined,
+};
+
 type GoalLimitPatchKey = 'maxTurns' | 'budgetTokens' | 'noProgressLimit';
 
 function throwGoalControllerIpcError(error: unknown): never {
@@ -87,7 +99,20 @@ export function broadcastGoalStatus(update: GoalStatusUpdate): void {
   tapWindowBroadcast(MAKER_PUSH.GOAL_STATUS_CHANGED, update);
 }
 
-export function registerGoalHandlers(): void {
+export function registerGoalHandlers(
+  lifecycle: GoalHandlerLifecycleDeps = NOOP_GOAL_LIFECYCLE_DEPS,
+): void {
+  const runWithLifecycleGuard = <T>(
+    sessionId: string,
+    task: () => Promise<T>,
+  ): Promise<T> => {
+    if (!lifecycle.isDeviceLinkInvoke()) return task();
+    return lifecycle.withSessionLock(sessionId, async () => {
+      await lifecycle.assertSessionActive(sessionId);
+      return task();
+    });
+  };
+
   // 设目标(renderer 备用入口;命令路径走 commands/builtins.ts)。新建/编辑都直接生效并续跑。
   ipcMain.handle(MAKER_INVOKE.GOAL_SET, async (_e, input: unknown) => {
     const obj = requireObject(input, 'goal');
@@ -107,7 +132,14 @@ export function registerGoalHandlers(): void {
     const controller = getGoalController();
     if (!controller) throwIpcError('INTERNAL', 'goal controller not started');
     try {
-      await controller.setGoal({ sessionId, objective, ...(limits ? { limits } : {}) });
+      await runWithLifecycleGuard(sessionId, () =>
+        controller.setGoal({
+          sessionId,
+          objective,
+          ...(limits ? { limits } : {}),
+          ...(lifecycle.isDeviceLinkInvoke() ? { sessionRouteLockHeld: true } : {}),
+        }),
+      );
     } catch (err) {
       throwGoalControllerIpcError(err);
     }
@@ -117,7 +149,7 @@ export function registerGoalHandlers(): void {
   // 用户清除目标(GoalIndicator ✕ 按钮)。
   ipcMain.handle(MAKER_INVOKE.GOAL_CLEAR, async (_e, sessionId: unknown) => {
     const id = requireString(sessionId, 'sessionId');
-    await getGoalController()?.clearGoal(id);
+    await runWithLifecycleGuard(id, () => getGoalController()?.clearGoal(id) ?? Promise.resolve());
     return { ok: true };
   });
 

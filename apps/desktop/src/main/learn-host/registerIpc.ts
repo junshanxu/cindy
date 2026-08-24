@@ -23,6 +23,18 @@ import { LearnError } from './controller';
 
 const log = createLogger('learn-host:ipc');
 
+export interface LearnIpcLifecycleDeps {
+  isDeviceLinkInvoke(): boolean;
+  withSessionLock<T>(sessionId: string, task: () => Promise<T>): Promise<T>;
+  assertSessionActive(sessionId: string): Promise<void>;
+}
+
+const NOOP_LEARN_LIFECYCLE_DEPS: LearnIpcLifecycleDeps = {
+  isDeviceLinkInvoke: () => false,
+  withSessionLock: async (_sessionId, task) => task(),
+  assertSessionActive: async (_sessionId) => undefined,
+};
+
 /** learn:* channel 常量 —— preload 与 renderer 按同名字符串消费。 */
 export const LEARN_CHANNELS = {
   START: 'learn:start',
@@ -70,12 +82,20 @@ export function broadcastLearnEvent(payload: LearnEventPayload): void {
  *  二次注册直接 throw,反而让重试永远无法恢复(Greptile review,含复现)。 */
 let _learnIpcRegistered = false;
 
-export function registerLearnIpc(): void {
+export function registerLearnIpc(
+  lifecycle: LearnIpcLifecycleDeps = NOOP_LEARN_LIFECYCLE_DEPS,
+): void {
   if (_learnIpcRegistered) return;
   _learnIpcRegistered = true;
   ipcMain.handle(LEARN_CHANNELS.START, async (_event, req: LearnStartRequest) => {
     try {
-      return await mustController().startLearn(req);
+      const start = () => mustController().startLearn(req);
+      const sourceSessionId = req.originSessionId?.trim();
+      if (!lifecycle.isDeviceLinkInvoke() || !sourceSessionId) return await start();
+      return await lifecycle.withSessionLock(sourceSessionId, async () => {
+        await lifecycle.assertSessionActive(sourceSessionId);
+        return start();
+      });
     } catch (err) {
       rethrow(err);
     }
