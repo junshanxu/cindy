@@ -170,6 +170,18 @@ describe('Plugin Market IPC error boundary', () => {
       manifestIncompatible: false,
     },
     {
+      label: 'an unknown string slot whose name contains the suffix separator text',
+      // 合法未知 slot 名本身可能包含诊断后缀分隔文本 "(可用:"。分类器必须锚定诊断
+      // 末尾的完整后缀、从 slot 名外部反解析,而不是 indexOf 任意位置——否则会把
+      // 这个该升级的包误判为 GHOST_FILE_INVALID(Codex P2 回归)。
+      response: invalidManifestResponse(GHOST_MANIFEST_SCHEMA_VERSION, {
+        slots: ['future(可用:x)'],
+        tools: undefined,
+      }),
+      hostUnsupported: true,
+      manifestIncompatible: false,
+    },
+    {
       label: 'a duplicated unknown string slot',
       // 同一个未知 slot 出现两次:新 Host 识别后仍会因重复声明而拒包,所以不该
       // 提示升级,应判为包本身无效(GHOST_FILE_INVALID)。

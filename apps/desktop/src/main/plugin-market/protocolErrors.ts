@@ -1,9 +1,13 @@
-import { GHOST_MANIFEST_SCHEMA_VERSION } from '@cindy/plugin-protocol';
+import { GHOST_MANIFEST_SCHEMA_VERSION, GHOST_SLOTS } from '@cindy/plugin-protocol';
 
 const CURRENT_RELEASE_MANIFEST_MARKER = 'currentRelease.manifest';
 const MANIFEST_SCHEMA_REASON_PREFIX = `schemaVersion 必须是 ${GHOST_MANIFEST_SCHEMA_VERSION},得到 `;
 const UNKNOWN_SLOT_REASON_PREFIX = 'slots 含未知卡槽 ';
-const UNKNOWN_SLOT_REASON_SUFFIX = '(可用:';
+// 与 plugin-protocol 的诊断构造同源(manifest.ts):`slots 含未知卡槽
+// <JSON.stringify(slot)>(可用:<GHOST_SLOTS join ' / ')`。后缀必须锚定到诊断
+// 末尾,不能用 indexOf——合法未知 slot 名本身可能包含 "(可用:" 文本,从 slot 名
+// 内部任意位置反解析会切坏 JSON、把该升级的包误判为包无效。
+const UNKNOWN_SLOT_REASON_SUFFIX = `(可用:${GHOST_SLOTS.join(' / ')})`;
 
 function currentReleaseManifestReason(error: unknown): string | null {
   if (
@@ -67,8 +71,13 @@ export function isPluginHostUnsupportedError(error: unknown): boolean {
   }
 
   if (!reason.startsWith(UNKNOWN_SLOT_REASON_PREFIX)) return false;
-  const suffixIndex = reason.indexOf(UNKNOWN_SLOT_REASON_SUFFIX);
-  if (suffixIndex < 0) return false;
-  const parsed = parseJsonLiteral(reason.slice(UNKNOWN_SLOT_REASON_PREFIX.length, suffixIndex));
+  // 后缀必须紧贴诊断末尾;长度不匹配说明不是这条已知形状(可能是其它清单错误,
+  // 也可能是用户可控 slot 名里碰巧含 "(可用:" 文本),交给包无效分支。
+  if (!reason.endsWith(UNKNOWN_SLOT_REASON_SUFFIX)) return false;
+  const serialized = reason.slice(
+    UNKNOWN_SLOT_REASON_PREFIX.length,
+    reason.length - UNKNOWN_SLOT_REASON_SUFFIX.length,
+  );
+  const parsed = parseJsonLiteral(serialized);
   return parsed.ok && typeof parsed.value === 'string';
 }
