@@ -1,13 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { PermissionQueue } from '../register.js';
-import type { InteractionDecision } from '@cindy/maker-core';
+import type { InteractionDecision, InteractionRequest } from '@cindy/maker-core';
 
 function allow(): InteractionDecision {
   return { kind: 'permission', behavior: 'allow' };
 }
 function deny(reason = 'denied'): InteractionDecision {
   return { kind: 'permission', behavior: 'deny', reason };
+}
+function permissionRequest(requestId: string): Extract<InteractionRequest, { kind: 'permission' }> {
+  return { kind: 'permission', requestId, toolName: 'Bash', input: {} };
 }
 
 describe('PermissionQueue (issue #3092)', () => {
@@ -136,6 +139,9 @@ describe('PermissionQueue (issue #3092)', () => {
       bRan = true;
       return allow();
     });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(aReleased).toBeTypeOf('function');
     // Cancel while A is in-flight and B is queued.
     queue.cancel(deny('session_closed'));
     const c = queue.dispatch(async () => {
@@ -184,6 +190,9 @@ describe('PermissionQueue (issue #3092)', () => {
       bRan = true;
       return allow();
     });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(aReleased).toBeTypeOf('function');
 
     // Transient reset while A is in-flight and B is queued.
     queue.resetForNewTurn(deny('session_aborted'));
@@ -291,6 +300,9 @@ describe('PermissionQueue (issue #3092)', () => {
           };
         }),
     );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(releaseA).toBeTypeOf('function');
 
     // Reset while A is in-flight.
     queue.resetForNewTurn(deny('session_aborted'));
@@ -312,5 +324,99 @@ describe('PermissionQueue (issue #3092)', () => {
     await newTurn;
     expect(newTurnRan).toBe(true);
     expect(startedWhileAInFlight).toBe(false);
+  });
+
+  it('migrates every queued permission without running the Desktop handlers', async () => {
+    const queue = new PermissionQueue();
+    let releaseA: ((() => void) | null) | undefined;
+    const a = queue.dispatch(
+      () =>
+        new Promise((resolve) => {
+          releaseA = () => resolve(allow());
+        }),
+      { timeoutMs: 1000, takeoverRequest: permissionRequest('req-a') },
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(releaseA).toBeTypeOf('function');
+
+    let bRan = false;
+    let cRan = false;
+    const b = queue.dispatch(
+      async () => {
+        bRan = true;
+        return allow();
+      },
+      { timeoutMs: 1000, takeoverRequest: permissionRequest('req-b') },
+    );
+    const c = queue.dispatch(
+      async () => {
+        cRan = true;
+        return allow();
+      },
+      { timeoutMs: 1000, takeoverRequest: permissionRequest('req-c') },
+    );
+
+    const taken = queue.takeForTakeover(deny('session_migrated'));
+    expect(taken.map((entry) => entry.requestId)).toEqual(['req-b', 'req-c']);
+    expect(taken.every((entry) => entry.expiresAt !== undefined)).toBe(true);
+
+    taken[0]?.resolve(allow());
+    taken[1]?.resolve(deny('user_denied'));
+    await expect(b).resolves.toMatchObject({ kind: 'permission', behavior: 'allow' });
+    await expect(c).resolves.toMatchObject({
+      kind: 'permission',
+      behavior: 'deny',
+      reason: 'user_denied',
+    });
+    expect(bRan).toBe(false);
+    expect(cRan).toBe(false);
+
+    releaseA?.();
+    await a;
+  });
+
+  it('keeps the original queued deadline after takeover and ignores a late answer', async () => {
+    vi.useFakeTimers();
+    try {
+      const queue = new PermissionQueue();
+      let releaseA: ((() => void) | null) | undefined;
+      const a = queue.dispatch(
+        () =>
+          new Promise((resolve) => {
+            releaseA = () => resolve(allow());
+          }),
+        { timeoutMs: 1000, takeoverRequest: permissionRequest('req-a') },
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const expectedDeadline = Date.now() + 1000;
+      const b = queue.dispatch(async () => allow(), {
+        timeoutMs: 1000,
+        takeoverRequest: permissionRequest('req-b'),
+      });
+      await vi.advanceTimersByTimeAsync(400);
+      const [taken] = queue.takeForTakeover(deny('session_migrated'));
+      expect(taken?.expiresAt).toBe(expectedDeadline);
+
+      await vi.advanceTimersByTimeAsync(600);
+      await expect(b).resolves.toMatchObject({
+        kind: 'permission',
+        behavior: 'deny',
+        reason: 'timeout',
+      });
+      taken?.resolve(allow());
+      await expect(b).resolves.toMatchObject({
+        kind: 'permission',
+        behavior: 'deny',
+        reason: 'timeout',
+      });
+
+      releaseA?.();
+      await a;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

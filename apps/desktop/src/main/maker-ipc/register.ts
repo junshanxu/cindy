@@ -2242,6 +2242,8 @@ interface PendingInteractionEntry {
    */
   persistId?: string;
   timeoutId?: ReturnType<typeof setTimeout>;
+  /** Absolute deadline shared with a migrated channel card. */
+  expiresAt?: number;
 }
 
 const pendingInteractionResolvers = new Map<string, PendingInteractionEntry>();
@@ -2645,6 +2647,7 @@ export function takePendingInteractionsForSession(sessionId: string): Array<{
   requestId: string;
   request: InteractionRequest;
   resolve: (decision: InteractionDecision) => void;
+  expiresAt?: number;
 }> {
   const entries = Array.from(pendingInteractionResolvers.entries()).filter(
     ([, entry]) => entry.sessionId === sessionId,
@@ -2653,10 +2656,16 @@ export function takePendingInteractionsForSession(sessionId: string): Array<{
     requestId: string;
     request: InteractionRequest;
     resolve: (decision: InteractionDecision) => void;
+    expiresAt?: number;
   }> = [];
   for (const [requestId, entry] of entries) {
     clearPendingInteraction(requestId);
-    taken.push({ requestId, request: entry.request, resolve: entry.resolve });
+    taken.push({
+      requestId,
+      request: entry.request,
+      resolve: entry.resolve,
+      ...(entry.expiresAt !== undefined ? { expiresAt: entry.expiresAt } : {}),
+    });
     handleAgentIslandInteractionDismissed(entry.sessionId, requestId);
     // resolvedAs 省略 — renderer 行 1537 默认 'deny', UI 上只是关掉对话框,
     // 跟我们这里"搬走"语义一致(没真选 allow/deny)。
@@ -2666,18 +2675,15 @@ export function takePendingInteractionsForSession(sessionId: string): Array<{
       reason: 'migrated_to_feishu',
     });
   }
-  // Permission requests still queued behind the in-flight one have no
-  // pendingInteractionResolvers entry yet, so take() can't migrate them.
-  // Reset (not permanently cancel) queued permissions: the items queued
-  // behind the in-flight one have no pendingInteractionResolvers entry yet,
-  // so they settle with a terminal deny; the queue stays live so permissions
-  // emitted later in the same turn — after the listener switched to the
-  // taken-over route — still broadcast normally instead of returning a stale
-  // deny forever (issue #3092 review P2).
-  cancelPermissionQueueForSession(
-    sessionId,
-    defaultDecisionForPending('permission', 'session_migrated'),
-    'takeover',
+  // The queue also owns requests that were accepted by the interaction router
+  // but have not reached the renderer yet. Take them atomically with the
+  // displayed request so channel takeover preserves every user decision and
+  // the original deadline instead of silently denying the queued cohort.
+  taken.push(
+    ...takePermissionQueueForSession(
+      sessionId,
+      defaultDecisionForPending('permission', 'session_migrated'),
+    ),
   );
   return taken;
 }
@@ -3704,10 +3710,10 @@ export function installDesktopInteractionListener(session: {
       // The overall timeout covers queue wait + execution so that N parallel,
       // unanswered permissions can't extend the 10-minute cap to N×10 minutes
       // (each card's in-handler timer only starts when it reaches the front).
-      return queue.dispatch(
-        (ctx) => handleDesktopInteractionRequest(req, ctx),
-        { timeoutMs: PERMISSION_INTERACTION_TIMEOUT_MS },
-      );
+      return queue.dispatch((ctx) => handleDesktopInteractionRequest(req, ctx), {
+        timeoutMs: PERMISSION_INTERACTION_TIMEOUT_MS,
+        takeoverRequest: req,
+      });
     }
     return handleDesktopInteractionRequest(req);
   });
@@ -3753,13 +3759,18 @@ export function installDesktopInteractionListener(session: {
         persistId: interactionPersistId ?? undefined,
       };
       if (req.kind === 'permission') {
-        entry.timeoutId = setTimeout(() => {
-          const pending = clearPendingInteraction(req.requestId);
-          if (!pending) return;
-          handleAgentIslandInteractionDismissed(session.id, req.requestId);
-          pending.resolve({ kind: 'permission', behavior: 'deny', reason: 'timeout' });
-          dismissRendererInteraction(pending, req.requestId, 'timeout', 'deny');
-        }, PERMISSION_INTERACTION_TIMEOUT_MS);
+        const expiresAt = ctx?.expiresAt ?? Date.now() + PERMISSION_INTERACTION_TIMEOUT_MS;
+        entry.expiresAt = expiresAt;
+        entry.timeoutId = setTimeout(
+          () => {
+            const pending = clearPendingInteraction(req.requestId);
+            if (!pending) return;
+            handleAgentIslandInteractionDismissed(session.id, req.requestId);
+            pending.resolve({ kind: 'permission', behavior: 'deny', reason: 'timeout' });
+            dismissRendererInteraction(pending, req.requestId, 'timeout', 'deny');
+          },
+          Math.max(0, expiresAt - Date.now()),
+        );
       }
       // 必须先登记 pending,再广播。否则 renderer / device-link 回得太快会打到
       // 「no pending resolver」,确认卡看起来没反应,Codex 最终却记成用户拒绝。
@@ -3831,13 +3842,33 @@ function permissionQueueSeed(): InteractionDecision {
 export interface PermissionRunContext {
   isStale: () => boolean;
   bindTimeoutCleanup: (fn: () => void) => void;
+  /** Absolute deadline measured from enqueue, including queue wait. */
+  expiresAt?: number;
+}
+
+type PermissionRequest = Extract<InteractionRequest, { kind: 'permission' }>;
+
+export interface PermissionQueueTakeoverEntry {
+  requestId: string;
+  request: PermissionRequest;
+  resolve: (decision: InteractionDecision) => void;
+  expiresAt?: number;
+}
+
+interface PermissionQueueDispatchState {
+  generation: number;
+  started: boolean;
+  migrated: boolean;
+  settled: boolean;
+  request?: PermissionRequest;
+  expiresAt?: number;
+  resolve: (decision: InteractionDecision) => void;
 }
 
 export class PermissionQueue {
   // Tail of the serialization chain. Each dispatch chains onto this so
-  // runs execute one at a time in arrival order. It is replaced on
-  // resetForNewTurn so new-turn dispatches don't wait behind the drained
-  // previous turn.
+  // runs execute one at a time in arrival order. Channel takeover replaces
+  // it only after the accepted queued cohort has been handed to that channel.
   private tail: Promise<InteractionDecision> = Promise.resolve(permissionQueueSeed());
   // Monotonic generation. Bumped on every reset/cancel. A run captured
   // its enqueue generation; when it gets to run, if the generation moved
@@ -3851,17 +3882,25 @@ export class PermissionQueue {
   // Set on terminal cancel (session_closed): every dispatch settles with
   // this forever, regardless of generation.
   private closedDecision: InteractionDecision | null = null;
+  // Dispatches accepted by the router but not necessarily started in the
+  // renderer. Keeping explicit entries lets takeover move the queued cohort
+  // without replaying it on Desktop or silently denying it.
+  private readonly dispatches = new Set<PermissionQueueDispatchState>();
 
   /** Enqueue a permission run. Resolves with the run's own decision. */
   dispatch(
     run: (ctx: PermissionRunContext) => Promise<InteractionDecision>,
-    opts?: { timeoutMs?: number },
+    opts?: { timeoutMs?: number; takeoverRequest?: PermissionRequest },
   ): Promise<InteractionDecision> {
     // Terminal close: never run again.
     if (this.closedDecision) return Promise.resolve(this.closedDecision);
     this.reapDrainedDecisions();
     const myGen = this.generation;
     const timeoutMs = opts?.timeoutMs;
+    const expiresAt =
+      timeoutMs && timeoutMs > 0 && timeoutMs < Number.POSITIVE_INFINITY
+        ? Date.now() + timeoutMs
+        : undefined;
 
     // Per-dispatch stale flag: set when this dispatch's overall timeout
     // fires so that — even if it later reaches the front of the queue —
@@ -3878,22 +3917,54 @@ export class PermissionQueue {
       bindTimeoutCleanup: (fn) => {
         onTimeout = fn;
       },
+      ...(expiresAt !== undefined ? { expiresAt } : {}),
     };
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let resolveFinal!: (decision: InteractionDecision) => void;
+    let rejectFinal!: (error: unknown) => void;
+    const final = new Promise<InteractionDecision>((resolve, reject) => {
+      resolveFinal = resolve;
+      rejectFinal = reject;
+    });
+    const finish = (): boolean => {
+      if (state.settled) return false;
+      state.settled = true;
+      if (timer) clearTimeout(timer);
+      this.dispatches.delete(state);
+      return true;
+    };
+    const settleDecision = (decision: InteractionDecision): void => {
+      if (!finish()) return;
+      resolveFinal(decision);
+    };
+    const settleError = (error: unknown): void => {
+      if (!finish()) return;
+      rejectFinal(error);
+    };
+    const state: PermissionQueueDispatchState = {
+      generation: myGen,
+      started: false,
+      migrated: false,
+      settled: false,
+      ...(opts?.takeoverRequest ? { request: opts.takeoverRequest } : {}),
+      ...(expiresAt !== undefined ? { expiresAt } : {}),
+      resolve: settleDecision,
+    };
+    this.dispatches.add(state);
 
     // The gate resolves when it's this run's turn AND it is still current,
     // or rejects if the previous run threw (we still proceed to run()).
     const next = this.tail.then(
-      () => this.runIfCurrent(myGen, run, ctx),
-      () => this.runIfCurrent(myGen, run, ctx),
+      () => this.runIfCurrent(state, run, ctx),
+      () => this.runIfCurrent(state, run, ctx),
     );
 
     // Advance the tail. On rejection recover so a throwing run doesn't
     // poison the queue.
     this.tail = next.then(
       (d) => d,
-      () =>
-        this.closedDecision
-        ?? permissionQueueSeed(),
+      () => this.closedDecision ?? permissionQueueSeed(),
     );
 
     // Apply an overall timeout that counts QUEUE WAIT + execution, not
@@ -3902,47 +3973,52 @@ export class PermissionQueue {
     // because each card's own timer only starts when it reaches the front
     // (issue #3092 review). When the timeout fires, mark the dispatch
     // stale and tear down any interaction the run already started.
-    if (timeoutMs && timeoutMs > 0 && timeoutMs < Number.POSITIVE_INFINITY) {
-      return new Promise<InteractionDecision>((resolve) => {
-        const timer = setTimeout(() => {
+    if (expiresAt !== undefined) {
+      timer = setTimeout(
+        () => {
           timedOut = true;
           try {
             onTimeout?.();
           } catch {
             // best-effort cleanup
           }
-          resolve({
+          settleDecision({
             kind: 'permission',
             behavior: 'deny',
             reason: 'timeout',
           });
-        }, timeoutMs);
-        next.then(
-          (decision) => {
-            clearTimeout(timer);
-            resolve(decision);
-          },
-          () => {
-            clearTimeout(timer);
-            resolve({
-              kind: 'permission',
-              behavior: 'deny',
-              reason: 'timeout',
-            });
-          },
-        );
-      });
+        },
+        Math.max(0, expiresAt - Date.now()),
+      );
     }
-    return next;
+    next.then(
+      (decision) => {
+        if (!state.migrated) settleDecision(decision);
+      },
+      (error) => {
+        if (state.migrated) return;
+        if (expiresAt !== undefined) {
+          settleDecision({
+            kind: 'permission',
+            behavior: 'deny',
+            reason: 'timeout',
+          });
+        } else {
+          settleError(error);
+        }
+      },
+    );
+    return final;
   }
 
   /** Run `run` only if no reset/close/timeout happened while queued. */
   private runIfCurrent(
-    myGen: number,
+    state: PermissionQueueDispatchState,
     run: (ctx: PermissionRunContext) => Promise<InteractionDecision>,
     ctx: PermissionRunContext,
   ): Promise<InteractionDecision> {
     if (this.closedDecision) return Promise.resolve(this.closedDecision);
+    if (state.migrated) return Promise.resolve(permissionQueueSeed());
     if (ctx.isStale()) {
       // This dispatch's overall timeout fired while queued. Don't run.
       return Promise.resolve({
@@ -3951,13 +4027,14 @@ export class PermissionQueue {
         reason: 'timeout',
       });
     }
-    if (myGen !== this.generation) {
+    if (state.generation !== this.generation) {
       // A reset happened while we were queued. Settle with the drain
       // decision recorded for our generation instead of running.
       return Promise.resolve(
-        this.drainedDecisionByGen.get(myGen) ?? permissionQueueSeed(),
+        this.drainedDecisionByGen.get(state.generation) ?? permissionQueueSeed(),
       );
     }
+    state.started = true;
     return run(ctx);
   }
 
@@ -3972,6 +4049,16 @@ export class PermissionQueue {
    */
   cancel(decision: InteractionDecision): void {
     if (this.closedDecision) return;
+    for (const state of this.dispatches) {
+      if (
+        !state.started &&
+        !state.migrated &&
+        !state.settled &&
+        state.generation === this.generation
+      ) {
+        state.resolve(decision);
+      }
+    }
     this.closedDecision = decision;
     this.drainedDecisionByGen.set(this.generation, decision);
     this.generation++;
@@ -3979,7 +4066,7 @@ export class PermissionQueue {
 
   /**
    * Transient turn teardown (session_aborted / turn_idle_reconcile /
-   * orca_disable / channel takeover): settle runs queued for the old turn
+   * orca_disable): settle runs queued for the old turn
    * with `decision`, while keeping serialization intact for the next turn.
    *
    * We do NOT replace the tail: the currently in-flight run (which has
@@ -3995,6 +4082,11 @@ export class PermissionQueue {
    */
   resetForNewTurn(decision: InteractionDecision): void {
     const drainedGen = this.generation;
+    for (const state of this.dispatches) {
+      if (!state.started && !state.migrated && !state.settled && state.generation === drainedGen) {
+        state.resolve(decision);
+      }
+    }
     this.drainedDecisionByGen.set(drainedGen, decision);
     this.generation++;
   }
@@ -4008,7 +4100,7 @@ export class PermissionQueue {
   }
 
   /**
-   * Detach an in-flight permission from the queue tail for channel takeover.
+   * Atomically detach the Desktop queue for channel takeover.
    *
    * When Feishu/Discord/Slack takes over a turn, the currently-displayed
    * permission has already been migrated (its resolver handed to the
@@ -4016,15 +4108,35 @@ export class PermissionQueue {
    * migrated card to settle (it may sit unanswered for the full 10 minutes,
    * blocking subsequent Desktop permissions); replacing the tail lets later
    * dispatches proceed. The in-flight Promise continues independently and
-   * settles on the taken-over route. This also bumps the generation so any
-   * permission queued behind the migrated one drains with `decision` instead
-   * of broadcasting on the old Desktop surface (issue #3092 review /
-   * channel takeover).
+   * settles on the taken-over route. Queued requests are returned with their
+   * original resolver and deadline so the caller can publish them on the same
+   * route; they never broadcast on the old Desktop surface (issue #3092
+   * review / channel takeover).
    */
-  skipInFlightForTakeover(decision: InteractionDecision): void {
+  takeForTakeover(decision: InteractionDecision): PermissionQueueTakeoverEntry[] {
+    const taken: PermissionQueueTakeoverEntry[] = [];
+    for (const state of this.dispatches) {
+      if (
+        state.started ||
+        state.migrated ||
+        state.settled ||
+        state.generation !== this.generation ||
+        !state.request
+      ) {
+        continue;
+      }
+      state.migrated = true;
+      taken.push({
+        requestId: state.request.requestId,
+        request: state.request,
+        resolve: state.resolve,
+        ...(state.expiresAt !== undefined ? { expiresAt: state.expiresAt } : {}),
+      });
+    }
     this.drainedDecisionByGen.set(this.generation, decision);
     this.generation++;
     this.tail = Promise.resolve(permissionQueueSeed());
+    return taken;
   }
 }
 
@@ -4057,8 +4169,7 @@ function ensurePermissionQueue(sessionId: string): PermissionQueue {
 /** How to drain a session's permission queue. */
 export type PermissionQueueDrainMode =
   | 'close' // terminal session teardown: cancel and forget the queue
-  | 'reset' // transient abort/turn-idle: drain old turn, keep queue usable
-  | 'takeover'; // channel (/ctr) takeover: detach migrated in-flight, keep usable
+  | 'reset'; // transient abort/turn-idle: drain old turn, keep queue usable
 
 export function cancelPermissionQueueForSession(
   sessionId: string,
@@ -4070,11 +4181,16 @@ export function cancelPermissionQueueForSession(
   if (mode === 'close') {
     q.cancel(decision);
     permissionQueuesBySession.delete(sessionId);
-  } else if (mode === 'takeover') {
-    q.skipInFlightForTakeover(decision);
   } else {
     q.resetForNewTurn(decision);
   }
+}
+
+function takePermissionQueueForSession(
+  sessionId: string,
+  decision: InteractionDecision,
+): PermissionQueueTakeoverEntry[] {
+  return permissionQueuesBySession.get(sessionId)?.takeForTakeover(decision) ?? [];
 }
 
 /**

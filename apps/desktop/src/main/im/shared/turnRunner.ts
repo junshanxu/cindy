@@ -109,7 +109,10 @@ import {
 } from '../../maker-ipc/interactionRouter';
 import { beginGroupHistoryAccess, type GroupHistoryAccessScope } from './groupHistoryAccess';
 import { agentHandoffPending } from '../../maker-ipc/agentHandoffPendingSingleton';
-import { prependHandoffToUserMessage, prependNoteToWireUserMessage } from '../../maker-ipc/agentHandoff';
+import {
+  prependHandoffToUserMessage,
+  prependNoteToWireUserMessage,
+} from '../../maker-ipc/agentHandoff';
 import { buildPlanReconcileNote, summarizeOpenPlan } from '../../maker-ipc/planReconcile';
 import { listMessagesForAgentHandoff } from '../../localDb/ipc/messages';
 import { enqueueDurableWrite } from '../../messagePersistBroadcaster';
@@ -879,7 +882,9 @@ export function createTurnRunner(
     } catch (err) {
       if (isCredentialModeSwitchBusyError(err)) {
         if (args.queueMode === 'internal') {
-          const consumed = (await args.onEarlyReject?.('credential_mode_switch', ui.agent.credentialBusy)) ?? false;
+          const consumed =
+            (await args.onEarlyReject?.('credential_mode_switch', ui.agent.credentialBusy)) ??
+            false;
           if (!consumed) {
             await handleSessionWiringBusy(userId, turn);
           } else {
@@ -1197,11 +1202,11 @@ export function createTurnRunner(
                   // 文本渠道自己认领掉的不动卡片(它本来就没有卡);其余走
                   // dropInteractionCard —— 作废 pending 的同时把那张卡收口。
                   onCancel: (requestId, decision) =>
-                    adapter.cancelTextInteraction?.(userId, requestId, decision) === true
-                    || dropInteractionCard(
+                    adapter.cancelTextInteraction?.(userId, requestId, decision) === true ||
+                    dropInteractionCard(
                       requestId,
                       'reason' in decision
-                        ? decision.reason ?? 'interaction_route_released'
+                        ? (decision.reason ?? 'interaction_route_released')
                         : 'interaction_route_released',
                     ),
                 });
@@ -1225,9 +1230,7 @@ export function createTurnRunner(
           // 复用那条记录, 不再写第二条。sessionId 必须相符 —— 拼装期间路由若换到
           // 别的 session(/new 重置等), 那份预落库不属于本轮, 照常自己落一条。
           const prePersisted =
-            item.prePersistedUserMessage?.sessionId === rowId
-              ? item.prePersistedUserMessage
-              : null;
+            item.prePersistedUserMessage?.sessionId === rowId ? item.prePersistedUserMessage : null;
           // 受保护群的触发消息不进会话存档 —— 正文与附件都不落。turn 照常跑,
           // agent 拿得到内容; 只是这一轮的输入不留在长期记录里。
           const persisted = item.protectedContent
@@ -1763,6 +1766,7 @@ export function createTurnRunner(
       requestId: string;
       request: InteractionRequest;
       resolve: (decision: InteractionDecision) => void;
+      expiresAt?: number;
     },
     userId: string,
     localSessionId: string,
@@ -1773,10 +1777,27 @@ export function createTurnRunner(
       `publishMigrated kind=${req.kind} requestId=...${req.requestId.slice(-8)} session=...${localSessionId.slice(-8)}`,
     );
 
+    if (
+      req.kind === 'permission' &&
+      entry.expiresAt !== undefined &&
+      entry.expiresAt <= Date.now()
+    ) {
+      resolve({ kind: 'permission', behavior: 'deny', reason: 'interaction_timeout' });
+      return;
+    }
+
     if (!richIm) {
       try {
         if (adapter.handleTextInteraction) {
-          resolve(await adapter.handleTextInteraction(userId, req));
+          const remainingTimeoutMs =
+            req.kind === 'permission' && entry.expiresAt !== undefined
+              ? Math.max(1, entry.expiresAt - Date.now())
+              : undefined;
+          resolve(
+            await adapter.handleTextInteraction(userId, req, {
+              ...(remainingTimeoutMs !== undefined ? { timeoutMs: remainingTimeoutMs } : {}),
+            }),
+          );
         } else {
           const kind = req.kind as InteractionDecision['kind'];
           resolve(
@@ -1859,6 +1880,16 @@ export function createTurnRunner(
       return;
     }
 
+    const remainingTimeoutMs =
+      req.kind === 'permission' && entry.expiresAt !== undefined
+        ? entry.expiresAt - Date.now()
+        : undefined;
+    if (remainingTimeoutMs !== undefined && remainingTimeoutMs <= 0) {
+      resolve({ kind: 'permission', behavior: 'deny', reason: 'interaction_timeout' });
+      patchExpiredInteractionCard(req.requestId, messageId);
+      return;
+    }
+
     try {
       // 授权卡已转投 owner 私聊 — 立刻在原群/话题 lane 留指路提示
       // (与 handleInteractionFor 同款; 私聊 lane 卡片就在原地, 不需要)。
@@ -1897,6 +1928,9 @@ export function createTurnRunner(
           ? {
               toolName: req.toolName,
               permissionCard: { title: spec.title ?? '', body: spec.body },
+              ...(remainingTimeoutMs !== undefined ? { timeoutMs: remainingTimeoutMs } : {}),
+              onTimeout: (expiredMessageId: string) =>
+                patchExpiredInteractionCard(req.requestId, expiredMessageId),
             }
           : askMultiExtras(req),
       );
@@ -2032,11 +2066,7 @@ export function createTurnRunner(
     const threadUiPack = adapter.ui.thread;
     const configuredPrefix = adapter.sessions.generatedTitlePrefix;
     const composeTitle = adapter.sessions.composeGeneratedTitle;
-    if (
-      configuredPrefix === undefined &&
-      !composeTitle &&
-      !(adapter.threadScoped && threadUiPack)
-    )
+    if (configuredPrefix === undefined && !composeTitle && !(adapter.threadScoped && threadUiPack))
       return;
     const prefix = typeof configuredPrefix === 'function' ? configuredPrefix() : configuredPrefix;
     try {
@@ -2568,6 +2598,20 @@ export function createTurnRunner(
     releaseHostLease?.();
   }
 
+  function patchExpiredInteractionCard(requestId: string, messageId: string): void {
+    const notice = adapter.interactionExpiredNotice;
+    if (!notice || !richIm) return;
+    const im = richIm;
+    void enqueueAskCardPatch(requestId, async () => {
+      try {
+        await im.updateInteractiveCard(messageId, cards.buildResolvedCard(notice));
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`dropped interaction card cleanup failed (non-fatal): ${msg}`);
+      }
+    });
+  }
+
   /**
    * 交互被作废(turn 收口 / session 清理 / 抢跑)时把它的卡片一起收口。
    *
@@ -2580,18 +2624,7 @@ export function createTurnRunner(
     // 返回值是 router 的契约: true = 渠道侧已收口这次交互, router 不再自行 cancel。
     // 丢掉它会让同一个 requestId 被取消两次(第二次落到 SDK 的默认拒绝路径)。
     if (!cancelled) return false;
-    const notice = adapter.interactionExpiredNotice;
-    if (!notice || !richIm) return true;
-    const messageId = cancelled.messageId;
-    const im = richIm;
-    void enqueueAskCardPatch(requestId, async () => {
-      try {
-        await im.updateInteractiveCard(messageId, cards.buildResolvedCard(notice));
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        log.warn(`dropped interaction card cleanup failed (non-fatal): ${msg}`);
-      }
-    });
+    patchExpiredInteractionCard(requestId, cancelled.messageId);
     return true;
   }
 
@@ -2731,13 +2764,9 @@ export function createTurnRunner(
             : `❌ 启动 agent 失败：${failure.reason}`;
         // 早期拒绝终态交调用方消费(群主流 @ 开话题时 patch 开场白卡),
         // 消费了就不再另发。
-        const consumed =
-          (await failure.onEarlyReject?.(failure.reason, message)) ?? false;
+        const consumed = (await failure.onEarlyReject?.(failure.reason, message)) ?? false;
         if (!consumed) {
-          if (
-            output.kind === 'chunked-text' &&
-            failure.turn.chunkedReplyBegun
-          ) {
+          if (output.kind === 'chunked-text' && failure.turn.chunkedReplyBegun) {
             await output.commitFinal({
               userId,
               text: message,
@@ -3045,11 +3074,9 @@ export function createTurnRunner(
           // (避免消费上一轮遗留的 opener 造成归属错乱)。
           const triggerId = output.im.getPendingOpenerTrigger?.(userId);
           const isMyOpener = triggerId === turn.userMessageId;
-          const consumed =
-            isMyOpener
-              ? ((await output.im.consumePendingOpenerCard?.(userId, '✅ (本轮无文本输出)')) ??
-                false)
-              : false;
+          const consumed = isMyOpener
+            ? ((await output.im.consumePendingOpenerCard?.(userId, '✅ (本轮无文本输出)')) ?? false)
+            : false;
           if (!consumed) {
             await sendTextClaimingOpener(userId, '✅ (本轮无文本输出)', state.scopeKey);
           }
@@ -3085,7 +3112,9 @@ export function createTurnRunner(
             turn.mediaAbsPaths.length > 0 ? { mediaAbsPaths: turn.mediaAbsPaths } : undefined,
           );
         }
-        log.info(`[${channel}/turn] streaming surface unavailable — final text delivered via plain send`);
+        log.info(
+          `[${channel}/turn] streaming surface unavailable — final text delivered via plain send`,
+        );
       } catch (err) {
         log.warn(
           `[${channel}/turn] plain-text fallback send failed (non-fatal): ${
@@ -3165,10 +3194,9 @@ export function createTurnRunner(
           const errorText = `❌ 错误：${msg}`;
           const triggerId = output.im.getPendingOpenerTrigger?.(userId);
           const isMyOpener = triggerId === turn?.userMessageId;
-          const consumed =
-            isMyOpener
-              ? ((await output.im.consumePendingOpenerCard?.(userId, errorText)) ?? false)
-              : false;
+          const consumed = isMyOpener
+            ? ((await output.im.consumePendingOpenerCard?.(userId, errorText)) ?? false)
+            : false;
           if (!consumed) {
             await sendTextClaimingOpener(userId, errorText, state.scopeKey);
           }
