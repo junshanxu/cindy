@@ -6,7 +6,6 @@ import type { DbClient } from '../client/DbClient.js';
 import { clearCurrentDbClient, setCurrentDbClient } from '../client/current.js';
 import { setSessionRouteLockImplementation } from '../sessionRouteLock.js';
 import { tx as runInprocTx } from '../worker/opHandlers/tx.js';
-import { setSessionRouteLockImplementation } from '../sessionRouteLock.js';
 import { setSessionRuntimeCleanup } from '../sessionRuntimeCleanup.js';
 import * as schema from '../schema.js';
 
