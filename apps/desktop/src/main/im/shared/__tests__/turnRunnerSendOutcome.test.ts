@@ -824,6 +824,76 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
     }
   });
 
+  it('settles a migrated text request while the adapter prompt send is still blocked', async () => {
+    const h = setupAttachedSession(async () => ({ accepted: true }));
+    const promptDecision = deferred<InteractionDecision>();
+    const resolve = vi.fn();
+    const handleTextInteraction = vi.fn<NonNullable<ImChannelAdapter['handleTextInteraction']>>(
+      async () => promptDecision.promise,
+    );
+    const cancelTextInteraction = vi.fn(() => true);
+    mocks.takePendingInteractionsForSession.mockReturnValue([
+      {
+        requestId: 'migrated-blocked-send',
+        request: {
+          kind: 'permission',
+          requestId: 'migrated-blocked-send',
+          toolName: 'bash',
+          input: { command: 'pnpm test' },
+        },
+        resolve,
+        expiresAt: Date.now() + 30_000,
+      },
+    ]);
+    const textAdapter: ImChannelAdapter = {
+      ...fakeAdapter,
+      channel: 'wecom',
+      output: {
+        kind: 'chunked-text',
+        im: mocks.feishuIm as unknown as ChannelIM,
+        commitFinal: vi.fn(async () => undefined),
+      },
+      handleTextInteraction,
+      cancelTextInteraction,
+    };
+    const localRunner = createTurnRunner(textAdapter, fakeRepo, fakeCards);
+
+    try {
+      await localRunner.runAgentTurn({
+        botContextId: 'cli_test_bot',
+        userId: 'ou_user',
+        userMessageId: 'msg-migrated-blocked-send',
+        text: 'take over',
+        attachments: [],
+      });
+      await waitForAssertion(() => expect(handleTextInteraction).toHaveBeenCalledOnce());
+
+      settleMigratedInteractionsForSessionExternal('desktop-attached-session', 'session_aborted');
+
+      expect(resolve).toHaveBeenCalledWith({
+        kind: 'permission',
+        behavior: 'deny',
+        reason: 'session_aborted',
+      });
+      expect(cancelTextInteraction).toHaveBeenCalledWith(
+        'ou_user',
+        'migrated-blocked-send',
+        expect.objectContaining({ behavior: 'deny', reason: 'session_aborted' }),
+      );
+
+      promptDecision.resolve({
+        kind: 'permission',
+        behavior: 'deny',
+        reason: 'session_aborted',
+      });
+      await flushMicrotasks();
+      expect(resolve).toHaveBeenCalledOnce();
+    } finally {
+      h.emit({ type: 'done', data: {} });
+      await localRunner.disposeAllSessions();
+    }
+  });
+
   it('hard-denies destructive permissions before publishing a migrated text interaction', async () => {
     const h = setupAttachedSession(async () => ({ accepted: true }));
     const resolve = vi.fn();

@@ -4024,12 +4024,14 @@ export function createTurnRunner(
           }
         }
       } else {
-        // Text-only surface: ask the adapter to cancel its waiter if it
-        // implements one; otherwise resolve the SDK promise directly so it
-        // does not hang for the text timeout.
-        const handled =
-          adapter.cancelTextInteraction?.(record.userId, requestId, decision) === true;
-        if (!handled) record.resolve(decision);
+        // Text-only surface: retire the adapter waiter when possible, but do
+        // not treat that as proof that its async prompt send has returned.
+        // The handler registers its waiter before awaiting the network send,
+        // so cancellation can settle the waiter while the send is still
+        // blocked. Resolve the migrated SDK request immediately; the later
+        // handler result is harmless because record.resolve is idempotent.
+        adapter.cancelTextInteraction?.(record.userId, requestId, decision);
+        record.resolve(decision);
       }
     }
   }

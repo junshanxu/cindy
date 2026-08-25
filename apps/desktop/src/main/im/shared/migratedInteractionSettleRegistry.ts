@@ -18,23 +18,31 @@
 
 type MigratedInteractionSettler = (reason: string) => void;
 
-/** sessionId → 该 session 迁移交互的 settle-all 回调。一次只有一个渠道拥有该 session。 */
-const settlers = new Map<string, MigratedInteractionSettler>();
+/** sessionId → 仍持有该 session 迁移交互的全部渠道 settle-all 回调。 */
+const settlers = new Map<string, Set<MigratedInteractionSettler>>();
 
 /**
  * 登记某 session 的迁移交互 settle-all 回调。返回注销函数。
  *
- * 同一 session 重复登记时覆盖(旧的应已随迁移记录清空而注销);调用方在该 session
- * 迁移记录全部 settle 完后必须调用返回的注销函数,避免 Map 无界增长。
+ * 同一 session 可能在旧渠道的迁移卡尚未收口时被另一个渠道接管，因此每个渠道都保留
+ * 自己的回调；调用方在自己的迁移记录全部 settle 完后必须调用返回的注销函数，避免
+ * Map 无界增长。
  */
 export function registerMigratedInteractionSettler(
   sessionId: string,
   settleAll: MigratedInteractionSettler,
 ): () => void {
-  settlers.set(sessionId, settleAll);
+  let sessionSettlers = settlers.get(sessionId);
+  if (!sessionSettlers) {
+    sessionSettlers = new Set();
+    settlers.set(sessionId, sessionSettlers);
+  }
+  sessionSettlers.add(settleAll);
   return () => {
-    // 仅当当前登记的仍是自己时才删,避免误删后来者重新登记的回调。
-    if (settlers.get(sessionId) === settleAll) settlers.delete(sessionId);
+    const current = settlers.get(sessionId);
+    if (!current) return;
+    current.delete(settleAll);
+    if (current.size === 0) settlers.delete(sessionId);
   };
 }
 
@@ -47,5 +55,8 @@ export function settleMigratedInteractionsForSessionExternal(
   sessionId: string,
   reason: string,
 ): void {
-  settlers.get(sessionId)?.(reason);
+  const sessionSettlers = settlers.get(sessionId);
+  if (!sessionSettlers) return;
+  // settle 回调可能同步注销自身，先快照避免迭代期间跳过同 session 的其它渠道。
+  for (const settleAll of Array.from(sessionSettlers)) settleAll(reason);
 }
