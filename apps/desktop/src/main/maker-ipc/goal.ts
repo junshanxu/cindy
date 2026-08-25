@@ -132,7 +132,10 @@ export function registerGoalHandlers(
   //   2. 本地副窗口(GoalIndicator 所在的 secondary app window)由真实 event.sender 反查,
   //      无需 renderer 自报标记,一律 fence——reviewer P2:此前本地副窗 resume/update 绕过门禁。
   // primary remote task(主窗口)不带标记且 sender 为主窗,保持"向已归档任务发命令可恢复
-  // 任务"的历史语义。返回是否实际加了 fence,供 GOAL_SET 决定是否传 sessionRouteLockHeld。
+  // 任务"的历史语义。fence 持锁期间调 controller 续跑(setGoal→fireTurn、
+  // resumeGoal、resumeOnOpen→acquirePendingAgentSwitch)会再次取同一把非重入
+  // route 锁,因此把 fenced 标志透传给 controller(sessionRouteLockHeld),
+  // 由 holder 跳过二次加锁,避免自死锁(#3262 review P2)。
   const runWithLifecycleGuard = <T>(
     sessionId: string,
     event: IpcMainInvokeEvent,
@@ -176,7 +179,8 @@ export function registerGoalHandlers(
             sessionId,
             objective,
             ...(limits ? { limits } : {}),
-            // 走了 route lock fence 时告诉 controller 锁已持有,避免重复获取 pending-agent-switch 锁。
+            // fence 已持有 route 锁:让 controller 内的 pending-agent-switch
+            // 走 holder 的 sessionRouteLockHeld 分支,不重复加锁(#3262 P2)。
             ...(fenced ? { sessionRouteLockHeld: true } : {}),
           }),
         obj.requireActiveSession === true,
@@ -244,7 +248,12 @@ export function registerGoalHandlers(
           await runWithLifecycleGuard(
             id,
             e,
-            () => controller.resumeOnOpen(id, { waitForDispatch: false }),
+            (fenced) =>
+              controller.resumeOnOpen(id, {
+                waitForDispatch: false,
+                // fence 持锁时透传,跳过 resumeOnOpen 内的二次加锁(#3262 P2)。
+                ...(fenced ? { sessionRouteLockHeld: true } : {}),
+              }),
             requireActiveSession,
           );
         } catch (error) {
@@ -290,7 +299,13 @@ export function registerGoalHandlers(
         await runWithLifecycleGuard(
           id,
           e,
-          () => getGoalController()?.resumeGoal(id) ?? Promise.resolve(),
+          (fenced) =>
+            // fence 持锁时传 sessionRouteLockHeld,让 resumeGoal→fireTurn 跳过
+            // 二次获取同一把 route 锁(#3262 P2);非 fence 路径保持无 opts 裸调用。
+            getGoalController()?.resumeGoal(
+              id,
+              ...(fenced ? [{ sessionRouteLockHeld: true }] : []),
+            ) ?? Promise.resolve(),
           requireActiveSession,
         );
       } catch (error) {

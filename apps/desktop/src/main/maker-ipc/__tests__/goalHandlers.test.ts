@@ -311,7 +311,8 @@ describe('goal remote lifecycle fence', () => {
 
     expect(withSessionLock).toHaveBeenCalledWith('rs', expect.any(Function));
     expect(assertSessionActive).toHaveBeenCalledWith('rs');
-    expect(mocks.resumeGoal).toHaveBeenCalledWith('rs');
+    // fence 已持有 route lock:透传 sessionRouteLockHeld,避免 resumeGoal→fireTurn 二次加锁。
+    expect(mocks.resumeGoal).toHaveBeenCalledWith('rs', { sessionRouteLockHeld: true });
   });
 
   it('fences a device-link GOAL_UPDATE only when requireActiveSession is explicitly requested', async () => {
@@ -359,7 +360,10 @@ describe('goal remote lifecycle fence', () => {
 
     expect(withSessionLock).toHaveBeenCalledWith('rs', expect.any(Function));
     expect(assertSessionActive).toHaveBeenCalledWith('rs');
-    expect(mocks.resumeOnOpen).toHaveBeenCalledWith('rs', { waitForDispatch: false });
+    expect(mocks.resumeOnOpen).toHaveBeenCalledWith('rs', {
+      waitForDispatch: false,
+      sessionRouteLockHeld: true,
+    });
   });
 
   it('does not fence GET_STATUS resumeOnOpen for a primary remote without the marker', async () => {
@@ -446,7 +450,7 @@ describe('goal local secondary-window lifecycle fence', () => {
     expect(isSecondaryWindowEvent).toHaveBeenCalledWith(SECONDARY_EVENT);
     expect(withSessionLock).toHaveBeenCalledWith('s1', expect.any(Function));
     expect(assertSessionActive).toHaveBeenCalledWith('s1');
-    expect(mocks.resumeGoal).toHaveBeenCalledWith('s1');
+    expect(mocks.resumeGoal).toHaveBeenCalledWith('s1', { sessionRouteLockHeld: true });
   });
 
   it('fences a local secondary-window GOAL_UPDATE without requireActiveSession', async () => {
@@ -525,7 +529,10 @@ describe('goal local secondary-window lifecycle fence', () => {
     expect(isSecondaryWindowEvent).toHaveBeenCalledWith(SECONDARY_EVENT);
     expect(withSessionLock).toHaveBeenCalledWith('s1', expect.any(Function));
     expect(assertSessionActive).toHaveBeenCalledWith('s1');
-    expect(mocks.resumeOnOpen).toHaveBeenCalledWith('s1', { waitForDispatch: false });
+    expect(mocks.resumeOnOpen).toHaveBeenCalledWith('s1', {
+      waitForDispatch: false,
+      sessionRouteLockHeld: true,
+    });
   });
 
   it('does not fence a primary local main-window GET_STATUS resumeOnOpen', async () => {

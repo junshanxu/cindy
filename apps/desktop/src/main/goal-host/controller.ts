@@ -1178,7 +1178,10 @@ export class GoalController {
    * (与 setGoal 全清零相反),重挂 listener,空闲则立即续一轮。终态(complete/budgetLimited)
    * /已 active 不处理。
    */
-  async resumeGoal(sessionId: string, opts?: { auto?: boolean }): Promise<void> {
+  async resumeGoal(
+    sessionId: string,
+    opts?: { auto?: boolean; sessionRouteLockHeld?: boolean },
+  ): Promise<void> {
     if (this.disposed || this.disposing) return;
     let existingBoundary = this.turns.get(sessionId);
     let state: GoalState | null | undefined;
@@ -1325,7 +1328,13 @@ export class GoalController {
     this.attachListener(sessionId);
     this.emit(updated);
     if (!this.isBusy(sessionId)) {
-      await this.fireTurn(sessionId, { throwOnRestoreFailure: !opts?.auto });
+      await this.fireTurn(sessionId, {
+        throwOnRestoreFailure: !opts?.auto,
+        // 调用方(goal fence)已持有 session route lock:让 fireTurn 内的
+        // pending-agent-switch 走 holder 的 sessionRouteLockHeld 分支,
+        // 不再二次获取同一把非重入锁,避免自死锁(#3262 P2)。
+        ...(opts?.sessionRouteLockHeld ? { sessionRouteLockHeld: true } : {}),
+      });
     }
   }
 
@@ -1400,7 +1409,7 @@ export class GoalController {
    */
   async resumeOnOpen(
     sessionId: string,
-    opts?: { waitForDispatch?: boolean },
+    opts?: { waitForDispatch?: boolean; sessionRouteLockHeld?: boolean },
   ): Promise<void> {
     if (this.disposed || this.disposing) return;
     const pendingFailure = this.unpersistedDispatchFailures.get(sessionId);
@@ -1440,7 +1449,11 @@ export class GoalController {
     let restoreError: unknown;
     try {
       releaseAgentSwitchLock =
-        (await this.deps.acquirePendingAgentSwitch?.(sessionId)) ?? (() => {});
+        (await this.deps.acquirePendingAgentSwitch?.(
+          sessionId,
+          // goal fence 已持有 route lock 时透传标记,让 holder 跳过二次加锁(#3262 P2)。
+          opts?.sessionRouteLockHeld ? { sessionRouteLockHeld: true } : undefined,
+        )) ?? (() => {});
       if (this.disposed) return;
       if (this.turns.get(sessionId) !== lifecycleBoundary) return;
       session = await this.deps.ensureSession(sessionId);

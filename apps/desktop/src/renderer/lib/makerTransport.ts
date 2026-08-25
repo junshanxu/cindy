@@ -633,32 +633,52 @@ export type RoutableGoal = FullGoalMaker;
  */
 export function goalApiFor(sessionId: string): RoutableGoal {
   const resolve = () => getStickySessionDeviceId(sessionId);
-  const t =
-    (channel: string, local: (...args: never[]) => unknown) =>
-    (...args: unknown[]): Promise<unknown> => {
-      const deviceId = resolve();
-      if (!deviceId) return Promise.resolve(local(...(args as never[])));
-      return invokeRemote(deviceId, channel, args);
-    };
   const localApi = window.electronAPI.maker;
+  // 远程副窗口(device-link 会话 + 当前 renderer 是副窗口):合成 event 无 sender,
+  // 被控端 runWithLifecycleGuard 无法按窗口归属识别副窗,因此每个有副作用的 Goal
+  // 操作都显式透传 requireActiveSession,与 GOAL_SET 的 input 标记 / GOAL_CLEAR、
+  // GOAL_RESUME 的第二参 fenceOpts 对齐(reviewer P1:不能只 fence getGoalStatus,
+  // 否则副窗口仍能通过 set/resume/update/clear 重新拉起已归档任务)。
+  // 本机会话 main 按真实 event.sender 自动 fence,主窗口远程会话保持历史语义。
+  const remoteFenceOpts = (): unknown => (isSecondaryWindow() ? { requireActiveSession: true } : undefined);
   return {
-    setGoal: t('maker:goal:set', localApi.setGoal) as FullMaker['setGoal'],
-    clearGoal: t('maker:goal:clear', localApi.clearGoal) as FullMaker['clearGoal'],
-    pauseGoal: t('maker:goal:pause', localApi.pauseGoal) as FullMaker['pauseGoal'],
-    resumeGoal: t('maker:goal:resume', localApi.resumeGoal) as FullMaker['resumeGoal'],
+    setGoal: ((input: unknown) => {
+      const deviceId = resolve();
+      if (!deviceId) return localApi.setGoal(input as Parameters<FullMaker['setGoal']>[0]);
+      const merged = isSecondaryWindow() && input && typeof input === 'object'
+        ? { ...(input as Record<string, unknown>), requireActiveSession: true }
+        : input;
+      return invokeRemote(deviceId, 'maker:goal:set', [merged]);
+    }) as FullMaker['setGoal'],
+    clearGoal: ((sid: string) => {
+      const deviceId = resolve();
+      if (!deviceId) return localApi.clearGoal(sid);
+      return invokeRemote(deviceId, 'maker:goal:clear', [sid, remoteFenceOpts()]);
+    }) as FullMaker['clearGoal'],
+    pauseGoal: ((sid: string) => {
+      const deviceId = resolve();
+      if (!deviceId) return localApi.pauseGoal(sid);
+      // pauseGoal 对 active/paused 是 no-op,不续跑任务,不需要 fence。
+      return invokeRemote(deviceId, 'maker:goal:pause', [sid]);
+    }) as FullMaker['pauseGoal'],
+    resumeGoal: ((sid: string) => {
+      const deviceId = resolve();
+      if (!deviceId) return localApi.resumeGoal(sid);
+      return invokeRemote(deviceId, 'maker:goal:resume', [sid, remoteFenceOpts()]);
+    }) as FullMaker['resumeGoal'],
     updateGoal: ((sid: string, patch: unknown) => {
       const deviceId = resolve();
       if (!deviceId)
         return localApi.updateGoal(sid, patch as Parameters<FullMaker['updateGoal']>[1]);
-      return invokeRemote(deviceId, 'maker:goal:update', [{ sessionId: sid, patch }]);
+      const payload: Record<string, unknown> = { sessionId: sid, patch };
+      if (isSecondaryWindow()) payload.requireActiveSession = true;
+      return invokeRemote(deviceId, 'maker:goal:update', [payload]);
     }) as FullMaker['updateGoal'],
     getGoalStatus: ((sid: string) => {
       const deviceId = resolve();
       if (!deviceId) return localApi.getGoalStatus(sid);
-      // 远程会话:本机会话 main 按真实 event.sender 自动 fence 副窗口,无需标记;
-      // 远程副窗口的合成 event 无 sender,这里显式透传 requireActiveSession,让被控端
-      // 把有副作用的 resumeOnOpen 纳入 active-session 复核(归档后不重新拉起任务)。
-      // 主窗口打开远程会话保持 resume-on-open 历史语义,不带标记。
+      // 远程副窗口显式透传 requireActiveSession,把有副作用的 resumeOnOpen 纳入
+      // active-session 复核(归档后不重新拉起任务);主窗口远程会话保持历史语义。
       const args: unknown[] = isSecondaryWindow() ? [sid, { requireActiveSession: true }] : [sid];
       return invokeRemote(deviceId, 'maker:goal:get-status', args);
     }) as FullMaker['getGoalStatus'],
