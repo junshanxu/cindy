@@ -62,6 +62,7 @@ const mocks = vi.hoisted(() => ({
   onSilentStopSettled: vi.fn(() => vi.fn()),
   installDesktopInteractionListener: vi.fn(),
   takePendingInteractionsForSession: vi.fn(),
+  completePermissionQueueTakeoverForSession: vi.fn(),
   // 取消不到时返回 null(取消到了返回 { messageId }, 调用方据此收口卡片)。
   cancelPending: vi.fn(() => null),
   rejectAllPending: vi.fn(),
@@ -143,6 +144,7 @@ vi.mock('../../../maker-ipc/register', () => ({
   wireSessionToIpcExternal: mocks.wireSessionToIpcExternal,
   installDesktopInteractionListener: mocks.installDesktopInteractionListener,
   takePendingInteractionsForSession: mocks.takePendingInteractionsForSession,
+  completePermissionQueueTakeoverForSession: mocks.completePermissionQueueTakeoverForSession,
   noteSilentStopUserSend: mocks.noteSilentStopUserSend,
   noteSilentStopSessionReset: mocks.noteSilentStopSessionReset,
   onSilentStopSettled: mocks.onSilentStopSettled,
@@ -1125,6 +1127,77 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
         reason: 'session_cleanup',
       });
       expect(mocks.cancelPending).toHaveBeenCalledWith('migrated-rich-detach', 'session_cleanup');
+    } finally {
+      h.emit({ type: 'done', data: {} });
+      await localRunner.disposeAllSessions();
+    }
+  });
+
+  it('settles detached migrated ownership during global dispose', async () => {
+    const h = setupAttachedSession(async () => ({ accepted: true }));
+    const resolve = vi.fn();
+    mocks.takePendingInteractionsForSession.mockReturnValue([
+      {
+        requestId: 'migrated-rich-dispose',
+        request: {
+          kind: 'permission',
+          requestId: 'migrated-rich-dispose',
+          toolName: 'bash',
+          input: { command: 'pnpm build' },
+        },
+        resolve,
+      },
+    ]);
+    mocks.buildPermissionCard.mockReturnValue({
+      title: 'Permission',
+      body: 'Allow?',
+      buttons: [],
+    });
+    mocks.feishuIm.sendInteractiveCard.mockResolvedValue({ messageId: 'migrated-dispose-card' });
+    let registeredResolve: ((decision: InteractionDecision) => void) | null = null;
+    mocks.registerPendingExternal.mockImplementation(
+      (_requestId, _kind, _messageId, resolveFn: (decision: InteractionDecision) => void) => {
+        registeredResolve = resolveFn;
+      },
+    );
+    (mocks.cancelPending as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      (requestId: string, reason: string) => {
+        if (requestId !== 'migrated-rich-dispose' || !registeredResolve) return null;
+        registeredResolve({ kind: 'permission', behavior: 'deny', reason });
+        return { messageId: 'migrated-dispose-card' };
+      },
+    );
+    const localRunner = createTurnRunner(fakeAdapter, fakeRepo, fakeCards);
+
+    try {
+      await localRunner.runAgentTurn({
+        botContextId: 'cli_test_bot',
+        userId: 'ou_user',
+        userMessageId: 'msg-migrated-rich-dispose',
+        text: 'take over',
+        attachments: [],
+      });
+      await waitForAssertion(() => expect(mocks.registerPendingExternal).toHaveBeenCalledOnce());
+      localRunner.detachFromSession('desktop-attached-session');
+      await flushMicrotasks();
+      expect(resolve).not.toHaveBeenCalled();
+
+      // The detach is deferred while this IM turn remains in the runner's
+      // queue. Finish the turn so the SessionState is actually removed; the
+      // migrated ownership must still survive outside that map.
+      h.emit({ type: 'done', data: {} });
+      await flushMicrotasks();
+      expect(resolve).not.toHaveBeenCalled();
+
+      await localRunner.disposeAllSessions();
+
+      await waitForAssertion(() => expect(resolve).toHaveBeenCalledOnce());
+      expect(resolve).toHaveBeenCalledWith({
+        kind: 'permission',
+        behavior: 'deny',
+        reason: 'session_disposed',
+      });
+      expect(mocks.cancelPending).toHaveBeenCalledWith('migrated-rich-dispose', 'session_disposed');
     } finally {
       h.emit({ type: 'done', data: {} });
       await localRunner.disposeAllSessions();

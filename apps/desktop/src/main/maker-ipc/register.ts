@@ -3891,10 +3891,15 @@ interface PermissionQueueDispatchState {
   resolve: (decision: InteractionDecision) => void;
 }
 
+interface PermissionQueueTakeoverBarrier {
+  promise: Promise<void>;
+  release: () => void;
+}
+
 export class PermissionQueue {
   // Tail of the serialization chain. Each dispatch chains onto this so
-  // runs execute one at a time in arrival order. Channel takeover replaces
-  // it only after the accepted queued cohort has been handed to that channel.
+  // runs execute one at a time in arrival order. Channel takeover keeps the
+  // existing tail and appends a temporary handoff fence.
   private tail: Promise<InteractionDecision> = Promise.resolve(permissionQueueSeed());
   // Monotonic generation. Bumped on every reset/cancel. A run captured
   // its enqueue generation; when it gets to run, if the generation moved
@@ -3908,6 +3913,12 @@ export class PermissionQueue {
   // Set on terminal cancel (session_closed): every dispatch settles with
   // this forever, regardless of generation.
   private closedDecision: InteractionDecision | null = null;
+  // Channel takeover temporarily fences new Desktop permission broadcasts
+  // until the target channel has installed its interaction route and accepted
+  // the migrated cohort. Keeping the existing tail preserves ordering with
+  // the permission already in flight instead of letting a new Desktop card
+  // overwrite the migrated card during the handoff window.
+  private takeoverBarrier: PermissionQueueTakeoverBarrier | null = null;
   // Dispatches accepted by the router but not necessarily started in the
   // renderer. Keeping explicit entries lets takeover move the queued cohort
   // without replaying it on Desktop or silently denying it.
@@ -4135,16 +4146,17 @@ export class PermissionQueue {
    *
    * When Feishu/Discord/Slack takes over a turn, the currently-displayed
    * permission has already been migrated (its resolver handed to the
-   * taken-over route). The Desktop queue must NOT keep waiting for that
-   * migrated card to settle (it may sit unanswered for the full 10 minutes,
-   * blocking subsequent Desktop permissions); replacing the tail lets later
-   * dispatches proceed. The in-flight Promise continues independently and
-   * settles on the taken-over route. Queued requests are returned with their
-   * original resolver and deadline so the caller can publish them on the same
-   * route; they never broadcast on the old Desktop surface (issue #3092
-   * review / channel takeover).
+   * taken-over route). Keep that in-flight run in the serialization chain:
+   * replacing the tail would let a permission arriving during handoff publish
+   * a second Desktop card and overwrite the migrated singleton slot. Queued
+   * requests are returned with their original resolver and deadline so the
+   * caller can publish them on the same route; their old chain entries become
+   * no-ops, then the handoff fence holds later Desktop dispatches until the
+   * channel has accepted the migrated cohort (issue #3092 review / takeover).
    */
   takeForTakeover(decision: InteractionDecision): PermissionQueueTakeoverEntry[] {
+    if (this.takeoverBarrier) return [];
+
     const taken: PermissionQueueTakeoverEntry[] = [];
     for (const state of this.dispatches) {
       if (
@@ -4167,8 +4179,31 @@ export class PermissionQueue {
     }
     this.drainedDecisionByGen.set(this.generation, decision);
     this.generation++;
-    this.tail = Promise.resolve(permissionQueueSeed());
+
+    let release!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.takeoverBarrier = { promise, release };
+    // Do not replace the tail here. The already-running permission must settle
+    // before any later Desktop permission can proceed; after the migrated
+    // queued cohort is skipped, the handoff barrier keeps the queue fenced
+    // until the channel route is ready.
+    this.tail = this.tail
+      .then(
+        () => promise,
+        () => promise,
+      )
+      .then(() => permissionQueueSeed());
     return taken;
+  }
+
+  /** Release the temporary Desktop permission fence after channel takeover. */
+  completeTakeover(): void {
+    const barrier = this.takeoverBarrier;
+    if (!barrier) return;
+    this.takeoverBarrier = null;
+    barrier.release();
   }
 }
 
@@ -4223,6 +4258,11 @@ function takePermissionQueueForSession(
   decision: InteractionDecision,
 ): PermissionQueueTakeoverEntry[] {
   return permissionQueuesBySession.get(sessionId)?.takeForTakeover(decision) ?? [];
+}
+
+/** Let the Desktop permission queue resume after the channel takeover handoff. */
+export function completePermissionQueueTakeoverForSession(sessionId: string): void {
+  permissionQueuesBySession.get(sessionId)?.completeTakeover();
 }
 
 /**
@@ -13989,6 +14029,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     abortSession: async (sessionId) => {
       resetAutomaticRecoveryForExplicitStop(sessionId);
       markWorkerManualInterruptIfKnown(sessionId, 'input_stop');
+      // Migrated interaction ownership is session-indexed and can outlive the
+      // Maker SessionState after channel detach. Settle it before the live
+      // session lookup can return early.
+      settleMigratedInteractionsForSessionExternal(sessionId, 'session_aborted');
       const sess = getStableSessionForTurnBoundary(sessionId);
       if (!sess) return;
       handleAgentIslandSessionStopped(sess);
@@ -15759,6 +15803,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     if (typeof sessionId !== 'string') throwIpcError('INVALID_PARAMS', 'sessionId required');
     markWorkerManualInterruptIfKnown(sessionId, 'abort_session');
     resetAutomaticRecoveryForExplicitStop(sessionId);
+    // The migrated-ownership bridge does not require a live Maker session;
+    // settle it before the early return below for detached/unavailable state.
+    settleMigratedInteractionsForSessionExternal(sessionId, 'session_aborted');
     // 调用本身先同步撤销 Goal 续跑资格；paused 落库与 vendor abort 并行。
     const goalPause = pauseGoalBeforeExplicitStop(sessionId);
     const sess = getStableSessionForTurnBoundary(sessionId);

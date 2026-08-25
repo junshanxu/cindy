@@ -96,6 +96,7 @@ import { bindingStore } from '../binding';
 import { buildImUserMessage } from './inboundMessage';
 import {
   beginTurnChangeSetAtDispatch,
+  completePermissionQueueTakeoverForSession,
   wireSessionToIpcExternal,
   takePendingInteractionsForSession,
   noteSilentStopUserSend,
@@ -1857,48 +1858,55 @@ export function createTurnRunner(
     // No-op 的常见情况: 没有 in-flight pending(idle session 接管), takePending
     // 返回空数组直接跳过。
     if (attached) {
-      const taken = takePendingInteractionsForSession(row.id);
-      if (richIm) {
-        for (const entry of taken) {
-          void publishMigratedInteraction(entry, userId, row.id, target.scopeKey);
-        }
-      } else {
-        // Text-only adapters have a single waiter per user. Preserve the
-        // Desktop permission queue's ordering after takeover instead of
-        // publishing the whole migrated cohort concurrently and replacing or
-        // rejecting every waiter after the first one.
-        //
-        // Pre-register ownership + absolute-deadline watchdog for the ENTIRE
-        // cohort BEFORE the serial await loop. A text channel publishes
-        // migrated interactions one at a time, so without this a permission
-        // queued behind an unanswered ask/plan (which has no timeout) would not
-        // arm its deadline until it reached the front, and the SDK Promise
-        // could hang for the whole serial wait past the permission's original
-        // deadline. Pre-registering arms every permission's watchdog up front
-        // and also makes the whole cohort settleable by Desktop ABORT_SESSION
-        // (via the external settle bridge) while they are still queued.
-        for (const entry of taken) {
-          registerMigratedOwnership(row.id, entry, 'text', userId);
-        }
-        void (async () => {
+      try {
+        const taken = takePendingInteractionsForSession(row.id);
+        if (richIm) {
           for (const entry of taken) {
-            // Skip entries the pre-registered watchdog/ABORT already settled
-            // while a predecessor was still in flight (their record is gone
-            // from the ownership map).
-            if (!migratedInteractionsBySession.get(row.id)?.has(entry.requestId)) {
-              continue;
-            }
-            await publishMigratedInteraction(entry, userId, row.id, target.scopeKey);
+            void publishMigratedInteraction(entry, userId, row.id, target.scopeKey);
           }
-        })().catch((err) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          log.error(`publish migrated text interaction queue failed: ${msg}`);
-        });
-      }
-      if (taken.length > 0) {
-        log.info(
-          `migrated ${taken.length} pending interaction(s) from desktop → ${channel} for session=${row.id.slice(-8)}`,
-        );
+        } else {
+          // Text-only adapters have a single waiter per user. Preserve the
+          // Desktop permission queue's ordering after takeover instead of
+          // publishing the whole migrated cohort concurrently and replacing or
+          // rejecting every waiter after the first one.
+          //
+          // Pre-register ownership + absolute-deadline watchdog for the ENTIRE
+          // cohort BEFORE the serial await loop. A text channel publishes
+          // migrated interactions one at a time, so without this a permission
+          // queued behind an unanswered ask/plan (which has no timeout) would not
+          // arm its deadline until it reached the front, and the SDK Promise
+          // could hang for the whole serial wait past the permission's original
+          // deadline. Pre-registering arms every permission's watchdog up front
+          // and also makes the whole cohort settleable by Desktop ABORT_SESSION
+          // (via the external settle bridge) while they are still queued.
+          for (const entry of taken) {
+            registerMigratedOwnership(row.id, entry, 'text', userId);
+          }
+          void (async () => {
+            for (const entry of taken) {
+              // Skip entries the pre-registered watchdog/ABORT already settled
+              // while a predecessor was still in flight (their record is gone
+              // from the ownership map).
+              if (!migratedInteractionsBySession.get(row.id)?.has(entry.requestId)) {
+                continue;
+              }
+              await publishMigratedInteraction(entry, userId, row.id, target.scopeKey);
+            }
+          })().catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.error(`publish migrated text interaction queue failed: ${msg}`);
+          });
+        }
+        if (taken.length > 0) {
+          log.info(
+            `migrated ${taken.length} pending interaction(s) from desktop → ${channel} for session=${row.id.slice(-8)}`,
+          );
+        }
+      } finally {
+        // Keep the Desktop queue fenced until the channel has accepted the
+        // migrated cohort, preventing a new Desktop permission from racing the
+        // handoff and overwriting the renderer's singleton permission slot.
+        completePermissionQueueTakeoverForSession(row.id);
       }
     }
 
@@ -3808,6 +3816,13 @@ export function createTurnRunner(
       }
     }
     sessionStates.clear();
+    // A detached session no longer appears in sessionStates, but its migrated
+    // interaction ownership intentionally survives detach until later teardown.
+    // Sweep those orphaned records during global dispose so their SDK waiters
+    // cannot remain live for the channel timeout.
+    for (const sessionId of migratedInteractionsBySession.keys()) {
+      settleMigratedInteractionsForSession(sessionId, 'session_disposed');
+    }
     unsubscribeMakerEvents?.();
     unsubscribeMakerEvents = null;
     subscribedMaker = null;

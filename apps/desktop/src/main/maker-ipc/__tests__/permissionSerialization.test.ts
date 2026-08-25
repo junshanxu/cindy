@@ -391,6 +391,48 @@ describe('PermissionQueue (issue #3092)', () => {
     await a;
   });
 
+  it('fences new Desktop permissions during the channel takeover handoff', async () => {
+    const queue = new PermissionQueue();
+    let releaseA: ((() => void) | null) | undefined;
+    let bRan = false;
+    const a = queue.dispatch(
+      () =>
+        new Promise<InteractionDecision>((resolve) => {
+          releaseA = () => resolve(allow());
+        }),
+      { timeoutMs: 1000, takeoverRequest: permissionRequest('req-a'), arrivalSequence: 1 },
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(releaseA).toBeTypeOf('function');
+
+    // The displayed permission A is migrated separately from the queued
+    // permission list. A new permission arriving before the channel route is
+    // ready must remain behind A instead of broadcasting a second Desktop card.
+    expect(queue.takeForTakeover(deny('session_migrated'))).toEqual([]);
+    const b = queue.dispatch(
+      async () => {
+        bRan = true;
+        return allow();
+      },
+      { timeoutMs: 1000, takeoverRequest: permissionRequest('req-b'), arrivalSequence: 2 },
+    );
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(bRan).toBe(false);
+
+    queue.completeTakeover();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(bRan).toBe(false);
+
+    releaseA?.();
+    await a;
+    await b;
+    expect(bRan).toBe(true);
+  });
+
   it('keeps the original queued deadline after takeover and ignores a late answer', async () => {
     vi.useFakeTimers();
     try {
