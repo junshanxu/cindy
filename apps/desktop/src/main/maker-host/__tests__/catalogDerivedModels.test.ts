@@ -105,14 +105,24 @@ function injectedCatalog(): Catalog {
 describe('deriveAvailableModels — dynamic-first catalog contract', () => {
   it('publishes Pi effort controls only when the official catalog has an explicit thinking map', () => {
     const pi = deriveAvailableModels(BUNDLED_CATALOG, 'pi');
-    expect(pi.find((m) => m.id === 'grok-4.3')?.efforts).toEqual([]);
+    expect(pi.find((m) => m.id === 'grok-4.3')?.efforts).toEqual([
+      'minimal',
+      'low',
+      'medium',
+      'high',
+    ]);
     expect(pi.find((m) => m.id === 'grok-4.5')?.efforts).toEqual([
       'minimal',
       'low',
       'medium',
       'high',
     ]);
-    expect(pi.find((m) => m.id === 'grok-4.6')?.efforts).toEqual([]);
+    expect(pi.find((m) => m.id === 'grok-4.6')?.efforts).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+    ]);
   });
 
   it('preserves the explicit effort subset of a Pi BYOM model in remote capabilities', () => {
@@ -183,8 +193,8 @@ describe('deriveAvailableModels — dynamic-first catalog contract', () => {
     const flat = flatModels.filter((m) => m.id === 'grok-4.3');
     expect(flat).toHaveLength(1);
     expect(flat[0]).toMatchObject({
-      efforts: [],
-      defaultEffort: null,
+      efforts: ['low'],
+      defaultEffort: 'low',
     });
     expect(
       resolvePiRuntimeModelDescriptor(catalog, 'colliding-reasoning', 'grok-4.3'),

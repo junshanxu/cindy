@@ -136,9 +136,8 @@ export interface XdGatewayAgentOverride {
 
 /**
  * 服务端下发的 XD 网关模型条目(shared/modelAccess ModelAccessGatewayModel 的子集)。
- * 命名沿用历史("聊天"),但条目本身不保证是聊天模型——是否聊天模型看 mode,
- * 服务端目前只透传已经过它自己 chat 过滤的条目,过滤范围以后可能放开(issue #882);
- * 客户端一律用 isChatEligible 判定,不依赖本类型名字或服务端过滤范围。
+ * 命名沿用历史("聊天"),但条目本身不保证是聊天模型——v4 同时包含 chat 与媒体模型，
+ * 客户端一律按 agents/mode 投影到对应消费面，不从 id 猜测类型。
  *
  * 能力字段已由服务端一次归一化,客户端不再二次转换(见 model-access/index.ts)。
  */
@@ -188,6 +187,8 @@ export interface XdGatewayModelInfo {
  * v3 必需字段在协议边界严格校验；这里不读取公共 Catalog，也不按模型 id 或固定常量补值。
  */
 let xdGatewayModels: XdGatewayModelInfo[] = [];
+/** 当前账号最近一次 `/models` 成功响应；false 时空/旧数组都不能作为 deny 证据。 */
+let xdGatewayModelsAuthoritative = false;
 /**
  * XD 模型里「由客户端投影给 Codex、但走 Anthropic Messages bridge」的 id 集合。
  * Responses → Anthropic Messages bridge，不能误用 XD 的原生 Responses 路由。
@@ -215,6 +216,99 @@ let localOverrides: ModelCatalogOverrides = EMPTY_MODEL_CATALOG_OVERRIDES;
 let lastPlanWarnings: ModelPlaneWarning[] = [];
 
 type Effort = CatalogModel['efforts'][number];
+const EFFORT_RANK: readonly Effort[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+
+/**
+ * 档位集合 → **规范升序**数组(低 → 高)。x.ai discovery 的 payload 是降序,而下游
+ * (滑杆按下标画轴、`efforts[0]`=最低 / `efforts.at(-1)`=最高的全部取值点)契约都是
+ * 升序 —— 此前只有 Grok 4.6 经 mergeKnownXaiEfforts 顺带归一,其余条目原样透传,
+ * Grok 4.5 的滑杆整条轴反向(Chris 2026-08-19 实测)。所有 xAI 条目统一过这一道。
+ */
+function canonicalEffortOrder(list: readonly Effort[] | undefined): Effort[] {
+  const seen = new Set<Effort>(list ?? []);
+  return EFFORT_RANK.filter((effort) => seen.has(effort));
+}
+
+/** Union discovery with the known official ladder so an incomplete SuperGrok payload cannot hide xhigh.
+ * Official source (2026-08-16): https://docs.x.ai/developers/model-capabilities/text/reasoning
+ * Grok 4.6 = low | medium | high (default) | xhigh. */
+function mergeKnownXaiEfforts(
+  discovered: readonly Effort[] | undefined,
+  baseline: readonly Effort[] | undefined,
+): Effort[] {
+  return canonicalEffortOrder([...(discovered ?? []), ...(baseline ?? [])]);
+}
+
+function isOfficialGrok46Id(modelId: string): boolean {
+  return modelId === 'grok-4.6' || modelId.endsWith('/grok-4.6');
+}
+
+function pickXaiDefaultEffort(
+  efforts: readonly Effort[],
+  candidates: ReadonlyArray<Effort | null | undefined>,
+  fallback: 'official-high' | 'first',
+): Effort | null {
+  for (const candidate of candidates) {
+    if (candidate != null && efforts.includes(candidate)) return candidate;
+  }
+  if (efforts.length === 0) return null;
+  if (fallback === 'official-high' && efforts.includes('high')) return 'high';
+  // efforts 已规范升序(canonicalEffortOrder):'official-high' 的兜底 = 最高档;
+  // 'first' 的兜底 = 最低档 —— 没有任何来源声明默认时保守起步,这条路仅在
+  // discovery / registry / catalog 三处默认全缺时才会走到(实测 payload 都带 default)。
+  return fallback === 'official-high'
+    ? (efforts[efforts.length - 1] ?? null)
+    : (efforts[0] ?? null);
+}
+
+/** SuperGrok 账号档位：官方梯子/默认 high 只作用于 Grok 4.6；其余以 discovery 为准。 */
+function resolveXaiAccountCapabilities(
+  entry: XaiDiscoveredModel,
+  baselineEfforts: readonly Effort[] | undefined,
+  registryDefault: Effort | null | undefined,
+  catalogDefault: Effort | null | undefined,
+): { efforts: Effort[]; defaultEffort: Effort | null } {
+  const isGrok46 = isOfficialGrok46Id(entry.id);
+  // 非 4.6 仍「以 discovery 为准」(不与官方梯子并集),但**顺序必须归一**:discovery 层
+  // 已排过一道(model-discovery/xai.ts canonicalEffortOrder),这里再兜一次是防御 ——
+  // efforts 是外部输入(payload / 磁盘缓存 / registry 静态值),任何一路漏排都会让滑杆反向。
+  const efforts = isGrok46
+    ? mergeKnownXaiEfforts(entry.efforts, baselineEfforts)
+    : entry.efforts !== undefined
+      ? canonicalEffortOrder(entry.efforts)
+      : canonicalEffortOrder(baselineEfforts);
+  const defaultEffort = isGrok46
+    ? pickXaiDefaultEffort(
+        efforts,
+        [registryDefault, catalogDefault, entry.defaultEffort],
+        'official-high',
+      )
+    : pickXaiDefaultEffort(
+        efforts,
+        [entry.defaultEffort, registryDefault, catalogDefault],
+        'first',
+      );
+  return { efforts, defaultEffort };
+}
+
+/** Registry overlay 会写回静态档位;非 4.6 的 discovery 显式值必须压过它。 */
+function preserveNonGrok46DiscoveryEfforts(
+  models: readonly CatalogModel[],
+  discovered: readonly XaiDiscoveredModel[],
+): CatalogModel[] {
+  const byId = new Map(discovered.map((entry) => [entry.id, entry]));
+  return models.map((model) => {
+    const entry = byId.get(model.id) ?? byId.get(`xai/${model.id}`);
+    if (!entry || isOfficialGrok46Id(entry.id)) return model;
+    const { efforts, defaultEffort } = resolveXaiAccountCapabilities(
+      entry,
+      model.efforts,
+      model.defaultEffort,
+      model.defaultEffort,
+    );
+    return { ...model, efforts, defaultEffort };
+  });
+}
 
 function xdGatewayTargetAgents(model: XdGatewayModelInfo): AgentKind[] {
   return (model.agents ?? []).filter((agent) => {
@@ -614,19 +708,12 @@ function materializeXaiAccountModels(
       xaiCatalogModelById(provider, entry.id, agent) ??
       xaiCatalogModelById(provider, entry.id, 'pi');
     const registry = modelRegistryMetaFields('xai', agent, entry.id);
-    const efforts = entry.efforts
-      ? [...entry.efforts]
-      : [...(registry?.efforts ?? catalogModel?.efforts ?? [])];
-    const requestedDefault =
-      entry.defaultEffort !== undefined
-        ? entry.defaultEffort
-        : (registry?.defaultEffort ?? catalogModel?.defaultEffort ?? null);
-    const defaultEffort =
-      requestedDefault !== null && efforts.includes(requestedDefault)
-        ? requestedDefault
-        : efforts.includes('high')
-          ? 'high'
-          : (efforts[efforts.length - 1] ?? null);
+    const { efforts, defaultEffort } = resolveXaiAccountCapabilities(
+      entry,
+      registry?.efforts ?? catalogModel?.efforts,
+      registry?.defaultEffort,
+      catalogModel?.defaultEffort,
+    );
     const contextWindow =
       entry.contextWindow ?? registry?.contextWindow ?? catalogModel?.contextWindow ?? 200_000;
     const contextWindowVerified =
@@ -702,6 +789,38 @@ function withEmptyModels(p: Provider): Provider {
   return { ...p, models };
 }
 
+function projectXdGatewayMediaModels(
+  provider: Provider,
+  gatewayModels: readonly XdGatewayModelInfo[],
+): Provider {
+  const imageModels = gatewayModels
+    .filter((model) => model.mode === 'image_generation')
+    .map((model) => ({
+      id: model.id,
+      name: model.name ?? model.id,
+      ...(model.modalities ? { modalities: model.modalities } : {}),
+    }));
+  const videoModels = gatewayModels
+    .filter((model) => model.mode === 'video_generation')
+    .map((model) => ({
+      id: model.id,
+      name: model.name ?? model.id,
+      ...(model.modalities ? { modalities: model.modalities } : {}),
+    }));
+  const identity = { ...provider };
+  delete identity.imageModels;
+  delete identity.imageDefaults;
+  delete identity.videoModels;
+  delete identity.videoDefaults;
+  return {
+    ...identity,
+    imageModels,
+    videoModels,
+    ...(imageModels[0] ? { imageDefaults: { standard: imageModels[0].id } } : {}),
+    ...(videoModels[0] ? { videoDefaults: { standard: videoModels[0].id } } : {}),
+  };
+}
+
 function computeMerged(): Catalog {
   const source = base ?? BUNDLED_CATALOG;
   const b =
@@ -748,9 +867,8 @@ function computeMerged(): Catalog {
   // 作者错误隔离进 warnings,由刷新路径读走打日志,不拖垮其余条目。
   const plan = planRegistryRoots(b.modelRegistry);
   lastPlanWarnings = plan.warnings;
-  // XD 的对话模型成员仍由下方 `/models` 权威重建，但 provider 壳中的媒体清单、
-  // 默认项和显式空值必须服从当前 Catalog。只有目录本身缺少 XD（生产加载经
-  // mergeWithBundled 后通常不会发生）才回落与 evidence 同级安全的 bundled 壳。
+  // XD 的模型成员与媒体清单都由下方 `/models` 权威重建。Catalog 只保留 provider
+  // 身份壳；其中残留的旧媒体字段不得成为第二事实源。
   const fallbackXdCatalog =
     baseCapabilityEvidence === 'current'
       ? projectUnverifiedCatalogFallbackForBuildRegion(
@@ -959,16 +1077,26 @@ function computeMerged(): Catalog {
       const codexRoot = authoritativeMembers
         ? assembleAuthoritativeRoot('xai', 'codex', codexSeed, plan)
         : assembleRoot('xai', 'codex', codexSeed, plan, true);
+      const claudeAccountRoot = useAccountMembership
+        ? preserveNonGrok46DiscoveryEfforts(claudeRoot, accountModels)
+        : claudeRoot;
+      const codexAccountRoot = useAccountMembership
+        ? preserveNonGrok46DiscoveryEfforts(codexRoot, accountModels)
+        : codexRoot;
       const stripPiApi = (model: CatalogModel): CatalogModel => {
         if (model.piApi === undefined) return model;
         const rest = { ...model };
         delete rest.piApi;
         return rest;
       };
-      const piModels = applyPiApiAnnotations(
+      const piProjected = applyPiApiAnnotations(
         'xai',
-        claudeRoot.map((model) => projectXaiPiModel(p, model)),
+        claudeAccountRoot.map((model) => projectXaiPiModel(p, model)),
       );
+      // Pi 投影会写回静态 official map;非 4.6 的 discovery 显式档位/默认值仍须压过它。
+      const piModels = useAccountMembership
+        ? preserveNonGrok46DiscoveryEfforts(piProjected, accountModels)
+        : piProjected;
       return {
         ...p,
         agents: p.agents.includes('pi') ? p.agents : [...p.agents, 'pi' as AgentKind],
@@ -984,8 +1112,8 @@ function computeMerged(): Catalog {
         },
         models: {
           ...p.models,
-          'claude-code': claudeRoot.map(stripPiApi),
-          codex: codexRoot.map(stripPiApi),
+          'claude-code': claudeAccountRoot.map(stripPiApi),
+          codex: codexAccountRoot.map(stripPiApi),
           pi: piModels,
         },
       };
@@ -1063,7 +1191,7 @@ function computeMerged(): Catalog {
         )
         .map(({ model }) => model);
     }
-    return { ...p, models };
+    return { ...projectXdGatewayMediaModels(p, gwModels), models };
   });
 
   if (providers === b.providers) return b; // 无 augment、无 custom → 原样返回
@@ -1315,8 +1443,14 @@ export function setDiscoveredProviderMediaModels(
  * 注入 XD 网关权威模型清单(model-access 拉取流程写入,重建逻辑见 computeMerged)。
  * 传空数组 = 实时清单不可用,此时 XD 供应商保留但不暴露任何模型。
  */
-export function setXdGatewayModels(models: XdGatewayModelInfo[]): void {
+export function setXdGatewayModels(
+  models: XdGatewayModelInfo[],
+  options?: { authoritative?: boolean },
+): void {
   xdGatewayModels = [...models];
+  if (options?.authoritative !== undefined) {
+    xdGatewayModelsAuthoritative = options.authoritative;
+  }
   xdCodexAnthropicBridgeModelIds = deriveXdCodexAnthropicBridgeModelIds(models);
   markChanged();
 }
@@ -1324,6 +1458,19 @@ export function setXdGatewayModels(models: XdGatewayModelInfo[]): void {
 /** 同步读取最近一次完整 `/models` 快照，供 sendSync 配置面只读投影。 */
 export function getXdGatewayModels(): readonly XdGatewayModelInfo[] {
   return xdGatewayModels;
+}
+
+/** 子代理模型预检只在此标记为 true 时，才可把清单缺席解释为权威拒绝。 */
+export function getXdGatewayModelAccessSnapshot(): {
+  authoritative: boolean;
+  models: readonly XdGatewayModelInfo[];
+} {
+  return { authoritative: xdGatewayModelsAuthoritative, models: xdGatewayModels };
+}
+
+/** 新一轮 `/models` 未完成或失败后撤销负向证明，但保留 LKG 供 UI 展示。 */
+export function markXdGatewayModelAccessUnknown(): void {
+  xdGatewayModelsAuthoritative = false;
 }
 
 /** 返回当前 active catalog 的单调递增修订号。 */

@@ -38,7 +38,6 @@ import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 import type { Session } from '@/lib/ccAgent.types';
 import { makerChatStore } from '@/lib/makerChatStore';
-import { WorktreeBadge } from '@/components/sidebar/WorktreeBadge';
 import { SessionStatusIcon } from './SessionStatusIcon';
 import { SessionRenameInput } from '../SessionRenameInput';
 import { usePrActions, usePrRefsForSession } from '@/contexts/PrRefsContext';
@@ -64,6 +63,7 @@ import { toast } from '@/lib/toast';
 import { buildSessionDeepLink } from '@/lib/deepLink';
 import { createLogger } from '@/lib/logger';
 import { buildSessionInfoPieces, SessionInfoMeta } from './SessionInfoMeta';
+import { useTaskInfoWorktree } from './sessionWorktreeInfo';
 import { useTaskInfoFields } from '../hooks/useTaskInfoFields';
 import { highlightSegments } from '../lib/highlightSegments';
 import { scrollIntoNearestView } from '../lib/scrollIntoNearestView';
@@ -93,7 +93,8 @@ import { prefetchDirtyWorktreeForRemoval } from '@/lib/worktreeRemovalWarning';
 import { useSessionAttentionKind } from '@/lib/sessionAttentionStore';
 import { useSessionAttentionUrgency } from '../contexts/SessionAttentionUrgencyContext';
 import { useRemoteSessionActivity } from '@/features/device-link/remoteSessionActivityStore';
-import { resolveSidebarRightStatus } from './sidebarRightStatus';
+import { useAgentIslandActivity } from '@/state/agentIslandActivity';
+import { projectSidebarSessionActivity, resolveSidebarRightStatus } from './sidebarRightStatus';
 import { AutomationTimerIcon } from './AutomationTimerIcon';
 import { SidebarRightStatusIndicator } from './SidebarRightStatusIndicator';
 import {
@@ -359,13 +360,15 @@ export const SessionItem = memo(function SessionItem({
       : session.updatedAt;
   // PR 信息(C' 期):勾选且有引用时取最新一条(prRefs 已按 lastSeenAt 降序)。
   const infoPrRef = taskInfoFields.includes('pr') ? prRefs[0] : undefined;
-  // 传 hasPrRef 让 PR 参与「按勾选顺序」排列(否则它恒在最前)。
+  const infoWorktree = useTaskInfoWorktree(session, taskInfoFields.includes('worktree'));
+  // 传 hasPrRef / hasWorktree 让它们参与「按勾选顺序」排列。
   const infoPieces = buildSessionInfoPieces(
     session,
     taskInfoFields,
     activityIso,
     t,
     infoPrRef != null,
+    infoWorktree != null,
   );
   // 右侧状态指示器五档优先级(高→低),色表全端统一(侧栏 / 卡片 / 灵动岛同一张表):
   //   1. error(出错终止 / 定时任务失败未读)→ 红点   —— 红专职表示"坏了"
@@ -392,32 +395,23 @@ export const SessionItem = memo(function SessionItem({
   // 通过 SessionAttentionUrgencyContext 由上游注入,避免误把失败的 automation 涂成 Completed。
   const attentionKind = useSessionAttentionKind(session.id);
   const isUrgentFromContext = useSessionAttentionUrgency(session.id);
+  const islandActivity = useAgentIslandActivity(session.id);
   // device-link 远程会话行:本地 attention/running 链路对被控端后台会话是盲区,状态改由
   // 被控端灵动岛 relay 的活动镜像驱动(remoteSessionActivityStore,按行精准订阅;本地
   // 会话恒 undefined 零开销)。镜像只保留活跃态与未读终态,映射与本地五档同一张色表。
   const remoteActivity = useRemoteSessionActivity(session.id);
-  const remoteRightStatus =
-    remoteActivity == null
-      ? null
-      : remoteActivity.phase === 'error'
-        ? ('error' as const)
-        : remoteActivity.phase === 'needs-interaction'
-          ? ('awaiting' as const)
-          : remoteActivity.phase === 'running'
-            ? ('running' as const)
-            : ('done' as const);
-  // 左侧 vendor mark 呼吸原先只看本地 running 集;远程会话的运行态只进了右侧
-  // 状态槽,图标颜色不会刷新。只并入 phase=running,与折叠 rail 的 remoteLampOf
-  // 以及本地 pending-prompt 口径一致:needs-interaction 继续由右侧 awaiting 表达。
-  const leftIconRunning = isRunning || remoteActivity?.phase === 'running';
-  const rightStatusKind =
-    remoteRightStatus ??
-    resolveSidebarRightStatus({
-      attentionKind,
-      isUrgentFromContext,
-      isRunning,
-      hasAttentionNotification,
-    });
+  const sessionActivity = projectSidebarSessionActivity({
+    sessionId: session.id,
+    title: session.title,
+    recordStatus: session.status,
+    liveActivity: remoteActivity ?? islandActivity,
+    attentionKind,
+    isUrgentFromContext,
+    isRunning,
+    hasAttentionNotification,
+  });
+  const leftIconRunning = sessionActivity.currentTurnActive === true;
+  const rightStatusKind = resolveSidebarRightStatus(sessionActivity);
   const showRightStatus = rightStatusKind !== 'time';
   const remoteIconKind = session.deviceLinkDeviceId
     ? 'device-link'
@@ -1077,19 +1071,17 @@ export const SessionItem = memo(function SessionItem({
         </span>
       )}
 
-      {/* 右侧 WorktreeBadge + 最近活动时间 + Archive 快捷按钮。
+      {/* 右侧任务信息 + Archive 快捷按钮。
           时间使用 sidebar 排序同一时间轴 session.updatedAt(scheduler 自动 fire
           也会 bump,不用 userSendAt 避免被绑定给定时任务的会话时间冻结)。
-          WorktreeBadge 紧贴时间左侧(仅在 WorktreeContext map 中存在 sessionId 时
-          渲染), 与时间同步 hover-fade 让位给 action buttons —— 让右侧只看到一组
-          视觉元素, 不和 action buttons 共存。
+          worktree 并入任务信息复选,与 PR / 费用同一槽,不再常驻分叉图标。
           archive 快捷按钮 hover/focus 时进同一格文档流,标题 truncate 让位;
           完整菜单仍走右键。槽宽跟可见内容走:平时信息槽有多宽占多宽,「任务信息 =
           无」且无状态、无 worktree 时宽度归零。hover / 菜单打开时按钮入流,
           槽宽取信息层与按钮的较大值——不再绝对定位盖到标题上。 */}
       {!isEditing && (
         <div className="group/slot relative ml-auto flex h-6 shrink-0 items-center justify-end">
-          {/* WorktreeBadge + time 同步 fade-out:hover/菜单打开/archivePending 时
+          {/* 任务信息同步 fade-out:hover/菜单打开/archivePending 时
               一起让位,确保只有 action buttons 占住右侧。fade 容器复用同一份条件,
               避免两个元素 fade 时机不一致产生闪烁。
               focus 隐藏条件用命名 group(/slot) 收窄到本槽位:行本身是
@@ -1109,13 +1101,17 @@ export const SessionItem = memo(function SessionItem({
                 ordinalBadgeLabel != null && 'opacity-0',
               )}
             >
-              <WorktreeBadge sessionId={session.id} size={12} className="size-4" />
               {showRightStatus ? (
                 <SidebarRightStatusIndicator kind={rightStatusKind} isActive={isActive} />
               ) : (
-                // 任务信息复选(C 期):按用户勾选拼装 pr / tokens / cost / time;默认仅
+                // 任务信息复选:按用户勾选拼装 pr / worktree / tokens / cost / time;默认仅
                 // time,与旧时间槽渲染等价。全不选 → SessionInfoMeta 渲染 null,槽宽归零。
-                <SessionInfoMeta pieces={infoPieces} prRef={infoPrRef} isActive={isActive} />
+                <SessionInfoMeta
+                  pieces={infoPieces}
+                  prRef={infoPrRef}
+                  worktree={infoWorktree ?? undefined}
+                  isActive={isActive}
+                />
               )}
             </div>
 

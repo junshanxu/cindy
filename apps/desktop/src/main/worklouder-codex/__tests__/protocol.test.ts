@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 
-import type { AgentIslandSessionActivity } from '../../../shared/agentIsland.js';
 import {
   applyWorkLouderCodexLightingBrightness,
   createWorkLouderCodexOffFrame,
@@ -9,15 +8,17 @@ import {
   isWorkLouderCodexHostMessage,
   isWorkLouderCodexLightingFrameOff,
   parseWorkLouderCodexAgentKeyPress,
+  foldOrcaWorkerActivityOntoLeads,
   projectWorkLouderCodexSlotActivity,
+  type WorkLouderCodexSessionActivity,
   WorkLouderLightingEffect,
 } from '../protocol.js';
 
 function activity(
   sessionId: string,
-  phase: AgentIslandSessionActivity['phase'],
+  phase: WorkLouderCodexSessionActivity['phase'],
   attention = false,
-): AgentIslandSessionActivity {
+): WorkLouderCodexSessionActivity {
   return { sessionId, phase, compactDetail: '', attention };
 }
 
@@ -77,6 +78,27 @@ describe('createWorkLouderCodexLightingFrame', () => {
     expect(frame.threads[0].brightness).toBe(0);
     expect(frame.threads[1].brightness).toBeGreaterThan(0);
   });
+
+  it('lights the lead task key when only an Orca worker is running', () => {
+    const folded = foldOrcaWorkerActivityOntoLeads(
+      [activity('worker-1', 'running')],
+      { 'lead-1': ['worker-1'] },
+    );
+    const frame = createWorkLouderCodexLightingFrame(folded, ['lead-1']);
+
+    expect(folded).toEqual([activity('worker-1', 'running'), activity('lead-1', 'running')]);
+    expect(frame.ambient.effect).toBe(WorkLouderLightingEffect.Snake);
+    expect(frame.threads[0].brightness).toBeGreaterThan(0);
+  });
+
+  it('keeps a lead question ahead of a running worker', () => {
+    const folded = foldOrcaWorkerActivityOntoLeads(
+      [activity('lead-1', 'needs-interaction'), activity('worker-1', 'running')],
+      { 'lead-1': ['worker-1'] },
+    );
+
+    expect(folded[0]).toEqual(activity('lead-1', 'needs-interaction'));
+  });
 });
 
 describe('Work Louder Agent key protocol', () => {
@@ -99,6 +121,25 @@ describe('Work Louder Agent key protocol', () => {
     expect(isWorkLouderCodexHostMessage({ kind: 'activity' })).toBe(true);
     expect(isWorkLouderCodexHostMessage({ kind: 'device-activity' })).toBe(false);
     expect(isWorkLouderCodexHostMessage(null)).toBe(false);
+  });
+
+  it('accepts presence discovery with optional identity', () => {
+    expect(isWorkLouderCodexHostMessage({ kind: 'presence', present: false })).toBe(true);
+    expect(
+      isWorkLouderCodexHostMessage({
+        kind: 'presence',
+        present: true,
+        deviceType: 'codex-micro',
+        isUsbConnection: true,
+      }),
+    ).toBe(true);
+    expect(
+      isWorkLouderCodexHostMessage({
+        kind: 'presence',
+        present: true,
+        deviceType: 'keyboard',
+      }),
+    ).toBe(false);
   });
 });
 

@@ -17,6 +17,12 @@ export const enum WorkLouderLightingEffect {
   ShallowBreath = 6,
 }
 
+/** Hardware lighting consumes only the stable activity facets it renders. */
+export type WorkLouderCodexSessionActivity = Pick<
+  AgentIslandSessionActivity,
+  'sessionId' | 'phase' | 'attention' | 'compactDetail'
+>;
+
 export interface WorkLouderLightingSide {
   effect: WorkLouderLightingEffect;
   brightness: number;
@@ -50,6 +56,7 @@ export type WorkLouderCodexHostRequest =
   // talk to the device — this is that something, driven by whoever is
   // currently showing connection state.
   | { kind: 'probe' }
+  | { kind: 'discover' }
   | { kind: 'stop' };
 
 export type WorkLouderCodexHostMessage =
@@ -61,6 +68,12 @@ export type WorkLouderCodexHostMessage =
   /** Legacy utility-host message retained for older host fakes and upgrades. */
   | { kind: 'agent-key'; slot: number }
   | { kind: 'device'; device: WorkLouderCodexDeviceState }
+  | {
+      kind: 'presence';
+      present: boolean;
+      deviceType?: 'codex-micro' | 'creator-micro-2';
+      isUsbConnection?: boolean;
+    }
   | { kind: 'hid'; event: WorkLouderCodexHidEvent }
   | { kind: 'joystick'; event: WorkLouderCodexJoystickEvent }
   | { kind: 'activity' }
@@ -97,7 +110,7 @@ const OFF_SIDE: WorkLouderLightingSide = {
   color: 0,
 };
 
-const PHASE_PRIORITY: Readonly<Record<AgentIslandSessionActivity['phase'], number>> = {
+const PHASE_PRIORITY: Readonly<Record<WorkLouderCodexSessionActivity['phase'], number>> = {
   'needs-interaction': 4,
   error: 3,
   running: 2,
@@ -109,11 +122,11 @@ const PHASE_PRIORITY: Readonly<Record<AgentIslandSessionActivity['phase'], numbe
  * zones plus its six per-thread indicators.
  */
 export function createWorkLouderCodexLightingFrame(
-  activity: readonly AgentIslandSessionActivity[],
+  activity: readonly WorkLouderCodexSessionActivity[],
   slotSessionIds?: readonly string[],
 ): WorkLouderCodexLightingFrame {
   const slots = projectWorkLouderCodexSlotActivity(activity, slotSessionIds);
-  const aggregate = slots.reduce<AgentIslandSessionActivity['phase'] | null>((current, item) => {
+  const aggregate = slots.reduce<WorkLouderCodexSessionActivity['phase'] | null>((current, item) => {
     if (!item) return current;
     return current === null || PHASE_PRIORITY[item.phase] > PHASE_PRIORITY[current]
       ? item.phase
@@ -131,16 +144,63 @@ export function createWorkLouderCodexLightingFrame(
 
 /** The ordered task assignment shared by the six LEDs and their physical keys. */
 export function selectWorkLouderCodexSlotActivity(
-  activity: readonly AgentIslandSessionActivity[],
-): AgentIslandSessionActivity[] {
+  activity: readonly WorkLouderCodexSessionActivity[],
+): WorkLouderCodexSessionActivity[] {
   return activity.filter(isLightingVisibleActivity).slice(0, WORKLOUDER_CODEX_AGENT_SLOT_COUNT);
+}
+
+/**
+ * Copy worker lighting onto the lead task key.
+ *
+ * Agent keys and LEDs are assigned to the lead session. Orca workers are
+ * separate sessions, so a team that is still working would otherwise look idle
+ * as soon as the lead turn finished.
+ */
+export function foldOrcaWorkerActivityOntoLeads(
+  activity: readonly WorkLouderCodexSessionActivity[],
+  workersByLead: Readonly<Record<string, readonly string[]>>,
+): WorkLouderCodexSessionActivity[] {
+  const byId = new Map(activity.map((item) => [item.sessionId, item]));
+  let changed = false;
+  const next = [...activity];
+  for (const [leadId, workerIds] of Object.entries(workersByLead)) {
+    if (workerIds.length === 0) continue;
+    let best = lightingActivityOrNull(byId.get(leadId));
+    for (const workerId of workerIds) {
+      const worker = lightingActivityOrNull(byId.get(workerId));
+      if (!worker) continue;
+      if (!best || lightingActivityRank(worker) > lightingActivityRank(best)) {
+        best = { ...worker, sessionId: leadId };
+      }
+    }
+    if (!best) continue;
+    const existingIndex = next.findIndex((item) => item.sessionId === leadId);
+    if (existingIndex === -1) {
+      next.push(best);
+      changed = true;
+    } else if (lightingActivityRank(best) > lightingActivityRank(next[existingIndex]!)) {
+      next[existingIndex] = best;
+      changed = true;
+    }
+  }
+  return changed ? next : activity as WorkLouderCodexSessionActivity[];
+}
+
+function lightingActivityOrNull(
+  item: WorkLouderCodexSessionActivity | undefined,
+): WorkLouderCodexSessionActivity | null {
+  return item && isLightingVisibleActivity(item) ? item : null;
+}
+
+function lightingActivityRank(item: WorkLouderCodexSessionActivity): number {
+  return (PHASE_PRIORITY[item.phase] ?? 0) + (item.attention ? 0.1 : 0);
 }
 
 /** Aligns activity LEDs with an explicit six-task key assignment when one is available. */
 export function projectWorkLouderCodexSlotActivity(
-  activity: readonly AgentIslandSessionActivity[],
+  activity: readonly WorkLouderCodexSessionActivity[],
   slotSessionIds?: readonly string[],
-): Array<AgentIslandSessionActivity | undefined> {
+): Array<WorkLouderCodexSessionActivity | undefined> {
   if (slotSessionIds === undefined) return selectWorkLouderCodexSlotActivity(activity);
   const visibleBySessionId = new Map(
     activity.filter(isLightingVisibleActivity).map((item) => [item.sessionId, item] as const),
@@ -282,6 +342,18 @@ export function isWorkLouderCodexHostMessage(value: unknown): value is WorkLoude
   }
   if (message.kind === 'device')
     return isWorkLouderCodexDeviceState((message as { device?: unknown }).device);
+  if (message.kind === 'presence') {
+    const present = (message as { present?: unknown }).present;
+    const deviceType = (message as { deviceType?: unknown }).deviceType;
+    const isUsbConnection = (message as { isUsbConnection?: unknown }).isUsbConnection;
+    return (
+      typeof present === 'boolean' &&
+      (deviceType === undefined ||
+        deviceType === 'codex-micro' ||
+        deviceType === 'creator-micro-2') &&
+      (isUsbConnection === undefined || typeof isUsbConnection === 'boolean')
+    );
+  }
   if (message.kind === 'state') {
     const validStatus =
       message.status === 'connected' ||
@@ -331,7 +403,7 @@ function isWorkLouderCodexDeviceState(value: unknown): value is WorkLouderCodexD
   );
 }
 
-function isLightingVisibleActivity(activity: AgentIslandSessionActivity): boolean {
+function isLightingVisibleActivity(activity: WorkLouderCodexSessionActivity): boolean {
   return (
     activity.phase === 'running' ||
     activity.phase === 'needs-interaction' ||
@@ -339,7 +411,7 @@ function isLightingVisibleActivity(activity: AgentIslandSessionActivity): boolea
   );
 }
 
-function ambientForPhase(phase: AgentIslandSessionActivity['phase']): WorkLouderLightingSide {
+function ambientForPhase(phase: WorkLouderCodexSessionActivity['phase']): WorkLouderLightingSide {
   switch (phase) {
     case 'running':
       return side(WorkLouderLightingEffect.Snake, 0.7, 0.4, COLORS.running);
@@ -352,7 +424,7 @@ function ambientForPhase(phase: AgentIslandSessionActivity['phase']): WorkLouder
   }
 }
 
-function keysForPhase(phase: AgentIslandSessionActivity['phase']): WorkLouderLightingSide {
+function keysForPhase(phase: WorkLouderCodexSessionActivity['phase']): WorkLouderLightingSide {
   const effect =
     phase === 'error' ? WorkLouderLightingEffect.Breath : WorkLouderLightingEffect.Solid;
   const brightness = phase === 'needs-interaction' || phase === 'error' ? 0.28 : 0.16;
@@ -361,7 +433,7 @@ function keysForPhase(phase: AgentIslandSessionActivity['phase']): WorkLouderLig
 
 function threadForActivity(
   id: number,
-  activity: AgentIslandSessionActivity | undefined,
+  activity: WorkLouderCodexSessionActivity | undefined,
 ): WorkLouderThreadLighting {
   if (!activity) {
     return {

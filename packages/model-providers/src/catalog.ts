@@ -338,6 +338,12 @@ function validateProvider(p: Provider): void {
         `provider '${p.id}' routing[${agent}].requestPath invalid`,
       );
     }
+    if (routing.supportsResponsesCustomTools !== undefined) {
+      assert(
+        typeof routing.supportsResponsesCustomTools === 'boolean',
+        `provider '${p.id}' routing[${agent}].supportsResponsesCustomTools must be boolean`,
+      );
+    }
     // modelPrefixes（路由服务范围）提供了就必须是命名空间前缀形态（`xai/` 这类,以 `/` 结尾）——
     // 结构上保证 claude-* 等裸 wire model 永远不会命中,防止把 scope 声明成误伤辅助请求的形状。
     if (routing.modelPrefixes !== undefined) {
@@ -392,7 +398,12 @@ function validateProvider(p: Provider): void {
 function validateMediaModels(
   providerId: string,
   modelsField: string,
-  models: { id: string; name: string }[] | undefined,
+  models: Array<{
+    id: string;
+    name: string;
+    modalities?: { input: string[]; output: string[] };
+    officialDocs?: string;
+  }> | undefined,
   defaultsField: string,
   defaults: { standard: string; draft?: string; best?: string } | undefined,
 ): void {
@@ -405,6 +416,44 @@ function validateMediaModels(
       assert(typeof m.name === 'string' && m.name.length > 0, `provider '${providerId}' ${modelsField} '${m.id}' missing name`);
       assert(!seen.has(m.id), `provider '${providerId}' ${modelsField} has duplicate id '${m.id}'`);
       seen.add(m.id);
+      if (m.modalities !== undefined) {
+        assert(
+          m.modalities && typeof m.modalities === 'object' && !Array.isArray(m.modalities),
+          `provider '${providerId}' ${modelsField} '${m.id}' modalities must be an object`,
+        );
+        for (const key of ['input', 'output'] as const) {
+          const values = m.modalities[key];
+          assert(
+            Array.isArray(values) && values.length > 0 && values.length <= 16,
+            `provider '${providerId}' ${modelsField} '${m.id}' modalities.${key} must be a non-empty bounded array`,
+          );
+          assert(
+            values.every(
+              (value) =>
+                typeof value === 'string' &&
+                value.length > 0 &&
+                value.length <= 64 &&
+                value.trim() === value,
+            ) && new Set(values).size === values.length,
+            `provider '${providerId}' ${modelsField} '${m.id}' modalities.${key} contains invalid values`,
+          );
+        }
+      }
+      if (m.officialDocs !== undefined) {
+        let valid = false;
+        if (typeof m.officialDocs === 'string' && m.officialDocs.length <= 2_048) {
+          try {
+            const url = new URL(m.officialDocs);
+            valid = url.protocol === 'https:' && !url.username && !url.password;
+          } catch {
+            valid = false;
+          }
+        }
+        assert(
+          valid,
+          `provider '${providerId}' ${modelsField} '${m.id}' officialDocs must be https`,
+        );
+      }
     }
   }
   if (defaults !== undefined) {

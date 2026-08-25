@@ -24,6 +24,7 @@ import { app } from 'electron';
 
 import {
   PiAgent,
+  PiNativeProviderProxyNotReadyError,
   type AgentDeps,
   type AuthAdapter,
   type AuthState,
@@ -54,8 +55,18 @@ import type {
 } from '@cindy/model-providers';
 
 import { getReadyBinaryPath } from '../agent-binaries/index.js';
+import { t } from '../i18n.js';
 import { getPiExtraSpawnConfig } from '../mcp-integrations/piEnvironment.js';
 import { listCustomProvidersWithSecureHeaders } from './custom-provider-header-secrets.js';
+import {
+  MANAGED_OLLAMA_PROVIDER_ID,
+  matchesManagedOllamaFingerprint,
+} from '../../shared/localModelRuntime.js';
+import { ensureManagedOllamaReadyForSession } from '../local-model-runtime/preflight.js';
+import {
+  applyQwen38NativeOverlay,
+  shouldApplyQwen38Overlay,
+} from '../local-model-runtime/qwenProfile.js';
 import { readCustomProviderKey } from '../secrets/providerSecretStore.js';
 import {
   desktopClaudeAuthAdapter,
@@ -85,7 +96,10 @@ import {
   getLocalCatalogOverridesSnapshot,
   resolveXdPiGatewayWireProtocol,
 } from './active-catalog.js';
+import { isExclusiveXaiModelId } from '../../shared/subscriptionModels.js';
 import { resolvePiRuntimeModelDescriptor } from './catalog-to-descriptors.js';
+import { resolveManagedPiPackageResources } from './pi-package-store.js';
+import { mutateAuthorizedPiManagedPackage } from './pi-managed-package-mutation.js';
 
 const log = createLogger('pi-host');
 
@@ -147,7 +161,13 @@ function piOpenaiProxyPlaceholderJwt(): string {
 }
 
 function appendEndpointPath(endpoint: string, suffix: string): string {
-  return `${endpoint.replace(/\/+$/, '')}/${suffix.replace(/^\/+/, '')}`;
+  const url = new URL(endpoint);
+  const normalizedSuffix = `/${suffix.replace(/^\/+/, '').replace(/\/+$/, '')}`;
+  const pathname = url.pathname.replace(/\/+$/, '');
+  if (!pathname.endsWith(normalizedSuffix)) {
+    url.pathname = `${pathname}${normalizedSuffix}`;
+  }
+  return url.toString().replace(/\/$/, '');
 }
 
 function piSubscriptionHeaders(providerId: string): Record<string, string> {
@@ -475,8 +495,12 @@ export function buildPiSubscriptionNativeProviders(
   retainedOpenAiModel?: ModelDescriptor | null,
 ): PiNativeProvidersResult {
   const providers: PiNativeProviderSpec[] = [];
+  const officialXaiById = new Map(
+    (officialPiModels('xai') ?? []).map((model) => [model.id, model]),
+  );
   const env: Record<string, string> = {
     [PI_OPENAI_PROXY_KEY_ENV]: piOpenaiProxyPlaceholderJwt(),
+    [PI_XAI_PROXY_API_KEY_ENV]: PI_PROVIDER_AUTH_PLACEHOLDER_KEY,
   };
   const add = (
     sourceProviderId: 'anthropic' | 'openai' | 'xai',
@@ -513,6 +537,26 @@ export function buildPiSubscriptionNativeProviders(
       });
     }
     if (models.length === 0) return;
+    const modelIdAliases = Object.fromEntries(
+      models.flatMap((model) => {
+        const wireId =
+          stripPrefix && model.id.startsWith(stripPrefix)
+            ? model.id.slice(stripPrefix.length)
+            : model.id;
+        const namespaced = sourceProviderId === 'xai' && !model.id.startsWith('xai/')
+          ? `xai/${wireId}`
+          : undefined;
+        // alias 必须落到 spec.models[].id,不能落到 wireId。否则 ChatGPT 的
+        // chatgpt/gpt-* 会被收成 gpt-*,和 namespaced candidate.id 对不上。
+        return [
+          [model.id, model.id],
+          ...(wireId !== model.id ? [[wireId, model.id] as const] : []),
+          ...(namespaced && namespaced !== model.id
+            ? [[namespaced, model.id] as const]
+            : []),
+        ];
+      }),
+    );
     providers.push({
       id: piProviderId,
       sourceProviderId,
@@ -520,6 +564,8 @@ export function buildPiSubscriptionNativeProviders(
       baseUrl,
       inheritModels: true,
       ...(sourceProviderId === 'openai' ? { apiKeyEnvVar: PI_OPENAI_PROXY_KEY_ENV } : {}),
+      ...(sourceProviderId === 'xai' ? { apiKeyEnvVar: PI_XAI_PROXY_API_KEY_ENV } : {}),
+      modelIdAliases,
       headers: piSubscriptionHeaders(sourceProviderId),
       models: models.map((model) => {
         const wireId =
@@ -535,7 +581,20 @@ export function buildPiSubscriptionNativeProviders(
         // A missing/empty/partial PI probe is not evidence that the daily
         // catalog annotation is wrong. Keep annotated rows in the overlay so
         // inheritModels cannot filter out a confirmed addition or correction.
-        const isAnnotatedAddition = !!model.piApi && !bundledModel;
+        // 探针失败(bundledModelsByProvider == null)不能当成「全部 xAI 都不在二进制里」,
+        // 否则 grok-4.3 / grok-build-0.1 会被改写成 openai-responses。只在探针成功且
+        // 明确缺 grok-4.6 时才合成 addition。
+        const listedIds =
+          listedModelIdsByProvider?.get(piProviderId)
+          ?? listedPiModelIds(bundledModelsByProvider)?.get(piProviderId);
+        const isKnownMissingXaiModel =
+          wireId === 'grok-4.6' || model.id === 'grok-4.6' || model.id.endsWith('/grok-4.6');
+        const isXaiCatalogAddition =
+          sourceProviderId === 'xai'
+          && listedIds != null
+          && !listedIds.has(wireId)
+          && isKnownMissingXaiModel;
+        const isAnnotatedAddition = (!!model.piApi && !bundledModel) || isXaiCatalogAddition;
         const isContextProfileAddition =
           sourceProviderId === 'openai' && wireId.endsWith('[1m]') && !bundledModel;
         const isProtocolCorrection =
@@ -543,6 +602,9 @@ export function buildPiSubscriptionNativeProviders(
           !!model.piApi &&
           !!bundledModel &&
           bundledModel.api !== model.piApi;
+        const officialModel = sourceProviderId === 'xai' ? officialXaiById.get(wireId) : undefined;
+        const officialThinking = officialXaiThinkingSpec(officialModel);
+        const capabilityCorrection = xaiOfficialCapabilityCorrection(bundledModel, officialModel);
         const isRegistryBaselineOverlay = sourceProviderId === 'openai' && !!bundledModel;
         const catalogCost = catalogCostForPiNative(model.cost);
         if (isRegistryBaselineOverlay) {
@@ -579,6 +641,19 @@ export function buildPiSubscriptionNativeProviders(
           };
         }
         const preserved = isProtocolCorrection ? bundledModel : contextProfileTemplate;
+        const thinkingLevelMap =
+          capabilityCorrection?.thinkingLevelMap
+          ?? officialThinking?.thinkingLevelMap
+          ?? (preserved?.thinkingLevelMap
+            ? { ...preserved.thinkingLevelMap }
+            : model.efforts.length > 0
+              ? Object.fromEntries(
+                  PI_REASONING_EFFORTS.map((effort) => [
+                    effort,
+                    model.efforts.includes(effort) ? effort : null,
+                  ]),
+                )
+              : undefined);
         return {
           id: model.id,
           wireId,
@@ -586,26 +661,19 @@ export function buildPiSubscriptionNativeProviders(
           // portable piApi marks a daily catalog addition here. Existing models
           // stay untouched so their full bundled compat/pricing metadata survives;
           // only IDs proven absent from this exact PI binary are added.
-          ...(sourceProviderId === 'openai' && (isAnnotatedAddition || isContextProfileAddition)
+          ...((sourceProviderId === 'openai' && (isAnnotatedAddition || isContextProfileAddition))
+            || isXaiCatalogAddition
             ? { catalogAddition: true }
             : {}),
-          // SuperGrok 没有官方列模型通道，Cindy 目录是成员唯一来源。
-          // 缺席证明必须来自未过滤的 --list-models id：解析后的
-          // bundled 表会丢掉未知 api 的行，不能把「解析失败」当成
-          // 「二进制没有这个模型」。
-          ...(() => {
-            if (sourceProviderId !== 'xai') return {};
-            const listedIds =
-              listedModelIdsByProvider?.get(piProviderId) ??
-              listedPiModelIds(bundledModelsByProvider)?.get(piProviderId);
-            if (!listedIds || listedIds.has(wireId)) return {};
-            return { catalogAddition: true };
-          })(),
-          ...(sourceProviderId !== 'openai' &&
-          model.piApi &&
-          (isAnnotatedAddition || isProtocolCorrection)
-            ? { api: model.piApi }
-            : {}),
+          ...(isXaiCatalogAddition
+            ? { api: model.piApi ?? officialModel?.api ?? bundledModel?.api ?? 'openai-responses' }
+            : sourceProviderId !== 'openai' &&
+                model.piApi &&
+                (isAnnotatedAddition || isProtocolCorrection)
+              ? { api: model.piApi }
+              : capabilityCorrection
+                ? { api: capabilityCorrection.api }
+                : {}),
           name: isContextProfileAddition ? model.name : (preserved?.name ?? model.name),
           contextWindow: isContextProfileAddition
             ? model.contextWindow
@@ -615,31 +683,30 @@ export function buildPiSubscriptionNativeProviders(
             : model.maxOutput
               ? { maxTokens: model.maxOutput }
               : {}),
-          reasoning: preserved?.reasoning ?? model.efforts.length > 0,
+          reasoning:
+            capabilityCorrection?.reasoning
+            ?? officialThinking?.reasoning
+            ?? preserved?.reasoning
+            ?? model.efforts.length > 0,
           ...(preserved?.input
             ? { input: [...preserved.input] }
             : model.supportsImageInput === true
               ? { input: ['text', 'image'] as Array<'text' | 'image'> }
               : {}),
-          ...(preserved?.thinkingLevelMap
-            ? { thinkingLevelMap: { ...preserved.thinkingLevelMap } }
-            : model.efforts.length > 0
-              ? {
-                  thinkingLevelMap: Object.fromEntries(
-                    PI_REASONING_EFFORTS.map((effort) => [
-                      effort,
-                      model.efforts.includes(effort) ? effort : null,
-                    ]),
-                  ),
-                }
-              : {}),
+          ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
           ...(preserved?.cost
             ? { cost: { ...preserved.cost } }
             : catalogCost
               ? { cost: catalogCost }
               : {}),
           ...(preserved?.headers ? { headers: { ...preserved.headers } } : {}),
-          ...(preserved?.compat ? { compat: structuredClone(preserved.compat) } : {}),
+          ...(capabilityCorrection?.compat
+            ? { compat: capabilityCorrection.compat }
+            : isXaiCatalogAddition && officialThinking?.compat
+              ? { compat: officialThinking.compat }
+            : preserved?.compat
+              ? { compat: structuredClone(preserved.compat) }
+              : {}),
         };
       }),
     });
@@ -925,6 +992,65 @@ export function piNativeModelId(providerId: string, model: string): string {
   return providerId === 'xai' && model.startsWith('xai/') ? model.slice('xai/'.length) : model;
 }
 
+function reasoningCompatEnabled(compat: Record<string, unknown> | undefined): boolean {
+  return compat?.supportsReasoningEffort !== false;
+}
+
+function thinkingMapsDiffer(
+  left: PiNativeModelSpec['thinkingLevelMap'] | undefined,
+  right: PiNativeModelSpec['thinkingLevelMap'] | undefined,
+): boolean {
+  return PI_REASONING_EFFORTS.some((level) => (left?.[level] ?? null) !== (right?.[level] ?? null));
+}
+
+/**
+ * Publish a full inheritModels replacement when Pi's bundled row is behind the
+ * official xAI ladder. Overlay rows without `api` are dropped (writeModelsJson
+ * only serializes api / catalogAddition); keeping bundled.api preserves protocol
+ * while replacing thinkingLevelMap and supportsReasoningEffort.
+ *
+ * Source: https://docs.x.ai/developers/model-capabilities/text/reasoning (2026-08-16)
+ * Grok 4.6 = low | medium | high (default) | xhigh.
+ */
+function officialXaiThinkingSpec(
+  official: PiNativeModelSpec | undefined,
+): Pick<PiNativeModelSpec, 'reasoning' | 'thinkingLevelMap' | 'compat'> | null {
+  if (!official?.thinkingLevelMap) return null;
+  return {
+    reasoning: official.reasoning !== false,
+    thinkingLevelMap: Object.fromEntries(
+      PI_REASONING_EFFORTS.map((level) => [level, official.thinkingLevelMap?.[level] ?? null]),
+    ),
+    compat: {
+      ...(official.compat ?? {}),
+      supportsReasoningEffort: reasoningCompatEnabled(official.compat),
+    },
+  };
+}
+
+function xaiOfficialCapabilityCorrection(
+  bundled: PiBundledModelInfo | undefined,
+  official: PiNativeModelSpec | undefined,
+): Pick<PiNativeModelSpec, 'api' | 'reasoning' | 'thinkingLevelMap' | 'compat'> | null {
+  if (!bundled || !official?.thinkingLevelMap) return null;
+  const mapDiffers = thinkingMapsDiffer(bundled.thinkingLevelMap, official.thinkingLevelMap);
+  const compatDiffers =
+    reasoningCompatEnabled(bundled.compat) !== reasoningCompatEnabled(official.compat);
+  if (!mapDiffers && !compatDiffers) return null;
+  return {
+    api: bundled.api,
+    reasoning: official.reasoning !== false,
+    thinkingLevelMap: Object.fromEntries(
+      PI_REASONING_EFFORTS.map((level) => [level, official.thinkingLevelMap?.[level] ?? null]),
+    ),
+    compat: {
+      ...(bundled.compat ?? {}),
+      ...(official.compat ?? {}),
+      supportsReasoningEffort: reasoningCompatEnabled(official.compat),
+    },
+  };
+}
+
 function officialPiModels(providerId: string): PiNativeModelSpec[] | null {
   const models = piModelCatalog.providers[providerId];
   if (!models) return null;
@@ -1061,6 +1187,11 @@ export function buildPiNativeProvidersFromConfigs(
       onSkip?.(cfg.id, 'oauth not supported for pi native');
       continue;
     }
+    const managedOllama = matchesManagedOllamaFingerprint({
+      id: cfg.id,
+      authMethod,
+      runtimes: cfg.runtimes,
+    });
     const runtimeApi =
       rt.wireProtocol === undefined ? undefined : wireProtocolToPiApi(rt.wireProtocol);
     // Protocol authority, in order: per-model override, explicit endpoint default,
@@ -1147,7 +1278,7 @@ export function buildPiNativeProvidersFromConfigs(
             : bundledModel?.api === modelApi
               ? bundledModel.baseUrl
               : undefined;
-        return {
+        const spec = {
           id: m.id,
           ...(m.piApi || modelApi !== providerApi ? { api: modelApi } : {}),
           ...(modelBaseUrl && modelBaseUrl !== rt.baseUrl ? { baseUrl: modelBaseUrl } : {}),
@@ -1184,6 +1315,9 @@ export function buildPiNativeProvidersFromConfigs(
             ? { samplingParams: structuredClone(bundledModel.samplingParams) }
             : {}),
         };
+        return managedOllama && shouldApplyQwen38Overlay(m.id)
+          ? applyQwen38NativeOverlay(spec)
+          : spec;
       }),
     });
   }
@@ -1263,9 +1397,10 @@ export async function buildXaiPiNativeProvider(
         ),
       })),
     id: `xai/${catalogModel.id}`,
-    // Keep the xai/ prefix on the wire so the existing compat proxy selects its Responses
-    // bridge, which refreshes OAuth per request, recovers 401/403, and injects x_search.
-    api: 'anthropic-messages' as const,
+    wireId: catalogModel.id,
+    // Keep the exact API from Pi's catalog. The host forwarder authenticates and forwards both
+    // native shapes without sending the request through the Claude Messages bridge.
+    api: catalogModel.piApi ?? officialById.get(catalogModel.id)?.api ?? 'openai-responses',
   }));
   const aliases = Object.fromEntries(
     catalogModels.flatMap((candidate) => [
@@ -1281,7 +1416,12 @@ export async function buildXaiPiNativeProvider(
       }
       // Resume compatibility only: preserve the historical id and route it through the same
       // proxy without asserting unverified vision/reasoning capabilities or publishing it.
-      models.push({ id: namespacedModel, name: namespacedModel, api: 'anthropic-messages' });
+      models.push({
+        id: namespacedModel,
+        wireId: piNativeModelId('xai', namespacedModel),
+        name: namespacedModel,
+        api: 'openai-responses',
+      });
       aliases[model] = namespacedModel;
       aliases[piNativeModelId('xai', model)] = namespacedModel;
     }
@@ -1296,10 +1436,10 @@ export async function buildXaiPiNativeProvider(
               const endpoint = new URL(getClaudeEndpoint());
               endpoint.hostname = '127.0.0.1';
               endpoint.port = String(PI_XAI_COMPAT_FORWARD_PORT);
-              return endpoint.toString().replace(/\/$/, '');
+              return appendEndpointPath(endpoint.toString(), 'v1');
             })()
-          : getClaudeEndpoint(),
-        api: 'anthropic-messages',
+          : appendEndpointPath(getClaudeEndpoint(), 'v1'),
+        api: 'openai-responses',
         apiKeyEnvVar: PI_XAI_PROXY_API_KEY_ENV,
         headers: {
           'x-cindy-pi-session-id': `$${PI_SESSION_ID_ENV}`,
@@ -1343,10 +1483,21 @@ export async function resolvePiNativeProviders(ctx: {
     // before the process snapshots its global skills. Remote Pi has a different HOME/root.
     await desktopClaudeAuthAdapter.ensureSharedGlobalSkills();
   }
+  const compatProxyReady = isAnthropicCompatProxyHandleReady();
+  const selectedOfficialXai =
+    ctx.providerId === 'xai' || (ctx.providerId == null && isExclusiveXaiModelId(ctx.model));
+  if (selectedOfficialXai && !compatProxyReady) {
+    log.error('resolvePiNativeProviders: SuperGrok requires the local compat proxy', {
+      providerId: ctx.providerId ?? null,
+      model: ctx.model,
+      remoteHostId: ctx.remoteHostId ?? null,
+    });
+    throw new PiNativeProviderProxyNotReadyError();
+  }
   const piBinaryPath = resolvePiBinaryPath();
   const bundledModels = piBinaryPath ? await readPiBundledModels(piBinaryPath) : null;
   let subscriptions: PiNativeProvidersResult = { providers: [], env: {} };
-  if (!ctx?.remoteHostId && isAnthropicCompatProxyHandleReady()) {
+  if (!ctx?.remoteHostId && compatProxyReady) {
     const retainedOpenAiModel =
       ctx.resumeSessionId && ctx.providerId === 'openai'
         ? resolvePiRuntimeModelDescriptor(getActiveCatalog(), 'openai', ctx.model, {
@@ -1373,6 +1524,13 @@ export async function resolvePiNativeProviders(ctx: {
     );
   }
   const isRemote = Boolean(ctx.remoteHostId);
+  if (!isRemote && ctx.providerId === MANAGED_OLLAMA_PROVIDER_ID) {
+    await ensureManagedOllamaReadyForSession({
+      providerId: ctx.providerId,
+      remoteHostId: ctx.remoteHostId ?? null,
+      userDataDir: app.getPath('userData'),
+    });
+  }
   // 远端会话:本地 loopback 端点(本机 Ollama/vLLM)远端够不到。
   // 轮 42 P2(codex-connector):**不再 pre-filter 掉** —— 让 PiAgent 的
   // [REMOTE_LOCAL_ONLY_PROVIDER] guard 显式拒绝, 用户才能拿到带行动指引的
@@ -1401,7 +1559,11 @@ export async function resolvePiNativeProviders(ctx: {
   // Remote PI cannot use the local native overlay. Preserve upstream's exact
   // SuperGrok provenance/forwarding path there; locally the version-matched PI
   // native provider above remains the protocol authority.
+  // inheritModels xai 现在带占位 apiKey,Pi getAvailable() 才能看见 grok-4.6。
+  // 不要再塞一份 overlay xai:reserved id 会被改名成 cindy-byom-xai；
+  // 请求打到 PI native handler 会走错误的 provider 身份并返回 404。
   if (
+    compatProxyReady &&
     !subscriptions.providers.some((provider) => provider.id === 'xai') &&
     (ctx.providerId === 'xai' || hasGrokOAuthLogin())
   ) {
@@ -1415,7 +1577,16 @@ export async function resolvePiNativeProviders(ctx: {
   }
   return mergePiNativeProviderResults(
     subscriptions,
-    custom,
+    {
+      providers: custom.providers,
+      env: {
+        ...custom.env,
+        // 会话启动时即使还没登录 SuperGrok,也预埋占位 env。登录后热写 models.json
+        // 才能引用 $CINDY_PI_XAI_PROXY_API_KEY,不必为注入 env 整进程重启。
+        [PI_XAI_PROXY_API_KEY_ENV]:
+          custom.env[PI_XAI_PROXY_API_KEY_ENV] ?? PI_PROVIDER_AUTH_PLACEHOLDER_KEY,
+      },
+    },
     (sourceProviderId, runtimeProviderId) => {
       log.info('resolvePiNativeProviders: namespaced custom provider runtime id', {
         sourceProviderId,
@@ -1476,6 +1647,18 @@ export function buildPiAgent(opts: BuildPiAgentOpts): PiAgent | null {
       if (remoteHostId) return '$HOME/.xdt-server/v1/pi-agent-home';
       return path.join(app.getPath('userData'), 'pi-agent-home');
     },
+    resolvePiManagedPackageResources: resolveManagedPiPackageResources,
+    mutatePiManagedPackage: mutateAuthorizedPiManagedPackage,
+    getPiExtensionUiStrings: () => ({
+      confirm: t('settings.piPackages.extensionDialogConfirm'),
+      cancel: t('settings.piPackages.cancel'),
+      mutationFailed: t('settings.piPackages.operationFailed'),
+      mutationSuccess: {
+        install: t('settings.piPackages.success.install'),
+        update: t('settings.piPackages.success.update'),
+        remove: t('settings.piPackages.success.remove'),
+      },
+    }),
     preparePiExtraSpawnConfig: async (providers, ctx) => {
       const extra = await getPiExtraSpawnConfig(providers, opts.logger, ctx);
       if (!extra?.mcpBridge || extra.mcpBridge.servers.length === 0) return extra;

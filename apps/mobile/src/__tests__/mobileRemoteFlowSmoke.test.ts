@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { i18n } from '@/i18n';
 import { DeviceLinkError, type DeviceView } from '@cindy/device-link';
 import { createMobileMakerTransport, type RemoteInvoke } from '@/device-link/mobileMakerTransport';
 import { toDeviceListItems } from '@/device-link/devices';
@@ -47,6 +48,10 @@ import type { InputProjection, PendingInteraction, QueuedRemoteMessage, RemoteMe
 
 const DEVICE_ID = 'host-mac';
 const SESSION_ID = 'smoke-session-1';
+
+beforeAll(async () => {
+  await i18n.changeLanguage('zh-CN');
+});
 
 function device(patch: Partial<DeviceView> = {}): DeviceView {
   return {
@@ -644,12 +649,25 @@ describe('mobile remote-control headless UI flow smoke', () => {
     });
     expect(remoteSessionStore.getSessions()[0].extraDirs).toEqual(['/repo/docs']);
 
-    await expect(maker.listAgentCommands('claude-code')).resolves.toMatchObject({
+    await expect(maker.listAgentCommands('claude-code', { sessionId: SESSION_ID })).resolves.toMatchObject({
       commands: [{ name: 'compact' }],
     });
-    await expect(maker.listAgentSkills('claude-code', { workingDir: '/repo/xdt-maker' })).resolves.toMatchObject({
+    await expect(maker.listAgentSkills('claude-code', {
+      workingDir: '/repo/xdt-maker',
+      sessionId: SESSION_ID,
+    })).resolves.toMatchObject({
       skills: [{ name: 'review' }],
     });
+    expect(invoke).toHaveBeenCalledWith(
+      DEVICE_ID,
+      'maker:list-agent-commands',
+      ['claude-code', { sessionId: SESSION_ID }],
+    );
+    expect(invoke).toHaveBeenCalledWith(
+      DEVICE_ID,
+      'maker:list-agent-skills',
+      ['claude-code', { workingDir: '/repo/xdt-maker', sessionId: SESSION_ID }],
+    );
     const atResources = await maker.scanAtResources('claude-code', {
       workingDir: '/repo/xdt-maker',
       cap: 2000,

@@ -19,6 +19,7 @@ export type {
   RoutingDescriptor,
   ModelCost,
   CatalogModel,
+  ProviderMediaModel,
   Provider,
   Catalog,
   CustomProviderConfig,
@@ -130,6 +131,7 @@ export type {
 export {
   modelDisableKey,
   isModelDisabled,
+  isModelDisabledWithUniqueLegacyBasename,
   isProviderDisabled,
 } from './disableOverrides.js';
 export type { ModelDisableOverrides } from './disableOverrides.js';
