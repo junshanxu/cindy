@@ -170,6 +170,10 @@ import {
   buildPlanDenyDecision,
   needsAskMultiCard,
 } from './interactionCardModel';
+import {
+  registerMigratedInteractionSettler,
+  settleMigratedInteractionsForSessionExternal,
+} from './migratedInteractionSettleRegistry';
 
 /**
  * ask 多题/多选打勾卡的登记附加项: 原始问题 + 空勾选态。cardActionHandler 的
@@ -638,20 +642,119 @@ export function createTurnRunner(
    * resolution path (user click, timeout, text reply) and by
    * `settleMigratedInteractionsForSession` on teardown.
    */
-  const migratedInteractionsBySession = new Map<
-    string,
-    Map<
-      string,
-      {
-        surface: 'rich' | 'text';
-        kind: InteractionDecision['kind'];
-        userId: string;
-        resolve: (decision: InteractionDecision) => void;
-        /** messageId once the rich card send resolves; null before/after. */
-        messageId: string | null;
+  const migratedInteractionsBySession = new Map<string, Map<string, MigratedInteractionRecord>>();
+  /**
+   * Unregister handle for the per-session external (Desktop ABORT_SESSION)
+   * settle bridge. Registered on the first migrated ownership for a session and
+   * fired once its last migrated record settles, so the leaf registry does not
+   * retain a closure over a session that no longer has migrated interactions.
+   */
+  const migratedSettlerUnregister = new Map<string, () => void>();
+
+  /**
+   * 一条从 desktop 搬过来的迁移交互的所有权记录。
+   *
+   * `resolve` 是幂等收口:任意路径(看门狗超时、destructive guard、卡片发送失败、
+   * 用户点击、text 回复、session abort/close/stop)走到这里都只收口一次,并清理
+   * 所有权记录与看门狗定时器。`cancelled()` 报告该交互是否已被外部收口 —— 串行
+   * 发布循环里的后续 await 据此拒绝再次发卡片/注册 waiter,避免重新 orphan。
+   */
+  interface MigratedInteractionRecord {
+    surface: 'rich' | 'text';
+    kind: InteractionDecision['kind'];
+    userId: string;
+    resolve: (decision: InteractionDecision) => void;
+    cancelled: () => boolean;
+    /** messageId once the rich card send resolves; null before/after. */
+    messageId: string | null;
+    /** Absolute-deadline watchdog; cleared once the backend owns the timeout. */
+    timeoutId?: ReturnType<typeof setTimeout>;
+  }
+
+  /**
+   * 登记(或复用)一条迁移交互的会话级所有权,武装 permission 的**绝对截止看门狗**,
+   * 并在首次登记时挂上 Desktop ABORT_SESSION 的外部 settle 桥接。
+   *
+   * 幂等:同一 (sessionId, requestId) 已登记时直接返回既有记录。这样 text-only
+   * 渠道可以在串行发布循环**之前**为整条 cohort 预登记所有权 + 看门狗,轮到某条时
+   * `publishMigratedInteraction` 再调一次也只是取回同一条记录,不会重复登记。
+   *
+   * 看门狗解决的问题:text-only 渠道串行发布迁移交互,前序 ask/plan(无超时)未回答
+   * 时,后续 permission 的绝对截止时间原本要等到轮到它才武装,可能整段被前序阻塞;
+   * 预登记后,即使前序一直挂起,后续 permission 也会在自己的原始 deadline 到达时
+   * 被 deny,SDK Promise 不会无限等待。交互一旦真正交给底层 waiter/卡片(text
+   * handleTextInteraction / rich registerPendingExternal),底层自己的 timeout 接管
+   * 剩余窗口;两个定时器都收口到同一个幂等 resolve,重复触发无害。
+   */
+  function registerMigratedOwnership(
+    localSessionId: string,
+    entry: {
+      requestId: string;
+      request: InteractionRequest;
+      resolve: (decision: InteractionDecision) => void;
+      expiresAt?: number;
+    },
+    surface: 'rich' | 'text',
+    userId: string,
+  ): MigratedInteractionRecord {
+    let sessionRecords = migratedInteractionsBySession.get(localSessionId);
+    if (!sessionRecords) {
+      sessionRecords = new Map();
+      migratedInteractionsBySession.set(localSessionId, sessionRecords);
+    }
+    const existing = sessionRecords.get(entry.requestId);
+    if (existing) return existing;
+
+    const record: MigratedInteractionRecord = {
+      surface,
+      kind: entry.request.kind as InteractionDecision['kind'],
+      userId,
+      resolve: () => undefined,
+      cancelled: () => false,
+      messageId: null,
+    };
+    let settled = false;
+    const resolve = (decision: InteractionDecision): void => {
+      if (settled) return;
+      settled = true;
+      if (record.timeoutId) clearTimeout(record.timeoutId);
+      const records = migratedInteractionsBySession.get(localSessionId);
+      records?.delete(entry.requestId);
+      // 该 session 最后一条迁移记录收口后,注销外部桥接,避免无界持有闭包。
+      if (!records || records.size === 0) {
+        migratedSettlerUnregister.get(localSessionId)?.();
+        migratedSettlerUnregister.delete(localSessionId);
       }
-    >
-  >();
+      entry.resolve(decision);
+    };
+    record.resolve = resolve;
+    record.cancelled = () => settled;
+    sessionRecords.set(entry.requestId, record);
+
+    // 挂上 Desktop ABORT_SESSION → 迁移所有权 settle 桥接(每 session 一次,同步注册,
+    // 不会有 ABORT 在当前同步代码段中间插入)。
+    if (!migratedSettlerUnregister.has(localSessionId)) {
+      migratedSettlerUnregister.set(
+        localSessionId,
+        registerMigratedInteractionSettler(localSessionId, (reason) =>
+          settleMigratedInteractionsForSession(localSessionId, reason),
+        ),
+      );
+    }
+
+    // 武装 permission 的绝对截止看门狗(含队列等待时间)。
+    if (entry.request.kind === 'permission' && entry.expiresAt !== undefined) {
+      const delay = entry.expiresAt - Date.now();
+      if (delay <= 0) {
+        resolve({ kind: 'permission', behavior: 'deny', reason: 'interaction_timeout' });
+      } else {
+        record.timeoutId = setTimeout(() => {
+          resolve({ kind: 'permission', behavior: 'deny', reason: 'interaction_timeout' });
+        }, delay);
+      }
+    }
+    return record;
+  }
   /** In-flight `ensureSessionWired` promises (keyed by sessionId). Prevents the
    *  classic race where two concurrent first-time runAgentTurn calls both miss
    *  the cache, both spawn a maker session, and the second clobbers the first
@@ -1764,8 +1867,27 @@ export function createTurnRunner(
         // Desktop permission queue's ordering after takeover instead of
         // publishing the whole migrated cohort concurrently and replacing or
         // rejecting every waiter after the first one.
+        //
+        // Pre-register ownership + absolute-deadline watchdog for the ENTIRE
+        // cohort BEFORE the serial await loop. A text channel publishes
+        // migrated interactions one at a time, so without this a permission
+        // queued behind an unanswered ask/plan (which has no timeout) would not
+        // arm its deadline until it reached the front, and the SDK Promise
+        // could hang for the whole serial wait past the permission's original
+        // deadline. Pre-registering arms every permission's watchdog up front
+        // and also makes the whole cohort settleable by Desktop ABORT_SESSION
+        // (via the external settle bridge) while they are still queued.
+        for (const entry of taken) {
+          registerMigratedOwnership(row.id, entry, 'text', userId);
+        }
         void (async () => {
           for (const entry of taken) {
+            // Skip entries the pre-registered watchdog/ABORT already settled
+            // while a predecessor was still in flight (their record is gone
+            // from the ownership map).
+            if (!migratedInteractionsBySession.get(row.id)?.has(entry.requestId)) {
+              continue;
+            }
             await publishMigratedInteraction(entry, userId, row.id, target.scopeKey);
           }
         })().catch((err) => {
@@ -1822,52 +1944,32 @@ export function createTurnRunner(
       `publishMigrated kind=${req.kind} requestId=...${req.requestId.slice(-8)} session=...${localSessionId.slice(-8)}`,
     );
 
-    // Idempotent settle: every exit path (timeout, destructive guard, send
-    // failure, user click via registerPendingExternal, and session cleanup)
-    // routes through here so the desktop SDK Promise is resolved exactly once
-    // and the session-indexed ownership record is reclaimed. The record lives
-    // in the outer `migratedInteractionsBySession` map (not on SessionState) so
-    // it survives a `/exctr` detach and remains settleable by a later
-    // abort/close/stop on the same session.
-    let settled = false;
-    const settle = (decision: InteractionDecision): void => {
-      if (settled) return;
-      settled = true;
-      migratedInteractionsBySession.get(localSessionId)?.delete(req.requestId);
-      entry.resolve(decision);
-    };
     const safeCleanupDecision = (): InteractionDecision => {
       if (req.kind === 'ask_user_question') return buildAskNoAnswerDecision();
       if (req.kind === 'plan_review') return buildPlanDenyDecision('session_cleanup');
       return buildPermissionDenyDecision('session_cleanup');
     };
-    // Register ownership up front so a cleanup/stop/detach that races the
-    // awaits below still finds and settles this interaction instead of leaking
-    // it. `settled` doubles as the per-publish cancellation flag: once an
-    // external settle (cleanup, !stop) has fired mid-flight, every subsequent
-    // await must refuse to publish/register so it cannot re-orphan the card.
-    let sessionRecords = migratedInteractionsBySession.get(localSessionId);
-    if (!sessionRecords) {
-      sessionRecords = new Map();
-      migratedInteractionsBySession.set(localSessionId, sessionRecords);
-    }
-    sessionRecords.set(req.requestId, {
-      surface: richIm ? 'rich' : 'text',
-      kind: req.kind as InteractionDecision['kind'],
+    // Reuse the ownership pre-registered by the text cohort loop (or register
+    // it now for the rich-card path, which publishes concurrently). The
+    // returned record carries an idempotent `resolve` and, for migrated
+    // permissions, an absolute-deadline watchdog armed from `entry.expiresAt`
+    // — so a permission queued behind an unanswered ask/plan on a text channel
+    // is still denied at its original deadline instead of hanging for the whole
+    // serial wait. `cancelled()` is the per-publish flag: once an external
+    // settle (watchdog / cleanup / !stop / ABORT_SESSION) has fired mid-flight,
+    // every subsequent await refuses to publish/register so it cannot re-orphan
+    // the card. The watchdog stays armed as a backstop even after the
+    // interaction is handed to the text waiter / rich card — both timers route
+    // through the same idempotent resolve, so a double fire is harmless.
+    const owned = registerMigratedOwnership(
+      localSessionId,
+      entry,
+      richIm ? 'rich' : 'text',
       userId,
-      resolve: settle,
-      messageId: null,
-    });
-    const cancelled = (): boolean => settled;
-
-    if (
-      req.kind === 'permission' &&
-      entry.expiresAt !== undefined &&
-      entry.expiresAt <= Date.now()
-    ) {
-      settle({ kind: 'permission', behavior: 'deny', reason: 'interaction_timeout' });
-      return;
-    }
+    );
+    const settle = owned.resolve;
+    const cancelled = owned.cancelled;
+    if (cancelled()) return;
 
     // Takeover is another channel confirmation surface, not a way around the
     // channel hard-deny policy. Keep destructive commands out of every
@@ -1978,8 +2080,7 @@ export function createTurnRunner(
           : {}),
       });
       messageId = result.messageId;
-      const tracked = sessionRecords.get(req.requestId);
-      if (tracked) tracked.messageId = messageId;
+      owned.messageId = messageId;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.error(`publishMigrated sendInteractiveCard failed: ${msg}`);

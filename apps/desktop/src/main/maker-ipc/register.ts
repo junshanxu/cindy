@@ -100,6 +100,7 @@ import {
   type GhostGrantConfirmInteractionSnapshot,
 } from '../cindy-brain/ghostGrantConfirmBridge.js';
 import { createFeishuDesktopConfirmNotifier } from '../im/desktopConfirmNoticeWiring.js';
+import { settleMigratedInteractionsForSessionExternal } from '../im/shared/migratedInteractionSettleRegistry.js';
 import {
   initGhostSetupInteractionBridge,
   parseGhostSetupInteractionCommand,
@@ -13998,6 +13999,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         // so its boolean result is not consumed twice. Interaction waiters are
         // still always released even when the vendor abort rejects.
         cleanupPendingInteractionsForSession(sessionId, 'session_aborted');
+        // Settle interactions migrated to an IM channel on takeover for the
+        // same reason as the ABORT_SESSION IPC handler above.
+        settleMigratedInteractionsForSessionExternal(sessionId, 'session_aborted');
       }
     },
     isTurnRunning: (sessionId) => {
@@ -15785,6 +15789,14 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         reconcileDirectAbortBoundary(sessionId, directAbortBoundary, 'direct-abort');
       } finally {
         cleanupPendingInteractionsForSession(sessionId, 'session_aborted');
+        // Also settle interactions that were migrated from this Desktop session
+        // to an IM channel on takeover. Their resolvers were handed to the
+        // channel and are no longer in `pendingInteractionResolvers`, so the
+        // Desktop cleanup above cannot reach them; without this the migrated
+        // channel card stays live (and its SDK Promise hangs) until its own
+        // timeout after the user pressed Stop. The channel turnRunner owns the
+        // actual settlement via the leaf registry (no reverse import cycle).
+        settleMigratedInteractionsForSessionExternal(sessionId, 'session_aborted');
       }
     }
     const settledGoalPause = await goalPauseResult;
