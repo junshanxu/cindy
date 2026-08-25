@@ -378,7 +378,11 @@ export class DingTalkIM extends BaseIM implements ChannelIM {
     };
     this.pendingReplies.set(userId, pending as PendingReply);
     try {
-      await this.sendText(userId, prompt);
+      const [, value] = await Promise.all([
+        this.sendText(userId, prompt),
+        reply,
+      ]);
+      return value;
     } catch (error) {
       if (this.pendingReplies.get(userId) === pending) {
         this.pendingReplies.delete(userId);
@@ -386,7 +390,6 @@ export class DingTalkIM extends BaseIM implements ChannelIM {
       clearTimeout(pending.timer);
       throw error;
     }
-    return reply;
   }
 
   /**

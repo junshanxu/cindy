@@ -473,6 +473,41 @@ describe("DingTalkIM", () => {
     await expect(reply).rejects.toThrow("DINGTALK_INTERACTION_CANCELLED");
   });
 
+  it("observes cancellation while the interaction prompt is still sending", async () => {
+    const { host } = makeHost();
+    const client = new FakeClient();
+    const im = new DingTalkIM(host, {
+      clientFactory: () => client,
+      fetcher: validCredentialFetcher(),
+    });
+    await im.init();
+
+    let finishSend!: () => void;
+    vi.spyOn(im, "sendText").mockImplementation(
+      () =>
+        new Promise<{ messageId: string }>((resolve) => {
+          finishSend = () => resolve({ messageId: "prompt-sent" });
+        }),
+    );
+
+    const reply = im.requestTextReply(
+      "owner-1",
+      "输入 y",
+      (text) => (text === "y" ? "accepted" : null),
+      1_000,
+      "request-cancel-during-send",
+    );
+
+    expect(
+      im.cancelTextReply("owner-1", "request-cancel-during-send", {
+        kind: "permission",
+      }),
+    ).toBe(true);
+    await expect(reply).rejects.toThrow("DINGTALK_INTERACTION_CANCELLED");
+
+    finishSend();
+  });
+
   it("does not expose the app secret through public state", async () => {
     const { host } = makeHost();
     const client = new FakeClient();

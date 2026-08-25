@@ -723,6 +723,7 @@ export function createTurnRunner(
       records?.delete(entry.requestId);
       // 该 session 最后一条迁移记录收口后,注销外部桥接,避免无界持有闭包。
       if (!records || records.size === 0) {
+        migratedInteractionsBySession.delete(localSessionId);
         migratedSettlerUnregister.get(localSessionId)?.();
         migratedSettlerUnregister.delete(localSessionId);
       }
