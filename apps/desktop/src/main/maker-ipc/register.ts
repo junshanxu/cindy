@@ -10909,23 +10909,25 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         }
       }
       // Lead 可能在 renderer 缓存检查通过后、派单前被另一窗口归档。仅靠前端状态
-      // 不够:在串行 claim 内复核 lead 持久化状态仍 active,避免 Worker 在已归档
-      // 任务下开始执行(#3262 P2)。
+      // 不够:复核 + sendToWorker 必须在 Lead 的 route lock 内原子完成,与归档
+      // 串行,否则检查通过后归档仍可在派发前提交(#3262 P2)。
       return orcaUiAssignmentDispatchClaims.runOnce(
         { leadSessionId, workerSessionId, snapshotBeforeMs },
         async () => {
-          await assertSessionActiveForManualDispatch(leadSessionId);
-          const result = await orcaTeamService.sendToWorker({
-            callerLeadSessionId: leadSessionId,
-            targetSessionId: workerSessionId,
-            message: buildUiAssignmentInitialTask({
-              leadSessionId,
-              initialTask: initialTask.trim(),
-              snapshotBeforeMs,
-            }),
+          return withSendToSessionLock(leadSessionId, async () => {
+            await assertSessionActiveForManualDispatch(leadSessionId);
+            const result = await orcaTeamService.sendToWorker({
+              callerLeadSessionId: leadSessionId,
+              targetSessionId: workerSessionId,
+              message: buildUiAssignmentInitialTask({
+                leadSessionId,
+                initialTask: initialTask.trim(),
+                snapshotBeforeMs,
+              }),
+            });
+            if (!result.ok) throwOrcaServiceFailure(result);
+            return result;
           });
-          if (!result.ok) throwOrcaServiceFailure(result);
-          return result;
         },
       );
     },
@@ -15094,7 +15096,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       return inputCoordinator.compact(
         sid,
         typedCreateOpts,
-        opts && typeof opts === 'object' ? (opts as { userName?: string }) : undefined,
+        // 透传 userName + requireActiveSession(后者在 dispatchCompact 最终 send
+        // 边界二次复核,覆盖 compact 入队后才归档的竞态,#3262 P2)。
+        compactOpts as { userName?: string; requireActiveSession?: boolean } | undefined,
       );
     },
   );
@@ -15770,10 +15774,16 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       assertResolveInteractionOrigin(decision, isPendingDesktopOnlyConfirmation(requestId));
       // 归档竞态:会话在权限/AskUser/Plan Review 等待期间被另一窗口归档、脏文件
       // 预检又取消了自动关窗时,pending 交互可能残留。批准/回答会放行已归档任务的
-      // 挂起 turn。解析前按 requestId 找到所属会话,在锁内复核仍 active(#3262 P2)。
+      // 挂起 turn。按 requestId 找到所属会话,把"复核 active"与"resolve 副作用"
+      // 放进同一把 session route lock,与归档串行——否则检查通过后归档仍可在
+      // resolver 执行前提交(#3262 P2)。
       const pendingEntry = pendingInteractionResolvers.get(requestId);
+      let accepted = false;
       if (pendingEntry?.sessionId) {
-        await assertSessionActiveForManualDispatch(pendingEntry.sessionId);
+        await withSendToSessionLock(pendingEntry.sessionId, async () => {
+          await assertSessionActiveForManualDispatch(pendingEntry.sessionId);
+          accepted = resolvePendingInteraction(requestId, decision as InteractionDecision);
+        });
       }
       let pluginSetupResponseTarget: GhostSetupInteractionResponseTarget | undefined;
       if (isPluginSetupInteractionDecision(decision) && !isDeviceLinkInvoke()) {
@@ -15784,7 +15794,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           pluginSetupResponseTarget = event.sender;
         }
       }
-      if (resolvePendingInteraction(requestId, decision as InteractionDecision)) {
+      if (accepted) {
         return { accepted: true };
       }
       if (isPermissionInteractionDecision(decision)) {

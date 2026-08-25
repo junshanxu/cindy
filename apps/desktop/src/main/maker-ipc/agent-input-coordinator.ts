@@ -578,6 +578,9 @@ interface PendingCompactRequest {
   createOpts: AgentInputCreateOpts;
   userName?: string;
   waitForClientIds: string[];
+  // 副窗口归档后不得压缩:入队时由调用方置位,dispatchCompact 在最终
+  // sendToAgent 前复核会话仍 active,与归档串行(#3262 P2)。
+  requireActiveSession?: boolean;
 }
 
 type ActiveTurnDispatchLifecycle =
@@ -1766,7 +1769,7 @@ export class AgentInputCoordinator {
   async compact(
     sessionId: string,
     createOpts: AgentInputCreateOpts,
-    opts?: { userName?: string },
+    opts?: { userName?: string; requireActiveSession?: boolean },
   ): Promise<AgentInputProjection> {
     const state = this.getState(sessionId);
     // 手动 /compact 是用户接管，与 composer 新消息同语义。先撤掉尚未跨过
@@ -1792,6 +1795,7 @@ export class AgentInputCoordinator {
       createOpts,
       userName: opts?.userName,
       waitForClientIds: state.pendingQueue.map((item) => item.clientId),
+      requireActiveSession: opts?.requireActiveSession === true,
     };
 
     if (
@@ -1843,6 +1847,21 @@ export class AgentInputCoordinator {
     this.emit(sessionId);
 
     try {
+      // 入队到派发之间会话可能被归档(request.requireActiveSession 仅副窗口置位)。
+      // 在最终 send 边界复核持久化 active 状态;非 active 则放弃压缩,不启动
+      // 新 turn(#3262 P2,与普通队列项的 requireActiveSession fence 对齐)。
+      if (
+        request.requireActiveSession &&
+        this.deps.isSessionActiveForManualDispatch &&
+        !(await this.deps.isSessionActiveForManualDispatch(sessionId))
+      ) {
+        if (!this.isActiveTurnCurrent(sessionId, active)) return this.getProjection(sessionId);
+        state.activeTurn = null;
+        this.emit(sessionId);
+        log.info('compact skipped: session no longer active', { sessionId, reason });
+        this.deps.onQueueEmptied?.(sessionId);
+        return this.getProjection(sessionId);
+      }
       active.sendStarted = true;
       active.dispatchLifecycle = 'sending';
       const result = await this.deps.sendToAgent(
