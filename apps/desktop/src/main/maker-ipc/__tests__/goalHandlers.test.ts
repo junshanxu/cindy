@@ -368,3 +368,111 @@ describe('goal remote lifecycle fence', () => {
     expect(mocks.updateGoal).not.toHaveBeenCalled();
   });
 });
+
+// Reviewer P2 (PRRT_kwDOTgdRUs6b0AHd):本地副窗口 GoalIndicator 的 resume/update/clear
+// 走真实 event.sender,此前因既非 device-link、renderer 也不带 requireActiveSession 标记而
+// 绕过 active-session 门禁。这里钉住"按真实 sender 识别本地副窗口 → 一律 fence"。
+describe('goal local secondary-window lifecycle fence', () => {
+  type SessionLock = <T>(sessionId: string, task: () => Promise<T>) => Promise<T>;
+  const isDeviceLinkInvoke = vi.fn(() => false);
+  const withSessionLock = vi.fn<SessionLock>(
+    async (_sessionId, task) => task(),
+  );
+  const assertSessionActive = vi.fn(async (_sessionId: string) => undefined);
+  const isSecondaryWindowEvent = vi.fn((event: unknown) => event === SECONDARY_EVENT);
+
+  // 主窗口事件(sender 不是副窗口);副窗口事件(sender 命中 secondaryWindows)。
+  const MAIN_EVENT = { sender: { id: 1 } };
+  const SECONDARY_EVENT = { sender: { id: 2 } };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.handlers.clear();
+    mocks.controllerAvailable = true;
+    isDeviceLinkInvoke.mockReturnValue(false);
+    isSecondaryWindowEvent.mockImplementation((event: unknown) => event === SECONDARY_EVENT);
+    registerGoalHandlers({
+      isDeviceLinkInvoke,
+      withSessionLock: withSessionLock as unknown as GoalHandlerLifecycleDeps['withSessionLock'],
+      assertSessionActive,
+      isSecondaryWindowEvent,
+    });
+  });
+
+  it('fences a local secondary-window GOAL_RESUME even with a bare sessionId (no marker)', async () => {
+    const resumeHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_RESUME)!;
+    await resumeHandler(SECONDARY_EVENT, 's1');
+
+    expect(isSecondaryWindowEvent).toHaveBeenCalledWith(SECONDARY_EVENT);
+    expect(withSessionLock).toHaveBeenCalledWith('s1', expect.any(Function));
+    expect(assertSessionActive).toHaveBeenCalledWith('s1');
+    expect(mocks.resumeGoal).toHaveBeenCalledWith('s1');
+  });
+
+  it('fences a local secondary-window GOAL_UPDATE without requireActiveSession', async () => {
+    mocks.updateGoal.mockResolvedValueOnce({ sessionId: 's1' });
+    const updateHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_UPDATE)!;
+    await updateHandler(SECONDARY_EVENT, {
+      sessionId: 's1',
+      patch: { objective: 'edited in secondary window' },
+    });
+
+    expect(withSessionLock).toHaveBeenCalledWith('s1', expect.any(Function));
+    expect(assertSessionActive).toHaveBeenCalledWith('s1');
+    expect(mocks.updateGoal).toHaveBeenCalledWith('s1', {
+      objective: 'edited in secondary window',
+    });
+  });
+
+  it('fences a local secondary-window GOAL_CLEAR even with a bare sessionId', async () => {
+    const clearHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_CLEAR)!;
+    await clearHandler(SECONDARY_EVENT, 's1');
+
+    expect(withSessionLock).toHaveBeenCalledWith('s1', expect.any(Function));
+    expect(assertSessionActive).toHaveBeenCalledWith('s1');
+    expect(mocks.clearGoal).toHaveBeenCalledWith('s1');
+  });
+
+  it('fences a local secondary-window GOAL_SET and marks the route lock held', async () => {
+    const setHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_SET)!;
+    await setHandler(SECONDARY_EVENT, { sessionId: 's1', objective: '目标' });
+
+    expect(withSessionLock).toHaveBeenCalledWith('s1', expect.any(Function));
+    expect(assertSessionActive).toHaveBeenCalledWith('s1');
+    expect(mocks.setGoal).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 's1', objective: '目标', sessionRouteLockHeld: true }),
+    );
+  });
+
+  it('blocks a secondary-window GOAL_RESUME for an archived session', async () => {
+    assertSessionActive.mockRejectedValueOnce(new Error('session is archived'));
+    const resumeHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_RESUME)!;
+
+    await expect(resumeHandler(SECONDARY_EVENT, 's1')).rejects.toThrow('session is archived');
+    expect(withSessionLock).toHaveBeenCalledWith('s1', expect.any(Function));
+    expect(mocks.resumeGoal).not.toHaveBeenCalled();
+  });
+
+  it('does not fence a primary local main-window GOAL_RESUME (historical resume semantics)', async () => {
+    const resumeHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_RESUME)!;
+    await resumeHandler(MAIN_EVENT, 's1');
+
+    expect(isSecondaryWindowEvent).toHaveBeenCalledWith(MAIN_EVENT);
+    expect(withSessionLock).not.toHaveBeenCalled();
+    expect(assertSessionActive).not.toHaveBeenCalled();
+    expect(mocks.resumeGoal).toHaveBeenCalledWith('s1');
+  });
+
+  it('does not fence a primary local main-window GOAL_UPDATE', async () => {
+    mocks.updateGoal.mockResolvedValueOnce({ sessionId: 's1' });
+    const updateHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_UPDATE)!;
+    await updateHandler(MAIN_EVENT, {
+      sessionId: 's1',
+      patch: { objective: 'edited in main window' },
+    });
+
+    expect(withSessionLock).not.toHaveBeenCalled();
+    expect(assertSessionActive).not.toHaveBeenCalled();
+    expect(mocks.updateGoal).toHaveBeenCalledWith('s1', { objective: 'edited in main window' });
+  });
+});

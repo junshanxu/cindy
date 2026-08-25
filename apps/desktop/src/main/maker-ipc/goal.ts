@@ -12,7 +12,7 @@
  *     controller.setGoal);GOAL_SET IPC 是给 renderer 主动设目标的备用入口。
  */
 
-import { ipcMain, BrowserWindow } from 'electron';
+import { ipcMain, BrowserWindow, type IpcMainInvokeEvent } from 'electron';
 
 import { createLogger } from '../logger.js';
 import { throwIpcError, requireString, requireObject } from '../utils/ipcValidate.js';
@@ -33,6 +33,13 @@ export interface GoalHandlerLifecycleDeps {
   isDeviceLinkInvoke(): boolean;
   withSessionLock<T>(sessionId: string, task: () => Promise<T>): Promise<T>;
   assertSessionActive(sessionId: string): Promise<void>;
+  /**
+   * 根据真实 event.sender 判定调用是否来自本地副窗口(secondary app window)。
+   * 本地副窗口承载的也是完整会话(含 GoalIndicator),其 resume/update/clear 与远程
+   * 副窗口一样必须走 active-session fence,不能信任 renderer 自报的窗口身份。
+   * device-link 合成 event 的 sender 为空,由 requireActiveSession 标记驱动,二者互补。
+   */
+  isSecondaryWindowEvent?(event: IpcMainInvokeEvent): boolean;
 }
 
 const NOOP_GOAL_LIFECYCLE_DEPS: GoalHandlerLifecycleDeps = {
@@ -102,23 +109,31 @@ export function broadcastGoalStatus(update: GoalStatusUpdate): void {
 export function registerGoalHandlers(
   lifecycle: GoalHandlerLifecycleDeps = NOOP_GOAL_LIFECYCLE_DEPS,
 ): void {
-  // 仅当调用方(原始 renderer,经隧道 args 透传)显式请求 active-session fence 时
-  // 才加 route lock + 持久化复核。device-link 合成 event 的 sender 为空,不能用窗口
-  // 归属判定 secondary;primary remote task(主窗口)不带此标记,保持历史恢复语义。
+  // 加 route lock + 持久化 active 复核的两条触发路径(对齐 register.ts 手工派发口径):
+  //   1. device-link 合成 event 的 sender 为空,无法用窗口归属判定,由原始 renderer 经隧道
+  //      args 透传的 requireActiveSession 显式驱动;
+  //   2. 本地副窗口(GoalIndicator 所在的 secondary app window)由真实 event.sender 反查,
+  //      无需 renderer 自报标记,一律 fence——reviewer P2:此前本地副窗 resume/update 绕过门禁。
+  // primary remote task(主窗口)不带标记且 sender 为主窗,保持"向已归档任务发命令可恢复
+  // 任务"的历史语义。返回是否实际加了 fence,供 GOAL_SET 决定是否传 sessionRouteLockHeld。
   const runWithLifecycleGuard = <T>(
     sessionId: string,
-    task: () => Promise<T>,
+    event: IpcMainInvokeEvent,
+    task: (fenced: boolean) => Promise<T>,
     requireActiveSession?: boolean,
   ): Promise<T> => {
-    if (!lifecycle.isDeviceLinkInvoke() || !requireActiveSession) return task();
+    const isSecondaryWindow = lifecycle.isSecondaryWindowEvent?.(event) ?? false;
+    const mustFence =
+      (lifecycle.isDeviceLinkInvoke() && requireActiveSession === true) || isSecondaryWindow;
+    if (!mustFence) return task(false);
     return lifecycle.withSessionLock(sessionId, async () => {
       await lifecycle.assertSessionActive(sessionId);
-      return task();
+      return task(true);
     });
   };
 
   // 设目标(renderer 备用入口;命令路径走 commands/builtins.ts)。新建/编辑都直接生效并续跑。
-  ipcMain.handle(MAKER_INVOKE.GOAL_SET, async (_e, input: unknown) => {
+  ipcMain.handle(MAKER_INVOKE.GOAL_SET, async (e, input: unknown) => {
     const obj = requireObject(input, 'goal');
     const sessionId = requireString(obj.sessionId, 'sessionId');
     const objective = requireString(obj.objective, 'objective');
@@ -138,14 +153,14 @@ export function registerGoalHandlers(
     try {
       await runWithLifecycleGuard(
         sessionId,
-        () =>
+        e,
+        (fenced) =>
           controller.setGoal({
             sessionId,
             objective,
             ...(limits ? { limits } : {}),
-            ...(lifecycle.isDeviceLinkInvoke() && obj.requireActiveSession === true
-              ? { sessionRouteLockHeld: true }
-              : {}),
+            // 走了 route lock fence 时告诉 controller 锁已持有,避免重复获取 pending-agent-switch 锁。
+            ...(fenced ? { sessionRouteLockHeld: true } : {}),
           }),
         obj.requireActiveSession === true,
       );
@@ -162,7 +177,7 @@ export function registerGoalHandlers(
   // primary remote 不带标记,保留"向已归档任务发命令可恢复任务"的历史语义。
   ipcMain.handle(
     MAKER_INVOKE.GOAL_CLEAR,
-    async (_e, sessionId: unknown, fenceOpts?: unknown) => {
+    async (e, sessionId: unknown, fenceOpts?: unknown) => {
       const id = requireString(sessionId, 'sessionId');
       const requireActiveSession =
         fenceOpts !== null &&
@@ -170,6 +185,7 @@ export function registerGoalHandlers(
         (fenceOpts as { requireActiveSession?: boolean }).requireActiveSession === true;
       await runWithLifecycleGuard(
         id,
+        e,
         () => getGoalController()?.clearGoal(id) ?? Promise.resolve(),
         requireActiveSession,
       );
@@ -221,7 +237,7 @@ export function registerGoalHandlers(
   // primary remote 不带标记,保留"向已归档任务发命令可恢复任务"的历史语义。
   ipcMain.handle(
     MAKER_INVOKE.GOAL_RESUME,
-    async (_e, sessionId: unknown, fenceOpts?: unknown) => {
+    async (e, sessionId: unknown, fenceOpts?: unknown) => {
       const id = requireString(sessionId, 'sessionId');
       const requireActiveSession =
         fenceOpts !== null &&
@@ -230,6 +246,7 @@ export function registerGoalHandlers(
       try {
         await runWithLifecycleGuard(
           id,
+          e,
           () => getGoalController()?.resumeGoal(id) ?? Promise.resolve(),
           requireActiveSession,
         );
@@ -240,7 +257,7 @@ export function registerGoalHandlers(
     },
   );
 
-  ipcMain.handle(MAKER_INVOKE.GOAL_UPDATE, async (_e, input: unknown) => {
+  ipcMain.handle(MAKER_INVOKE.GOAL_UPDATE, async (e, input: unknown) => {
     const obj = requireObject(input, 'goal');
     const sessionId = requireString(obj.sessionId, 'sessionId');
     const rawPatch = requireObject(obj.patch, 'patch');
@@ -254,11 +271,13 @@ export function registerGoalHandlers(
     const controller = getGoalController();
     if (!controller) throwIpcError('INTERNAL', 'goal controller not started');
     try {
-      // 与 GOAL_SET 同口径:仅 device-link 调用且原始 renderer 显式带
-      // requireActiveSession 时才加 route lock + 持久化 active 复核;主窗口 / primary
-      // remote 不带标记,保留"编辑已归档任务目标可重新激活任务"的历史语义。
+      // 与 GOAL_SET 同口径:device-link 显式带 requireActiveSession,或真实 sender 是本地
+      // 副窗口(reviewer P2:本地副窗 GoalIndicator resume/update 此前绕过门禁)时,加 route
+      // lock + 持久化 active 复核;主窗口 / primary remote 不带标记且非副窗,保留"编辑已归档
+      // 任务目标可重新激活任务"的历史语义。
       const updated = await runWithLifecycleGuard(
         sessionId,
+        e,
         () => controller.updateGoal(sessionId, patch),
         obj.requireActiveSession === true,
       );

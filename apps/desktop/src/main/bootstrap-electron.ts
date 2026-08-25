@@ -5839,6 +5839,10 @@ const registerIpcHandlers = () => {
         isDeviceLinkInvoke,
         withSessionLock: withSendToSessionLock,
         assertSessionActive: assertSessionActiveForManualDispatch,
+        // 本地副窗口(GoalIndicator 所在的 secondary app window)按真实 sender 反查,
+        // 与 device-link 透传的 requireActiveSession 标记互补,统一走 active-session fence。
+        isSecondaryWindowEvent: (event) =>
+          isSecondaryAppWindow(BrowserWindow.fromWebContents(event.sender)),
       });
       // clear-context 清目标 / turn 收尾 idle 兜底续跑(setter 注入,null-safe)。
       setGoalClearObserver((sid) => {
