@@ -10908,9 +10908,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           );
         }
       }
+      // Lead 可能在 renderer 缓存检查通过后、派单前被另一窗口归档。仅靠前端状态
+      // 不够:在串行 claim 内复核 lead 持久化状态仍 active,避免 Worker 在已归档
+      // 任务下开始执行(#3262 P2)。
       return orcaUiAssignmentDispatchClaims.runOnce(
         { leadSessionId, workerSessionId, snapshotBeforeMs },
         async () => {
+          await assertSessionActiveForManualDispatch(leadSessionId);
           const result = await orcaTeamService.sendToWorker({
             callerLeadSessionId: leadSessionId,
             targetSessionId: workerSessionId,
@@ -15058,9 +15062,24 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
 
   ipcMain.handle(
     MAKER_INVOKE.INPUT_COMPACT,
-    async (_e, sessionId: unknown, createOpts: unknown, opts?: unknown) => {
+    async (event, sessionId: unknown, createOpts: unknown, opts?: unknown) => {
       const sid = requireSessionId(sessionId);
       const remote = isDeviceLinkInvoke();
+      // 副窗口归档后不得压缩(压缩会启动新 turn,绕过 active-session fence,
+      // #3262 P2)。device-link 显式传 requireActiveSession;本机副窗口按真实
+      // sender 判定。主窗口保持历史语义。
+      const compactOpts =
+        opts && typeof opts === 'object' && !Array.isArray(opts)
+          ? (opts as Record<string, unknown>)
+          : undefined;
+      const requireActiveSession =
+        compactOpts?.requireActiveSession === true ||
+        (!remote &&
+          event?.sender &&
+          isSecondaryAppWindow(BrowserWindow.fromWebContents(event.sender)));
+      if (requireActiveSession) {
+        await assertSessionActiveForManualDispatch(sid);
+      }
       await assertRemoteInputControlBoundary(sid, remote, opts);
       if (!remote) await observeLocalInputClearBoundary(sid);
       await inputCoordinator.ensureQueueRestored(sid).catch(() => undefined);
@@ -15737,7 +15756,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
 
   ipcMain.handle(
     MAKER_INVOKE.RESOLVE_INTERACTION,
-    (event, requestId: unknown, decision: unknown) => {
+    async (event, requestId: unknown, decision: unknown) => {
       if (typeof requestId !== 'string') throwIpcError('INVALID_PARAMS', 'requestId required');
       if (
         isPluginSetupInteractionDecision(decision) &&
@@ -15749,6 +15768,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       // resolvable. Host-owned setup side effects and Desktop-only confirmations
       // may only originate from the trusted local Desktop.
       assertResolveInteractionOrigin(decision, isPendingDesktopOnlyConfirmation(requestId));
+      // 归档竞态:会话在权限/AskUser/Plan Review 等待期间被另一窗口归档、脏文件
+      // 预检又取消了自动关窗时,pending 交互可能残留。批准/回答会放行已归档任务的
+      // 挂起 turn。解析前按 requestId 找到所属会话,在锁内复核仍 active(#3262 P2)。
+      const pendingEntry = pendingInteractionResolvers.get(requestId);
+      if (pendingEntry?.sessionId) {
+        await assertSessionActiveForManualDispatch(pendingEntry.sessionId);
+      }
       let pluginSetupResponseTarget: GhostSetupInteractionResponseTarget | undefined;
       if (isPluginSetupInteractionDecision(decision) && !isDeviceLinkInvoke()) {
         assertTrustedAppRendererEvent(event);
@@ -17358,7 +17384,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
 
   ipcMain.handle(
     MAKER_INVOKE.COMPACT_SESSION,
-    async (event, sessionId: unknown, instructions: unknown) => {
+    async (event, sessionId: unknown, instructions: unknown, fenceOpts?: unknown) => {
       // 会启动 Agent turn、产生模型费用:非 device-link 的本机调用必须来自受信顶层页面,
       // 不能让辅助窗口 / WebView / 子 frame 经隐藏入口触发(codex review)。device-link
       // 走独立鉴权通道,按既有 dual 模式放行。
@@ -17370,6 +17396,19 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       }
       if (instructions !== undefined && typeof instructions !== 'string') {
         throwIpcError('INVALID_PARAMS', 'instructions must be a string when provided');
+      }
+      // 副窗口(device-link 显式 requireActiveSession,或本地副窗口由 sender 判定)
+      // 已归档/非 active 时不得压缩——压缩会启动新 turn,绕过 active-session fence
+      // (#3262 P2)。本机主窗口保持历史语义(允许对任意存在的会话压缩)。
+      const requireActiveSession =
+        (fenceOpts !== null &&
+          typeof fenceOpts === 'object' &&
+          (fenceOpts as { requireActiveSession?: boolean }).requireActiveSession === true) ||
+        (!isDeviceLinkInvoke() &&
+          event?.sender &&
+          isSecondaryAppWindow(BrowserWindow.fromWebContents(event.sender)));
+      if (requireActiveSession) {
+        await assertSessionActiveForManualDispatch(sessionId);
       }
       const sess = maker.getSession(sessionId);
       if (!sess) {

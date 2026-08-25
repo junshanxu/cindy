@@ -96,6 +96,7 @@ import type {
 } from '../../shared/ghost';
 import * as messageService from '@/lib/messageService';
 import * as sessionService from '@/lib/sessionService';
+import { isSecondaryWindow } from '@/lib/secondaryWindow';
 // device-link 透明传输:远程(被控设备)会话的操作/读取走隧道,本地会话零变化。
 import {
   makerApiFor,
@@ -12974,11 +12975,15 @@ function compactSession(
   // 不进计划模式、不消耗用户的一次性勾选(false 语义见 SendOptions.planMode)。
   createOpts.planMode = false;
   const boundaryOpts = getRemoteInputClearBoundaryOpts(sessionId);
+  // 副窗口归档后不得压缩(压缩会启动新 turn,绕过 active-session fence,#3262 P2)。
+  // main 侧 INPUT_COMPACT handler 读取此标记并在持锁内复核会话仍 active。
+  const fenceOpts = isSecondaryWindow() ? { requireActiveSession: true } : {};
   return (
     runAgentDispatchProjectionOperation(sessionId, (input) =>
       input.compact(sessionId, createOpts, {
         userName: currentUserName,
         ...(boundaryOpts ?? {}),
+        ...fenceOpts,
       }),
     )
       // RPC 已执行成功时保留既有返回语义；origin 漂移只丢控制端镜像回写。

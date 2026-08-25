@@ -177,7 +177,17 @@ function remoteMakerApi(deviceId: string): RoutableMaker {
       invokeRemote(
         deviceId,
         'maker:compact-session',
-        instructions === undefined ? [sessionId] : [sessionId, instructions],
+        // 副窗口显式透传 requireActiveSession:压缩会启动新 turn,不能在已归档
+        // 任务上执行(#3262 P2)。instructions 后追加 fenceOpts 作为第四参。
+        isSecondaryWindow()
+          ? [
+              sessionId,
+              ...(instructions === undefined ? [] : [instructions]),
+              { requireActiveSession: true },
+            ]
+          : instructions === undefined
+            ? [sessionId]
+            : [sessionId, instructions],
       )) as FullMaker['compactSession'],
     enableOrca: t('maker:session:enable-orca') as FullMaker['enableOrca'],
     dispatchOrcaUiAssignment: t(
