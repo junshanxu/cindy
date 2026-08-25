@@ -653,7 +653,11 @@ export function goalApiFor(sessionId: string): RoutableGoal {
     clearGoal: ((sid: string) => {
       const deviceId = resolve();
       if (!deviceId) return localApi.clearGoal(sid);
-      return invokeRemote(deviceId, 'maker:goal:clear', [sid, remoteFenceOpts()]);
+      return invokeRemote(
+        deviceId,
+        'maker:goal:clear',
+        isSecondaryWindow() ? [sid, { requireActiveSession: true }] : [sid],
+      );
     }) as FullMaker['clearGoal'],
     pauseGoal: ((sid: string) => {
       const deviceId = resolve();
@@ -664,7 +668,11 @@ export function goalApiFor(sessionId: string): RoutableGoal {
     resumeGoal: ((sid: string) => {
       const deviceId = resolve();
       if (!deviceId) return localApi.resumeGoal(sid);
-      return invokeRemote(deviceId, 'maker:goal:resume', [sid, remoteFenceOpts()]);
+      return invokeRemote(
+        deviceId,
+        'maker:goal:resume',
+        isSecondaryWindow() ? [sid, { requireActiveSession: true }] : [sid],
+      );
     }) as FullMaker['resumeGoal'],
     updateGoal: ((sid: string, patch: unknown) => {
       const deviceId = resolve();
