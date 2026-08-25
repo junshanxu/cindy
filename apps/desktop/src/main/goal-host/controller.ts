@@ -748,7 +748,11 @@ export class GoalController {
     return (await this.deps.storage.get(sessionId)) ?? createdState;
   }
 
-  async updateGoal(sessionId: string, patch: GoalUpdatePatch): Promise<GoalState | null> {
+  async updateGoal(
+    sessionId: string,
+    patch: GoalUpdatePatch,
+    opts?: { sessionRouteLockHeld?: boolean },
+  ): Promise<GoalState | null> {
     if (this.disposed || this.disposing) return null;
     const normalized = normalizeGoalUpdatePatch(patch);
     const existingBoundary = this.turns.get(sessionId);
@@ -962,7 +966,11 @@ export class GoalController {
         objectiveChanged &&
         (changed.status === 'paused' || changed.status === 'blocked' || changed.status === 'usageLimited')
       ) {
-        await this.resumeGoal(sessionId);
+        // fence 已持有 route 锁时透传,避免 resumeGoal→fireTurn 二次加锁自死锁(#3262)。
+        await this.resumeGoal(
+          sessionId,
+          opts?.sessionRouteLockHeld ? { sessionRouteLockHeld: true } : undefined,
+        );
         return reconcileLifecycleChange();
       }
       this.emit(next);

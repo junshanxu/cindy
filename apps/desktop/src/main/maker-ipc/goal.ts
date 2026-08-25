@@ -336,7 +336,14 @@ export function registerGoalHandlers(
       const updated = await runWithLifecycleGuard(
         sessionId,
         e,
-        () => controller.updateGoal(sessionId, patch),
+        // fence 持锁时透传 sessionRouteLockHeld:updateGoal 改 paused/blocked
+        // 目标的 objective 会内部调 resumeGoal→fireTurn,需跳过二次加锁(#3262)。
+        (fenced) =>
+          controller.updateGoal(
+            sessionId,
+            patch,
+            ...(fenced ? [{ sessionRouteLockHeld: true }] : []),
+          ),
         obj.requireActiveSession === true,
       );
       if (!updated) throwIpcError('GOAL_NOT_FOUND', 'goal not found');

@@ -326,7 +326,7 @@ describe('goal remote lifecycle fence', () => {
 
     expect(withSessionLock).toHaveBeenCalledWith('rs', expect.any(Function));
     expect(assertSessionActive).toHaveBeenCalledWith('rs');
-    expect(mocks.updateGoal).toHaveBeenCalledWith('rs', { objective: 'updated objective' });
+    expect(mocks.updateGoal).toHaveBeenCalledWith('rs', { objective: 'updated objective' }, { sessionRouteLockHeld: true });
   });
 
   it('does not fence a primary remote GOAL_UPDATE without requireActiveSession', async () => {
@@ -465,7 +465,7 @@ describe('goal local secondary-window lifecycle fence', () => {
     expect(assertSessionActive).toHaveBeenCalledWith('s1');
     expect(mocks.updateGoal).toHaveBeenCalledWith('s1', {
       objective: 'edited in secondary window',
-    });
+    }, { sessionRouteLockHeld: true });
   });
 
   it('fences a local secondary-window GOAL_CLEAR even with a bare sessionId', async () => {

@@ -5841,8 +5841,14 @@ const registerIpcHandlers = () => {
         assertSessionActive: assertSessionActiveForManualDispatch,
         // 本地副窗口(GoalIndicator 所在的 secondary app window)按真实 sender 反查,
         // 与 device-link 透传的 requireActiveSession 标记互补,统一走 active-session fence。
-        isSecondaryWindowEvent: (event) =>
-          isSecondaryAppWindow(BrowserWindow.fromWebContents(event.sender)),
+        // device-link 合成事件的 sender 为 undefined(见 device-link/invoke-registry),
+        // 不能交给 fromWebContents;这类请求只靠显式 requireActiveSession 标记驱动,
+        // 窗口归属探测直接返回 false(#3262 review P1)。
+        isSecondaryWindowEvent: (event) => {
+          if (!event?.sender) return false;
+          const win = BrowserWindow.fromWebContents(event.sender);
+          return win ? isSecondaryAppWindow(win) : false;
+        },
       });
       // clear-context 清目标 / turn 收尾 idle 兜底续跑(setter 注入,null-safe)。
       setGoalClearObserver((sid) => {
