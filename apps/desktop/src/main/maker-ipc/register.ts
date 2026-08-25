@@ -17417,23 +17417,31 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         (!isDeviceLinkInvoke() &&
           event?.sender &&
           isSecondaryAppWindow(BrowserWindow.fromWebContents(event.sender)));
+      // 复核 active 与执行 compact 必须在同一把 route lock 内,否则检查通过后、
+      // compactSession 启动 turn 前归档仍可提交(#3262 P1)。主窗口(无 fence)
+      // 保持历史语义,直接执行。
+      const runCompact = async (): Promise<unknown> => {
+        const sess = maker.getSession(sessionId);
+        if (!sess) {
+          log.debug('compact-session: session not found, no-op', { sessionId });
+          return null;
+        }
+        if (!sess.capabilities.manualCompact?.supported) {
+          log.debug('compact-session: agent does not support manual compact, no-op', {
+            sessionId,
+            agentKind: sess.agentKind,
+          });
+          return null;
+        }
+        return sess.compactSession(instructions);
+      };
       if (requireActiveSession) {
-        await assertSessionActiveForManualDispatch(sessionId);
-      }
-      const sess = maker.getSession(sessionId);
-      if (!sess) {
-        log.debug('compact-session: session not found, no-op', { sessionId });
-        return null;
-      }
-      if (!sess.capabilities.manualCompact?.supported) {
-        // 调用方应先按 capabilities 隐藏入口,这里兜底 no-op。
-        log.debug('compact-session: agent does not support manual compact, no-op', {
-          sessionId,
-          agentKind: sess.agentKind,
+        return withSendToSessionLock(sessionId, async () => {
+          await assertSessionActiveForManualDispatch(sessionId);
+          return runCompact();
         });
-        return null;
       }
-      return sess.compactSession(instructions);
+      return runCompact();
     },
   );
 

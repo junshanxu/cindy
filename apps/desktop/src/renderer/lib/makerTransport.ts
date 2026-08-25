@@ -173,22 +173,19 @@ function remoteMakerApi(deviceId: string): RoutableMaker {
     setExtraDirs: t('maker:set-extra-dirs') as FullMaker['setExtraDirs'],
     setWritableDirs: t('maker:set-writable-dirs') as FullMaker['setWritableDirs'],
     closeSession: t('maker:close-session') as FullMaker['closeSession'],
-    compactSession: ((sessionId, instructions) =>
-      invokeRemote(
-        deviceId,
-        'maker:compact-session',
-        // 副窗口显式透传 requireActiveSession:压缩会启动新 turn,不能在已归档
-        // 任务上执行(#3262 P2)。instructions 后追加 fenceOpts 作为第四参。
-        isSecondaryWindow()
-          ? [
-              sessionId,
-              ...(instructions === undefined ? [] : [instructions]),
-              { requireActiveSession: true },
-            ]
-          : instructions === undefined
-            ? [sessionId]
-            : [sessionId, instructions],
-      )) as FullMaker['compactSession'],
+    compactSession: ((sessionId, instructions) => {
+      // 副窗口显式透传 requireActiveSession:压缩会启动新 turn,不能在已归档
+      // 任务上执行(#3262)。handler 签名是 (event, sessionId, instructions,
+      // fenceOpts),所以副窗口时必须保留 instructions 槽位(即使 undefined),
+      // 再追加 fenceOpts 作为第四参——否则 fence 对象会被当成 instructions
+      // 触发 INVALID_PARAMS(P1)。
+      const args: unknown[] = isSecondaryWindow()
+        ? [sessionId, instructions, { requireActiveSession: true }]
+        : instructions === undefined
+          ? [sessionId]
+          : [sessionId, instructions];
+      return invokeRemote(deviceId, 'maker:compact-session', args);
+    }) as FullMaker['compactSession'],
     enableOrca: t('maker:session:enable-orca') as FullMaker['enableOrca'],
     dispatchOrcaUiAssignment: t(
       'maker:worker:dispatch-ui-assignment',

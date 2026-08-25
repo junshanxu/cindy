@@ -1876,6 +1876,10 @@ export class AgentInputCoordinator {
           expectedInputGeneration: active.generation,
           onVendorTurnReserved: (generation) =>
             this.captureReservedVendorGeneration(sessionId, active, generation),
+          // 把 fence 传到最终 send 边界,让 sendToAgent 在持有的
+          // session route lock 内做最后一次 active 复核(与上面的 precheck
+          // 形成闭环,消除 precheck 与 send 之间的归档竞态,#3262 P1)。
+          ...(request.requireActiveSession ? { requireActiveSession: true } : {}),
         },
       );
       if (!this.isActiveTurnCurrent(sessionId, active)) return this.getProjection(sessionId);
