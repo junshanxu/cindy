@@ -352,6 +352,46 @@ describe('goal remote lifecycle fence', () => {
     expect(mocks.resumeGoal).not.toHaveBeenCalled();
   });
 
+  it('fences the side-effecting resumeOnOpen inside GET_STATUS when requireActiveSession is set', async () => {
+    mocks.getStatus.mockResolvedValue({ sessionId: 'rs', status: 'active' });
+    const getStatusHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_GET_STATUS)!;
+    await getStatusHandler({}, 'rs', { requireActiveSession: true });
+
+    expect(withSessionLock).toHaveBeenCalledWith('rs', expect.any(Function));
+    expect(assertSessionActive).toHaveBeenCalledWith('rs');
+    expect(mocks.resumeOnOpen).toHaveBeenCalledWith('rs', { waitForDispatch: false });
+  });
+
+  it('does not fence GET_STATUS resumeOnOpen for a primary remote without the marker', async () => {
+    mocks.getStatus
+      .mockResolvedValueOnce({ sessionId: 'rs', status: 'active' })
+      .mockResolvedValueOnce({ sessionId: 'rs', status: 'active' });
+    const getStatusHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_GET_STATUS)!;
+    await getStatusHandler({}, 'rs');
+
+    expect(withSessionLock).not.toHaveBeenCalled();
+    expect(assertSessionActive).not.toHaveBeenCalled();
+    expect(mocks.resumeOnOpen).toHaveBeenCalledWith('rs', { waitForDispatch: false });
+  });
+
+  it('skips resumeOnOpen for GET_STATUS when the fence reports the session archived', async () => {
+    mocks.getStatus.mockResolvedValue({ sessionId: 'rs', status: 'active' });
+    // 真实 assertSessionActiveForManualDispatch 用 throwIpcError 抛 PRECONDITION_FAILED +
+    // SESSION_NOT_ACTIVE 标记;GET_STATUS 据此降级为不 resumeOnOpen、返回恢复前快照。
+    const archived = new Error('SESSION_NOT_ACTIVE: Session rs is no longer active') as Error & {
+      code: string;
+    };
+    archived.code = 'PRECONDITION_FAILED';
+    assertSessionActive.mockRejectedValueOnce(archived);
+    const getStatusHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_GET_STATUS)!;
+    const result = await getStatusHandler({}, 'rs', { requireActiveSession: true });
+
+    expect(withSessionLock).toHaveBeenCalledWith('rs', expect.any(Function));
+    expect(mocks.resumeOnOpen).not.toHaveBeenCalled();
+    // 降级返回恢复前的 active 快照,不把读取变成报错。
+    expect(result).toEqual({ sessionId: 'rs', status: 'active' });
+  });
+
   it('blocks GOAL_UPDATE for an archived session when the active-session assertion rejects', async () => {
     assertSessionActive.mockRejectedValueOnce(new Error('session is archived'));
     mocks.updateGoal.mockResolvedValueOnce({ sessionId: 'rs' });
@@ -474,5 +514,30 @@ describe('goal local secondary-window lifecycle fence', () => {
     expect(withSessionLock).not.toHaveBeenCalled();
     expect(assertSessionActive).not.toHaveBeenCalled();
     expect(mocks.updateGoal).toHaveBeenCalledWith('s1', { objective: 'edited in main window' });
+  });
+
+  it('fences the resumeOnOpen inside a local secondary-window GET_STATUS (no marker needed)', async () => {
+    mocks.getStatus.mockResolvedValue({ sessionId: 's1', status: 'active' });
+    const getStatusHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_GET_STATUS)!;
+    // 裸 sessionId,无 requireActiveSession —— 本地副窗口靠真实 sender 自动 fence。
+    await getStatusHandler(SECONDARY_EVENT, 's1');
+
+    expect(isSecondaryWindowEvent).toHaveBeenCalledWith(SECONDARY_EVENT);
+    expect(withSessionLock).toHaveBeenCalledWith('s1', expect.any(Function));
+    expect(assertSessionActive).toHaveBeenCalledWith('s1');
+    expect(mocks.resumeOnOpen).toHaveBeenCalledWith('s1', { waitForDispatch: false });
+  });
+
+  it('does not fence a primary local main-window GET_STATUS resumeOnOpen', async () => {
+    mocks.getStatus
+      .mockResolvedValueOnce({ sessionId: 's1', status: 'active' })
+      .mockResolvedValueOnce({ sessionId: 's1', status: 'active' });
+    const getStatusHandler = mocks.handlers.get(MAKER_INVOKE.GOAL_GET_STATUS)!;
+    await getStatusHandler(MAIN_EVENT, 's1');
+
+    expect(isSecondaryWindowEvent).toHaveBeenCalledWith(MAIN_EVENT);
+    expect(withSessionLock).not.toHaveBeenCalled();
+    expect(assertSessionActive).not.toHaveBeenCalled();
+    expect(mocks.resumeOnOpen).toHaveBeenCalledWith('s1', { waitForDispatch: false });
   });
 });

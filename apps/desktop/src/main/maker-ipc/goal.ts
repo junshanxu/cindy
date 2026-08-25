@@ -50,6 +50,23 @@ const NOOP_GOAL_LIFECYCLE_DEPS: GoalHandlerLifecycleDeps = {
 
 type GoalLimitPatchKey = 'maxTurns' | 'budgetTokens' | 'noProgressLimit';
 
+/**
+ * 识别 lifecycle fence 里 `assertSessionActive` 对已归档/非 active 会话抛出的
+ * PRECONDITION_FAILED(消息以 `SESSION_NOT_ACTIVE:` 开头,见 register.ts)。
+ * GOAL_GET_STATUS 对副窗口遇到这种情况降级为"返回恢复前快照、不 resumeOnOpen",
+ * 而不是把读取变成报错;其它 PRECONDITION_FAILED(目标控制器真实失败)仍向上抛。
+ */
+function isSessionNotActiveError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: unknown }).code === 'PRECONDITION_FAILED' &&
+    error instanceof Error &&
+    error.message.includes('SESSION_NOT_ACTIVE')
+  );
+}
+
 function throwGoalControllerIpcError(error: unknown): never {
   if (error instanceof GoalControllerInputError) {
     throwIpcError('INVALID_PARAMS', error.message);
@@ -194,33 +211,59 @@ export function registerGoalHandlers(
   );
 
   // 取当前状态(useGoalStatus hook 挂载时拉一次 = 用户打开该会话)。无 goal 返回 null。
-  ipcMain.handle(MAKER_INVOKE.GOAL_GET_STATUS, async (_e, sessionId: unknown) => {
-    const id = requireString(sessionId, 'sessionId');
-    const controller = getGoalController();
-    if (!controller) throwIpcError('INTERNAL', 'goal controller not started');
-    let status = await readGoalStatusForIpc(controller, id);
-    // Dormant recovery may synchronously converge an apparently active Goal to
-    // blocked. Wait for storage/session recovery and re-read so this invoke
-    // response cannot overwrite the newer status push with a stale active
-    // snapshot. Actual turn dispatch stays detached: PI prompt acceptance may
-    // legitimately wait through long compaction and must not hold a read query.
-    if (status?.status === 'active') {
-      try {
-        await controller.resumeOnOpen(id, { waitForDispatch: false });
-      } catch (error) {
-        if (
-          error instanceof GoalControllerInputError ||
-          error instanceof GoalSessionRestoreError ||
-          error instanceof GoalUpdateSupersededError
-        ) {
-          throwGoalControllerIpcError(error);
+  // 第一参保持裸 sessionId 字符串的 wire 形态(append-only 协议兼容;旧被控端 / 本机
+  // hook 发裸字符串,多余尾参被忽略);副窗口经隧道时在第二参带 { requireActiveSession:
+  // true },此时 resumeOnOpen(有副作用:会重建 Agent session 并可能续跑 dormant goal)
+  // 与 GOAL_RESUME/CLEAR 同口径走 route lock + 持久化 active 复核——reviewer P2:副窗口
+  // 归档后这个"读取"入口此前能把已归档任务重新拉起。本地副窗口由真实 event.sender 自动
+  // fence,无需 renderer 标记;primary remote / 主窗口不带标记,保留 resume-on-open 的
+  // 历史语义(打开主窗口会话本就允许 dormant 恢复)。
+  ipcMain.handle(
+    MAKER_INVOKE.GOAL_GET_STATUS,
+    async (e, sessionId: unknown, fenceOpts?: unknown) => {
+      const id = requireString(sessionId, 'sessionId');
+      const requireActiveSession =
+        fenceOpts !== null &&
+        typeof fenceOpts === 'object' &&
+        (fenceOpts as { requireActiveSession?: boolean }).requireActiveSession === true;
+      const controller = getGoalController();
+      if (!controller) throwIpcError('INTERNAL', 'goal controller not started');
+      let status = await readGoalStatusForIpc(controller, id);
+      // Dormant recovery may synchronously converge an apparently active Goal to
+      // blocked. Wait for storage/session recovery and re-read so this invoke
+      // response cannot overwrite the newer status push with a stale active
+      // snapshot. Actual turn dispatch stays detached: PI prompt acceptance may
+      // legitimately wait through long compaction and must not hold a read query.
+      //
+      // resumeOnOpen 有副作用(重建 Agent session / 续跑 dormant goal),必须在
+      // lifecycle fence 内执行:副窗口 + 已归档任务时 assertSessionActive 失败,
+      // 这里降级为直接返回当前 status(归档任务无 active goal → 通常 null),既不
+      // 重新激活任务,也不把"读取"变成对 renderer 的报错。
+      if (status?.status === 'active') {
+        try {
+          await runWithLifecycleGuard(
+            id,
+            e,
+            () => controller.resumeOnOpen(id, { waitForDispatch: false }),
+            requireActiveSession,
+          );
+        } catch (error) {
+          // 副窗口 fence 判定会话已归档:放弃 resumeOnOpen,返回恢复前快照即可。
+          if (isSessionNotActiveError(error)) return status;
+          if (
+            error instanceof GoalControllerInputError ||
+            error instanceof GoalSessionRestoreError ||
+            error instanceof GoalUpdateSupersededError
+          ) {
+            throwGoalControllerIpcError(error);
+          }
+          throwIpcError('INTERNAL', 'failed to restore goal status');
         }
-        throwIpcError('INTERNAL', 'failed to restore goal status');
+        status = await readGoalStatusForIpc(controller, id);
       }
-      status = await readGoalStatusForIpc(controller, id);
-    }
-    return status;
-  });
+      return status;
+    },
+  );
 
   // 暂停 active 目标(GoalIndicator ⏸ 按钮)。非 active 是 no-op,不报错。
   ipcMain.handle(MAKER_INVOKE.GOAL_PAUSE, async (_e, sessionId: unknown) => {

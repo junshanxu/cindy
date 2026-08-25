@@ -28,6 +28,7 @@ import {
   sessionCacheInvalidationToken,
 } from '@/features/device-link/mirrorCacheClient';
 import { getStickySessionDeviceId } from '@/features/device-link/stickySessionOrigin';
+import { isSecondaryWindow } from '@/lib/secondaryWindow';
 import type { Message, Session } from '@/lib/ccAgent.types';
 import * as messageService from '@/lib/messageService';
 import * as sessionService from '@/lib/sessionService';
@@ -651,7 +652,16 @@ export function goalApiFor(sessionId: string): RoutableGoal {
         return localApi.updateGoal(sid, patch as Parameters<FullMaker['updateGoal']>[1]);
       return invokeRemote(deviceId, 'maker:goal:update', [{ sessionId: sid, patch }]);
     }) as FullMaker['updateGoal'],
-    getGoalStatus: t('maker:goal:get-status', localApi.getGoalStatus) as FullMaker['getGoalStatus'],
+    getGoalStatus: ((sid: string) => {
+      const deviceId = resolve();
+      if (!deviceId) return localApi.getGoalStatus(sid);
+      // 远程会话:本机会话 main 按真实 event.sender 自动 fence 副窗口,无需标记;
+      // 远程副窗口的合成 event 无 sender,这里显式透传 requireActiveSession,让被控端
+      // 把有副作用的 resumeOnOpen 纳入 active-session 复核(归档后不重新拉起任务)。
+      // 主窗口打开远程会话保持 resume-on-open 历史语义,不带标记。
+      const args: unknown[] = isSecondaryWindow() ? [sid, { requireActiveSession: true }] : [sid];
+      return invokeRemote(deviceId, 'maker:goal:get-status', args);
+    }) as FullMaker['getGoalStatus'],
   };
 }
 
