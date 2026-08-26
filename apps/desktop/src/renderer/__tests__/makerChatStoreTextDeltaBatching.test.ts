@@ -2178,6 +2178,33 @@ describe('makerChatStore text delta batching', () => {
     expect(window.electronAPI.maker.closeSession).not.toHaveBeenCalled();
   });
 
+  it('waits for a fenced clear guard instead of clearing after timeout', async () => {
+    let settleClear!: (error: Error) => void;
+    input.clearSession.mockReturnValueOnce(
+      new Promise<AgentInputProjection>((_resolve, reject) => {
+        settleClear = reject;
+      }),
+    );
+
+    emitTextDelta('preserve until the guard settles');
+    vi.advanceTimersByTime(32);
+    const clear = makerChatStore.clearSession(SESSION_ID, { requireActiveSession: true });
+    await flushPromises();
+
+    vi.advanceTimersByTime(500);
+    await flushPromises();
+    expect(makerChatStore.getSnapshot(SESSION_ID).messages).toEqual([
+      expect.objectContaining({ content: 'preserve until the guard settles' }),
+    ]);
+    expect(sessionService.update).not.toHaveBeenCalled();
+
+    settleClear(new Error('SESSION_NOT_ACTIVE: session is archived'));
+    await clear;
+    expect(makerChatStore.getSnapshot(SESSION_ID).messages).toEqual([
+      expect.objectContaining({ content: 'preserve until the guard settles' }),
+    ]);
+  });
+
   it('continues clearing local state when the clear guard hangs', async () => {
     input.clearSession.mockReturnValueOnce(new Promise<AgentInputProjection>(() => {}));
 

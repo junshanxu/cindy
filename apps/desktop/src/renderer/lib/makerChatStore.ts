@@ -13987,19 +13987,26 @@ async function clearSessionAfterGuardImpl(
     opts
       ? clearOperation.api.input.clearSession(sessionId, clearedAt, opts)
       : clearOperation.api.input.clearSession(sessionId, clearedAt);
+  const clearResult = clearSessionRequest.then(
+    (projection) => ({ kind: 'projection' as const, projection }),
+    (err) => ({ kind: 'error' as const, err }),
+  );
   try {
-    guardResult = await Promise.race([
-      clearSessionRequest.then(
-        (projection) => ({ kind: 'projection' as const, projection }),
-        (err) => ({ kind: 'error' as const, err }),
-      ),
-      new Promise<{ kind: 'timeout' }>((resolve) => {
-        guardTimeoutId = setTimeout(
-          () => resolve({ kind: 'timeout' }),
-          CLEAR_SESSION_GUARD_TIMEOUT_MS,
-        );
-      }),
-    ]);
+    // A fenced clear must wait for the main-side lifecycle decision. Falling
+    // back to a local clear after the timeout would let a later
+    // SESSION_NOT_ACTIVE rejection arrive after the renderer has already
+    // destroyed the archived transcript.
+    guardResult = fencedClear
+      ? await clearResult
+      : await Promise.race([
+          clearResult,
+          new Promise<{ kind: 'timeout' }>((resolve) => {
+            guardTimeoutId = setTimeout(
+              () => resolve({ kind: 'timeout' }),
+              CLEAR_SESSION_GUARD_TIMEOUT_MS,
+            );
+          }),
+        ]);
   } catch (err) {
     guardResult = { kind: 'error', err };
   } finally {
