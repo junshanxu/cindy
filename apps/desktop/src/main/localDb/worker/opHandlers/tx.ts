@@ -1476,7 +1476,7 @@ function embeddingRecordFailures(db: Database.Database, args: unknown): { failCo
   );
   const updSnooze = db.prepare(
     `UPDATE embedding_jobs
-        SET last_error = ?, scheduled_at = ?
+        SET attempts = 0, last_error = ?, scheduled_at = ?
       WHERE rowid = ?`,
   );
   const updFail = db.prepare(

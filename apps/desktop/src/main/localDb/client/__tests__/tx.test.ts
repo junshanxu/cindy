@@ -2002,9 +2002,9 @@ describe('db worker tx handlers', () => {
 
   it('embedding.recordFailures snoozes terminal (INVALID_MODEL) failures instead of permanent fail', async () => {
     await withClient(async (client) => {
-      const rowid = await insertJob(client, { sourceId: 'invalid-model', attempts: 0 });
+      const rowid = await insertJob(client, { sourceId: 'invalid-model', attempts: 4 });
       const result = await client.tx('embedding.recordFailures', {
-        jobs: [{ rowid, attempts: 0 }],
+        jobs: [{ rowid, attempts: 4 }],
         errMsg: '[INVALID_MODEL] unsupported model',
         now: 10_000,
         terminal: true,

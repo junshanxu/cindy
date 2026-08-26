@@ -1530,7 +1530,7 @@ function embeddingRecordFailures(readyDb, args) {
   const terminal = payload.terminal === true;
   const snoozeUntil = typeof payload.snoozeUntil === 'number' ? payload.snoozeUntil : now + TERMINAL_SNOOZE_MS;
   const updReschedule = readyDb.prepare('UPDATE embedding_jobs SET attempts = ?, last_error = ?, scheduled_at = ? WHERE rowid = ?');
-  const updSnooze = readyDb.prepare('UPDATE embedding_jobs SET last_error = ?, scheduled_at = ? WHERE rowid = ?');
+  const updSnooze = readyDb.prepare('UPDATE embedding_jobs SET attempts = 0, last_error = ?, scheduled_at = ? WHERE rowid = ?');
   const updFail = readyDb.prepare("UPDATE embedding_jobs SET attempts = ?, last_error = ?, status = 'failed' WHERE rowid = ?");
   const failCount = readyDb.transaction(() => {
     let count = 0;

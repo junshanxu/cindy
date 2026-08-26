@@ -1198,6 +1198,15 @@ describe('EmbeddingClient · mapStatusToCode (INVALID_MODEL 熔断信号)', () =
     ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
   });
 
+  it('"The model schema validation failed: property dimensions does not exist" 不跨段误判 → BAD_REQUEST (PR #2288 Codex P1)', async () => {
+    const fetchImpl = errorResponse(400, {
+      error: { message: 'The model schema validation failed: property dimensions does not exist' },
+    });
+    await expect(
+      clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+
   it('"model: input is unsupported" 冒号分支参数错误不误判 → BAD_REQUEST (PR #2288 Codex P1 L833)', async () => {
     const fetchImpl = errorResponse(400, {
       error: { message: 'model: input is unsupported for this endpoint' },
@@ -1210,6 +1219,15 @@ describe('EmbeddingClient · mapStatusToCode (INVALID_MODEL 熔断信号)', () =
   it('"model: parameter dimensions is unsupported" 冒号分支参数错误不误判 → BAD_REQUEST (PR #2288 Codex P1 L833)', async () => {
     const fetchImpl = errorResponse(400, {
       error: { message: 'model: parameter dimensions is unsupported' },
+    });
+    await expect(
+      clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+
+  it('"model: glm-5; parameter dimensions is unsupported" 不吞入后续参数 → BAD_REQUEST (PR #2288 Codex P1)', async () => {
+    const fetchImpl = errorResponse(400, {
+      error: { message: 'model: glm-5; parameter dimensions is unsupported' },
     });
     await expect(
       clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
@@ -1250,6 +1268,33 @@ describe('EmbeddingClient · mapStatusToCode (INVALID_MODEL 熔断信号)', () =
     await expect(
       clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
     ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+
+  it('"invalid model: input must be an array" 冒号后的参数错误不误判 → BAD_REQUEST (PR #2288 Codex P2)', async () => {
+    const fetchImpl = errorResponse(400, {
+      error: { message: 'invalid model: input must be an array' },
+    });
+    await expect(
+      clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+
+  it('"invalid_model: parameter dimensions is unsupported" 冒号后的参数错误不误判 → BAD_REQUEST (PR #2288 Codex P2)', async () => {
+    const fetchImpl = errorResponse(400, {
+      error: { message: 'invalid_model: parameter dimensions is unsupported' },
+    });
+    await expect(
+      clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+
+  it('"invalid model: voyage/voyage-4" 仍识别为 INVALID_MODEL (PR #2288 Codex P2 正向回归)', async () => {
+    const fetchImpl = errorResponse(400, {
+      error: { message: 'invalid model: voyage/voyage-4' },
+    });
+    await expect(
+      clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
+    ).rejects.toMatchObject({ code: 'INVALID_MODEL' });
   });
 
   it('"model: input field not found" 参数错误不误判 → BAD_REQUEST (PR #2288 Codex P1 L818)', async () => {
