@@ -1514,8 +1514,13 @@ export class GoalController {
     if (!this.isBusy(sessionId)) {
       const dispatch = this.fireTurn(sessionId, {
         throwOnUnpersistedRestoreFailure: true,
+        ...(opts?.sessionRouteLockHeld ? { sessionRouteLockHeld: true } : {}),
       });
-      if (opts?.waitForDispatch === false) {
+      // A caller-held route lock protects the entire lifecycle boundary. Do
+      // not detach the dispatch while that lock is still owned by the caller,
+      // otherwise the lock can be released before Session.send reaches the
+      // accepted side effect.
+      if (opts?.waitForDispatch === false && !opts?.sessionRouteLockHeld) {
         void dispatch.catch((error) => {
           this.deps.logger.warn('[goal] detached resume-on-open fire failed', {
             sessionId,

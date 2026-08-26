@@ -2114,6 +2114,25 @@ describe('makerChatStore text delta batching', () => {
     });
   });
 
+  it('does not clear local state when a fenced clear is rejected for an archived session', async () => {
+    input.clearSession.mockRejectedValueOnce(
+      new Error('SESSION_NOT_ACTIVE: session is archived'),
+    );
+
+    emitTextDelta('preserve me');
+    vi.advanceTimersByTime(32);
+    expect(makerChatStore.getSnapshot(SESSION_ID).messages).toHaveLength(1);
+
+    await makerChatStore.clearSession(SESSION_ID, { requireActiveSession: true });
+
+    expect(input.clearSession).toHaveBeenCalledWith(SESSION_ID, expect.any(String), {
+      requireActiveSession: true,
+    });
+    expect(makerChatStore.getSnapshot(SESSION_ID).messages).toHaveLength(1);
+    expect(window.electronAPI.maker.closeSession).not.toHaveBeenCalled();
+    expect(sessionService.update).not.toHaveBeenCalled();
+  });
+
   it('continues clearing local state when the clear guard hangs', async () => {
     input.clearSession.mockReturnValueOnce(new Promise<AgentInputProjection>(() => {}));
 

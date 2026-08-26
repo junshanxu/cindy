@@ -2466,6 +2466,19 @@ function isPendingDesktopOnlyConfirmation(requestId: string): boolean {
   );
 }
 
+function findPendingInteractionSessionId(requestId: string): string | undefined {
+  const agentEntry = pendingInteractionResolvers.get(requestId);
+  if (agentEntry) return agentEntry.sessionId;
+  const bridgeEntries = [
+    ...issueConfirmBridge.pendingSnapshots(),
+    ...renameSessionsConfirmBridge.pendingSnapshots(),
+    ...orcaWorkerPermissionConfirmBridge.pendingSnapshots(),
+    ...ghostGrantConfirmBridge.pendingSnapshots(),
+    ...ghostSetupInteractionBridge.pendingSnapshots(),
+  ];
+  return bridgeEntries.find(({ request }) => request.requestId === requestId)?.sessionId;
+}
+
 function dismissRendererInteraction(
   entry: PendingInteractionEntry,
   requestId: string,
@@ -7369,7 +7382,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   });
 
   const isSecondarySessionWindowEvent = (event: IpcMainInvokeEvent): boolean =>
-    isSecondaryAppWindow(BrowserWindow.fromWebContents(event.sender));
+    Boolean(event?.sender) && isSecondaryAppWindow(BrowserWindow.fromWebContents(event.sender));
 
   // 会话移动转录迁移:活跃会话桥(查内存 sdkSessionId + 关闭 handle)。
   // rewind fork 后 SDK 换新 id,消息落库前 DB 仍是旧值,迁移必须能看到内存里的最新 id;
@@ -15777,14 +15790,6 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       // 挂起 turn。按 requestId 找到所属会话,把"复核 active"与"resolve 副作用"
       // 放进同一把 session route lock,与归档串行——否则检查通过后归档仍可在
       // resolver 执行前提交(#3262 P2)。
-      const pendingEntry = pendingInteractionResolvers.get(requestId);
-      let accepted = false;
-      if (pendingEntry?.sessionId) {
-        await withSendToSessionLock(pendingEntry.sessionId, async () => {
-          await assertSessionActiveForManualDispatch(pendingEntry.sessionId);
-          accepted = resolvePendingInteraction(requestId, decision as InteractionDecision);
-        });
-      }
       let pluginSetupResponseTarget: GhostSetupInteractionResponseTarget | undefined;
       if (isPluginSetupInteractionDecision(decision) && !isDeviceLinkInvoke()) {
         assertTrustedAppRendererEvent(event);
@@ -15794,8 +15799,39 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           pluginSetupResponseTarget = event.sender;
         }
       }
+      const pendingSessionId = findPendingInteractionSessionId(requestId);
+      let accepted = false;
+      let resolutionAttemptedUnderLock = false;
+      if (pendingSessionId) {
+        await withSendToSessionLock(pendingSessionId, async () => {
+          await assertSessionActiveForManualDispatch(pendingSessionId);
+          resolutionAttemptedUnderLock = true;
+          accepted =
+            resolvePendingInteraction(requestId, decision as InteractionDecision) ||
+            issueConfirmBridge.resolve(requestId, decision) ||
+            renameSessionsConfirmBridge.resolve(requestId, decision) ||
+            orcaWorkerPermissionConfirmBridge.resolveFromIpc(requestId, decision, {
+              isDeviceLink: isDeviceLinkInvoke(),
+              assertTrustedSender: () => assertTrustedAppRendererEvent(event),
+            }) ||
+            ghostGrantConfirmBridge.resolve(requestId, decision) ||
+            ghostSetupInteractionBridge.resolve(requestId, decision, pluginSetupResponseTarget);
+        });
+      }
       if (accepted) {
         return { accepted: true };
+      }
+      // If the request was found under the lock but disappeared before the
+      // resolver ran, do not retry it outside the lock and reintroduce the
+      // archive/resolve race.
+      if (resolutionAttemptedUnderLock) {
+        if (isPermissionInteractionDecision(decision)) {
+          handleAgentIslandInteractionDismissedByRequestId(requestId);
+        }
+        log.warn('resolve-interaction: no pending resolver (likely already dismissed/timed out)', {
+          requestId,
+        });
+        return { accepted: false };
       }
       if (isPermissionInteractionDecision(decision)) {
         handleAgentIslandInteractionDismissedByRequestId(requestId);

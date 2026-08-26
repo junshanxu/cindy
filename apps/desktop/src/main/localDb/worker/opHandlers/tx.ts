@@ -1945,7 +1945,11 @@ function orcaUpsertWorker(db: Database.Database, args: unknown): void {
       "UPDATE orca_teams SET updated_at = updated_at WHERE id = ? AND status = 'active'",
     ).run(teamId);
     if (activeTeam.changes !== 1) {
-      throw new Error(`Orca team ${teamId} is not active`);
+      const team = db.prepare(
+        'SELECT status, completed_at FROM orca_teams WHERE id = ? LIMIT 1',
+      ).get(teamId) as { status?: unknown; completed_at?: unknown } | undefined;
+      const ended = team?.completed_at != null;
+      throw new Error(`Orca team ${teamId} is ${ended ? 'no longer active' : 'not active'}`);
     }
     if (payload.focused === true) {
       db.prepare('UPDATE orca_workers SET focused = 0, updated_at = ? WHERE team_id = ? AND focused = 1').run(now, teamId);

@@ -13893,6 +13893,11 @@ function clearSession(sessionId: string, opts?: { requireActiveSession?: boolean
   return clearSessionAfterGuard(sessionId, clearedAt, opts);
 }
 
+function isSessionNotActiveError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\bSESSION_NOT_ACTIVE\b/i.test(message);
+}
+
 async function clearSessionAfterGuard(
   sessionId: string,
   clearedAt: string,
@@ -13948,7 +13953,7 @@ async function clearSessionAfterGuardImpl(
     | { kind: 'timeout' };
   const clearOperation = beginInputProjectionOperation(sessionId, remoteDeviceId);
   const clearSessionRequest =
-    opts && !remoteDeviceId
+    opts
       ? clearOperation.api.input.clearSession(sessionId, clearedAt, opts)
       : clearOperation.api.input.clearSession(sessionId, clearedAt);
   try {
@@ -13988,6 +13993,14 @@ async function clearSessionAfterGuardImpl(
   } else if (guardResult.kind === 'error') {
     const err = guardResult.err;
     log.warn('maker.input.clearSession failed:', err);
+    if (opts?.requireActiveSession && isSessionNotActiveError(err)) {
+      // A fenced secondary-window clear must not turn an already archived
+      // session into a locally cleared session. The host rejected the
+      // lifecycle before its clear boundary was committed; preserve the
+      // transcript and stop any remote retry loop.
+      if (remoteDeviceId) clearRemoteClearFence(sessionId, { pump: false });
+      return;
+    }
     if (remoteDeviceId) {
       noteRemoteClearDispatchError(sessionId, remoteDeviceId, clearedAt, err);
       scheduleRemoteClearRetry(sessionId);
