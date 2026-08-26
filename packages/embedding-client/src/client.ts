@@ -817,12 +817,14 @@ const MODEL_NOT_FOUND_PATTERNS = [
   // 收紧两步 (PR #2288 Codex P1):
   //   1. 中间段不能以 input/field/parameter/... 等参数词开头 —— "model: input field not found"
   //      是 input field 错误而非模型不存在。
-  //   2. 中间段不能含 JSON 结构字符 `"` `,` `{` `}` —— 防止错误体中
+  //   2. 中间段不能含 JSON 跨字段字符 `,` `{` `}` —— 防止错误体中
   //      {"model":"<id>","error":"<not found>"} 这种无关 `not found` 通过贪婪
-  //      `[^\n]{0,80}` 跨字段命中。
+  //      `[^\n]{0,80}` 跨字段命中。引号 `"` 仍允许,因为 OpenAI 等网关会把
+  //      模型 ID 用 `"<id>"` 包裹 (model: "glm-5" not found);排除 `"` 会把这种
+  //      正常 INVALID_MODEL 误判为 BAD_REQUEST (regression check)。
   // lookahead 内含 `[ \t]*` 避免 engine 回溯到 cursor 落在冒号后空格;参数词后接
   // `(?=_|-|\b|$)` 同样把下划线/连字符当 word boundary (下划线不是 \b)。
-  /model\s*[:='"`](?![ \t]*(?:input|field|parameter|argument|property|option|key|value|type|feature|attribute)(?=_|-|\b|$))[ \t]*[^"\n,{}]{0,80}not[_\s-]?found/i,
+  /model\s*[:='"`](?![ \t]*(?:input|field|parameter|argument|property|option|key|value|type|feature|attribute)(?=_|-|\b|$))[ \t]*[^,\n{}]{0,80}not[_\s-]?found/i,
   /deployment[_\s-]?not[_\s-]?found/i,
   // "unknown model" 独立出现 / 后接冒号引号模型 id;
   // 不匹配 "unknown model parameter / field / input / key / argument" 这类参数错误。

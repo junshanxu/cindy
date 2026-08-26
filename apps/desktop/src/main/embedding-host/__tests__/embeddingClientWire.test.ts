@@ -1264,7 +1264,7 @@ describe('EmbeddingClient · mapStatusToCode (INVALID_MODEL 熔断信号)', () =
   it('JSON 体内 model 与无关 not found 共存不误判 → BAD_REQUEST (PR #2288 Codex P1 L818)', async () => {
     // 错误体里同时出现 "model":"<id>" 与另一个字段的 "... not found" 描述,
     // L818 旧版贪婪 [^\n]{0,80} 会跨字段命中 not found,误判为 INVALID_MODEL。
-    // 修复后 ID 段不允许含 JSON 结构字符 (`"` `,` `{` `}`),跨字段不会成立。
+    // 修复后 ID 段不允许含 JSON 跨字段字符 (`,` `{` `}`),跨字段不会成立。
     const fetchImpl = errorResponse(
       400,
       '{"model":"glm-5","error":"input field not found in request body"}',
@@ -1272,5 +1272,35 @@ describe('EmbeddingClient · mapStatusToCode (INVALID_MODEL 熔断信号)', () =
     await expect(
       clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
     ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+
+  it('双引号包裹 ID "model \\"glm-5\\" not found" 仍识别为 INVALID_MODEL (PR #2288 L818 双引号回归)', async () => {
+    // OpenAI 等网关会把模型 ID 用 "<id>" 包裹;L818 中间段若排除引号会把这种
+    // 正常 INVALID_MODEL 误判为 BAD_REQUEST。修复用 [^,\n{}] 而非 [^"\n,{}],
+    // 允许 ID 段内出现包裹引号。
+    const fetchImpl = errorResponse(400, {
+      error: { message: 'model: "glm-5" not found' },
+    });
+    await expect(
+      clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
+    ).rejects.toMatchObject({ code: 'INVALID_MODEL' });
+  });
+
+  it('单引号包裹 ID "model \'glm-5\' was not found" 仍识别为 INVALID_MODEL', async () => {
+    const fetchImpl = errorResponse(400, {
+      error: { message: "model 'glm-5' was not found" },
+    });
+    await expect(
+      clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
+    ).rejects.toMatchObject({ code: 'INVALID_MODEL' });
+  });
+
+  it('双引号包裹 ID 出现在 model 后空格处 "model \\"glm-5\\" was not found" 仍识别为 INVALID_MODEL', async () => {
+    const fetchImpl = errorResponse(400, {
+      error: { message: 'model "glm-5" was not found' },
+    });
+    await expect(
+      clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
+    ).rejects.toMatchObject({ code: 'INVALID_MODEL' });
   });
 });
