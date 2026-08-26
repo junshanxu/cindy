@@ -432,9 +432,14 @@ describe('EmbeddingWorker invalid-model circuit breaker', () => {
       let rowid = 0;
       const query = vi.fn(async () => [{ ...job(++rowid, `msg-${rowid}`) }]);
       const tx = vi.fn(async () => ({ failCount: 0 }));
+      let embedCallCount = 0;
       const embed = vi.fn(async () => {
-        // Flip source-suspended during the reprobe — embeddings resolve
-        // successfully but the post-call source check sees the suspension.
+        embedCallCount++;
+        if (embedCallCount === 1) {
+          // Initial block.
+          throw new EmbeddingError('model is unsupported', 'INVALID_MODEL', 404);
+        }
+        // TTL reprobe: source flips to suspended, embeddings still succeed.
         setProviderSuspended('chat', true);
         return { embeddings: [new Array(10).fill(0.1)], tokensUsed: 0, cacheHits: 0 };
       });
@@ -457,21 +462,22 @@ describe('EmbeddingWorker invalid-model circuit breaker', () => {
       await tick();
       expect(embed).toHaveBeenCalledTimes(1);
 
-      // TTL 1: reprobe runs, succeeds, but source is now suspended. The
-      // blockedAt must roll back to the pre-probe timestamp, otherwise the
-      // entry would age as "just blocked" for the next full TTL.
+      // Tick 2: TTL expires, reprobe runs and flips source-suspended.
       now += 31 * 60_000;
       vi.setSystemTime(now);
       await tick();
       expect(embed).toHaveBeenCalledTimes(2);
 
-      // Re-enable source shortly after (well inside the original TTL window).
-      // If blockedAt was correctly rolled back, age is now > TTL again
-      // (since we advanced 31m from the original block); the next tick must
-      // dispatch another reprobe immediately. If the bug were present,
-      // blockedAt would be Date.now() at the reprobe start and age would be
-      // ~0 here, skipping the reprobe.
+      // Re-enable source before the next tick so the SQL filter at the top
+      // of tick() does not drop 'chat' jobs outright.
       setProviderSuspended('chat', false);
+
+      // Advance another minute (32m total from the original block). If
+      // blockedAt was correctly rolled back to the pre-probe timestamp,
+      // age is well past TTL and the next tick must dispatch another
+      // reprobe. If the bug were present, blockedAt would be Date.now()
+      // at the reprobe start, age would be ~1m, and the tick would stay
+      // inside the window (no reprobe).
       now += 60_000;
       vi.setSystemTime(now);
       await tick();
@@ -495,8 +501,15 @@ describe('EmbeddingWorker invalid-model circuit breaker', () => {
       let rowid = 0;
       const query = vi.fn(async () => [{ ...job(++rowid, `msg-${rowid}`) }]);
       const tx = vi.fn(async () => ({ failCount: 0 }));
+      let embedCallCount = 0;
       const embed = vi.fn(async () => {
-        if (embed.mock.calls.length === 2) setProviderSuspended('chat', true);
+        embedCallCount++;
+        if (embedCallCount === 1) {
+          // Initial block.
+          throw new EmbeddingError('model is unsupported', 'INVALID_MODEL', 404);
+        }
+        // TTL reprobe: source flips to suspended, request still rejects.
+        setProviderSuspended('chat', true);
         throw new EmbeddingError('model not found', 'INVALID_MODEL', 404);
       });
 
@@ -524,12 +537,13 @@ describe('EmbeddingWorker invalid-model circuit breaker', () => {
       await tick();
       expect(embed).toHaveBeenCalledTimes(2);
 
-      // Re-enable after a short interval. If blockedAt was correctly rolled
-      // back, age is well past TTL (we moved 31m from the original block) and
-      // the next tick must dispatch another reprobe. If the bug were
-      // present, blockedAt would be Date.now() at the reprobe start, age
-      // would be ~0, and we'd stay inside the window (no reprobe).
+      // Re-enable source before the next tick so the SQL filter at the top
+      // of tick() does not drop 'chat' jobs outright.
       setProviderSuspended('chat', false);
+
+      // Tick 3 must dispatch another reprobe. Same reasoning as the
+      // success-path test: blockedAt must be rolled back so age is well
+      // past TTL by now.
       now += 60_000;
       vi.setSystemTime(now);
       await tick();
