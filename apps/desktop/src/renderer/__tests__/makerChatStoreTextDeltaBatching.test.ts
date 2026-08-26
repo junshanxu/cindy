@@ -2133,6 +2133,51 @@ describe('makerChatStore text delta batching', () => {
     expect(sessionService.update).not.toHaveBeenCalled();
   });
 
+  it('preserves a remote optimistic send when a fenced clear is rejected', async () => {
+    remoteProjectsStore.pinSessionOrigin('device-1', SESSION_ID);
+    let rejectClear!: (error: Error) => void;
+    deviceLinkInvoke.mockImplementation(async (_deviceId, channel) => {
+      if (channel === 'maker:input:clear-session') {
+        return new Promise<AgentInputProjection>((_resolve, reject) => {
+          rejectClear = reject;
+        });
+      }
+      throw new Error(`unexpected remote channel: ${channel}`);
+    });
+
+    const clear = makerChatStore.clearSession(SESSION_ID, { requireActiveSession: true });
+    await flushPromises();
+    expect(rejectClear).toBeDefined();
+
+    await expect(
+      makerChatStore.sendMessage(
+        SESSION_ID,
+        'preserve this remote optimistic send',
+        MODEL,
+        EFFORT,
+        PERMISSION_MODE,
+        WORKING_DIR,
+      ),
+    ).resolves.toBe(true);
+    expect(makerChatStore.getSnapshot(SESSION_ID).messages).toEqual([
+      expect.objectContaining({
+        content: 'preserve this remote optimistic send',
+        isPendingPersist: true,
+      }),
+    ]);
+
+    rejectClear(new Error('SESSION_NOT_ACTIVE: session is archived'));
+    await clear;
+
+    expect(makerChatStore.getSnapshot(SESSION_ID).messages).toEqual([
+      expect.objectContaining({
+        content: 'preserve this remote optimistic send',
+        isPendingPersist: true,
+      }),
+    ]);
+    expect(window.electronAPI.maker.closeSession).not.toHaveBeenCalled();
+  });
+
   it('continues clearing local state when the clear guard hangs', async () => {
     input.clearSession.mockReturnValueOnce(new Promise<AgentInputProjection>(() => {}));
 

@@ -1955,7 +1955,52 @@ function clearRemoteOptimisticSend(sessionId: string, clientId: string): void {
   if (deleted) syncRemoteOptimisticAttachmentUrls();
 }
 
-function clearRemoteOptimisticSendsForSession(sessionId: string): void {
+function clearRemoteOptimisticSendsForSession(
+  sessionId: string,
+  preserveClientIds?: ReadonlySet<string>,
+): void {
+  if (preserveClientIds) {
+    const records = remoteOptimisticSends.get(sessionId);
+    let deleted = false;
+    if (records) {
+      for (const clientId of [...records.keys()]) {
+        if (preserveClientIds.has(clientId)) continue;
+        records.delete(clientId);
+        cancelRemoteOptimisticSettlingRetirement(sessionId, clientId);
+        deleted = true;
+      }
+      if (records.size === 0) remoteOptimisticSends.delete(sessionId);
+    }
+    remoteInputProjectionRequests.delete(sessionId);
+    remoteInputProjectionProbeStateBySession.delete(sessionId);
+    clearRemoteOptimisticRetryTimer(sessionId);
+    remoteOptimisticPumps.delete(sessionId);
+    const timers = remoteOptimisticSettlingTimers.get(sessionId);
+    if (timers) {
+      for (const clientId of [...timers.keys()]) {
+        if (preserveClientIds.has(clientId)) continue;
+        clearTimeout(timers.get(clientId));
+        timers.delete(clientId);
+      }
+      if (timers.size === 0) remoteOptimisticSettlingTimers.delete(sessionId);
+    }
+    for (const key of remoteOptimisticSettlingChecks) {
+      const prefix = `${sessionId}\u0000`;
+      if (key.startsWith(prefix) && !preserveClientIds.has(key.slice(prefix.length))) {
+        remoteOptimisticSettlingChecks.delete(key);
+      }
+    }
+    const removed = remoteOptimisticLocallyRemoved.get(sessionId);
+    if (removed) {
+      for (const clientId of [...removed]) {
+        if (!preserveClientIds.has(clientId)) removed.delete(clientId);
+      }
+      if (removed.size === 0) remoteOptimisticLocallyRemoved.delete(sessionId);
+    }
+    if (deleted) syncRemoteOptimisticAttachmentUrls();
+    return;
+  }
+
   const deleted = remoteOptimisticSends.delete(sessionId);
   remoteInputProjectionRequests.delete(sessionId);
   remoteInputProjectionProbeStateBySession.delete(sessionId);
@@ -13917,34 +13962,20 @@ async function clearSessionAfterGuardImpl(
   clearedAt: string,
   opts?: { requireActiveSession?: boolean },
 ): Promise<void> {
-  // /clear 清空会话：清掉该 session 的「正在识别图片中」toast，防残留。
-  dismissVisionBridgeToast(sessionId);
+  const fencedClear = opts?.requireActiveSession === true;
   // Pin the clear lifecycle to the last known device before any await. The
   // mirror is intentionally cleared below, so live origin lookup is no longer
   // reliable for either clearSession or closeSession.
   const remoteDeviceId = getStickySessionDeviceId(sessionId);
-  noteRendererClearBoundary(sessionId, clearedAt);
-  // Invalidate old history/projection operations before the first network await.
-  // The clear guard itself must be the new authority generation, otherwise an
-  // older projection can win the race and reinsert pre-clear queue state.
-  invalidateMessageHistoryWindow(sessionId);
-  bumpInteractionReconcileEpoch(sessionId);
-  supersedeInputProjectionRequests(sessionId, { supersedeOperations: true });
+  const preGuardRemoteOptimisticClientIds = new Set(
+    remoteOptimisticSendRecords(sessionId)?.keys() ?? [],
+  );
   if (remoteDeviceId) {
     // Arm before the first remote await. New sends made while the invoke is
     // pending are accepted into the local optimistic ledger but cannot cross
     // the host's clear boundary.
     armRemoteClearFence(sessionId, remoteDeviceId, clearedAt);
   }
-  clearRemoteOptimisticMaterializationRecoveriesForSession(sessionId, {
-    preserveComposerTransitions: true,
-    markComposerTransitionsPurged: true,
-  });
-  clearRemoteOptimisticSendsForSession(sessionId);
-  // 远程会话:/clear 之后**不会**再有一次"最新页"拉取(唯一写缓存的那条路径),盘上那份
-  // 仍是清空前的正文 —— 此刻退出 app,下次离线冷启动就把已经被清掉的对话 hydrate 回来
-  // (review: codex P1)。放在守卫之前:无论守卫成功、失败还是超时,缓存都必须消失。
-  invalidateRemoteMessageCache(sessionId, remoteDeviceId);
   // Arm main-side clear guards before closing the CLI and clearing renderer state.
   let guardTimeoutId: ReturnType<typeof setTimeout> | undefined;
   let guardResult:
@@ -13974,8 +14005,9 @@ async function clearSessionAfterGuardImpl(
   } finally {
     if (guardTimeoutId) clearTimeout(guardTimeoutId);
   }
+  let remoteClearResolved: boolean | undefined;
   if (guardResult.kind === 'projection') {
-    let remoteClearResolved = true;
+    remoteClearResolved = true;
     if (remoteDeviceId) {
       remoteClearResolved = resolveRemoteClearFenceFromProjection(
         sessionId,
@@ -13986,10 +14018,6 @@ async function clearSessionAfterGuardImpl(
       );
     }
     applyInputProjectionOperationResponse(sessionId, clearOperation, guardResult.projection);
-    if (remoteDeviceId) {
-      if (remoteClearResolved) pumpRemoteOptimisticSendsAfterCurrent(sessionId);
-      else scheduleRemoteClearRetry(sessionId);
-    }
   } else if (guardResult.kind === 'error') {
     const err = guardResult.err;
     log.warn('maker.input.clearSession failed:', err);
@@ -14003,11 +14031,56 @@ async function clearSessionAfterGuardImpl(
     }
     if (remoteDeviceId) {
       noteRemoteClearDispatchError(sessionId, remoteDeviceId, clearedAt, err);
-      scheduleRemoteClearRetry(sessionId);
     }
   } else {
     log.warn('maker.input.clearSession timed out; continuing local clear', { sessionId });
-    if (remoteDeviceId) scheduleRemoteClearRetry(sessionId);
+  }
+
+  // A fenced clear must not mutate renderer history, optimistic sends, or the
+  // offline mirror until the main-side lifecycle guard has accepted it. If
+  // the guard rejects with SESSION_NOT_ACTIVE, returning above leaves all of
+  // those structures untouched. Sends created while the guard was pending
+  // are post-clear work and are retained below for both local and remote
+  // clears.
+  const postGuardRemoteOptimisticClientIds = new Set(
+    [...(remoteOptimisticSendRecords(sessionId)?.keys() ?? [])].filter(
+      (clientId) => !preGuardRemoteOptimisticClientIds.has(clientId),
+    ),
+  );
+  dismissVisionBridgeToast(sessionId);
+  noteRendererClearBoundary(sessionId, clearedAt);
+  invalidateMessageHistoryWindow(sessionId);
+  bumpInteractionReconcileEpoch(sessionId);
+  supersedeInputProjectionRequests(sessionId, { supersedeOperations: true });
+  clearRemoteOptimisticMaterializationRecoveriesForSession(sessionId, {
+    preserveComposerTransitions: true,
+    markComposerTransitionsPurged: true,
+  });
+  clearRemoteOptimisticSendsForSession(sessionId, postGuardRemoteOptimisticClientIds);
+  for (const clientId of postGuardRemoteOptimisticClientIds) {
+    const record = remoteOptimisticSendRecords(sessionId)?.get(clientId);
+    if (record) {
+      record.clearGeneration = rendererClearGenerationBySession.get(sessionId) ?? 0;
+    }
+  }
+  // 远程会话:/clear 之后**不会**再有一次"最新页"拉取(唯一写缓存的那条路径),盘上那份
+  // 仍是清空前的正文 —— 此刻退出 app,下次离线冷启动就把已经被清掉的对话 hydrate 回来。
+  invalidateRemoteMessageCache(sessionId, remoteDeviceId);
+  if (remoteDeviceId) {
+    // The remote fence was armed before the guard, so its generation predates
+    // the renderer clear boundary we just committed. Advance it only after a
+    // successful/non-terminal clear result; rejected fenced clears returned
+    // above and never reach this mutation.
+    const fence = remoteClearFences.get(sessionId);
+    if (fence) {
+      fence.clearGeneration = rendererClearGenerationBySession.get(sessionId) ?? 0;
+    }
+    if (guardResult.kind === 'projection') {
+      if (remoteClearResolved) pumpRemoteOptimisticSendsAfterCurrent(sessionId);
+      else scheduleRemoteClearRetry(sessionId);
+    } else {
+      scheduleRemoteClearRetry(sessionId);
+    }
   }
 
   _lastViewedAt.delete(sessionId);
@@ -14022,13 +14095,15 @@ async function clearSessionAfterGuardImpl(
   // The remote guard may have been waiting while the user composed another
   // message. Those records belong to the post-clear generation: clear the old
   // transcript, but keep their local optimistic rows until the host accepts
-  // them. Pre-clear records were already removed before the guard invoke.
+  // them. Records from before the guard are removed by the clear below.
   const postClearOptimisticClientIds = new Set(
     [...(remoteOptimisticSendRecords(sessionId)?.values() ?? [])]
       .filter(
         (record) =>
           isDataOwnerGenerationCurrent(record.dataOwner) &&
-          record.clearGeneration === (rendererClearGenerationBySession.get(sessionId) ?? 0),
+          (fencedClear
+            ? !preGuardRemoteOptimisticClientIds.has(record.queued.clientId)
+            : record.clearGeneration === (rendererClearGenerationBySession.get(sessionId) ?? 0)),
       )
       .map((record) => record.queued.clientId),
   );
