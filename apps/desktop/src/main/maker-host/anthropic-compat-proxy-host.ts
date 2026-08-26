@@ -73,7 +73,7 @@ import {
 } from './claude-session-route-registry.js';
 import { createClaudeGatewayErrorObserver } from './claude-gateway-error-observer.js';
 import { shouldApplyExclusiveProviderReroute } from './model-route-guard.js';
-import { getSessionProvider } from './session-provider-store.js';
+import { getSessionProvider, hasSessionProvider } from './session-provider-store.js';
 import {
   buildRouteDecision,
   gatewayDefaultRouteDecision,

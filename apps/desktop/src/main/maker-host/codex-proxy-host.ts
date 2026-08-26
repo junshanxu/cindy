@@ -84,7 +84,7 @@ import {
   rewriteSessionModelIdForRoute,
 } from './provider-route.js';
 import type { CodexSubagentRouteSnapshot } from './codex-subagent-config.js';
-import { getSessionProvider } from './session-provider-store.js';
+import { getSessionProvider, hasSessionProvider } from './session-provider-store.js';
 import {
   composeResponseObservers,
   recordClaudeRateLimitHeaders,
