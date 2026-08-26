@@ -2,7 +2,7 @@ import { EmbeddingError } from '@cindy/embedding-client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { EmbeddingWorker } from '../EmbeddingWorker';
-import { clearProviders, registerProvider } from '../providers';
+import { clearProviders, registerProvider, setProviderSuspended } from '../providers';
 
 interface FailureArgs {
   jobs: Array<{ rowid: number; attempts: number }>;
@@ -414,6 +414,128 @@ describe('EmbeddingWorker invalid-model circuit breaker', () => {
       await tick();
       expect(embed).toHaveBeenCalledTimes(3);
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('source suspended mid-TTL-reprobe (success path) rolls back blockedAt so re-enable is not blocked by the probe-start timestamp (PR #2288 Codex P1)', async () => {
+    // TTL-expired reprobe that happens to land while the user briefly suspends
+    // the source: the post-embed `isProviderSuspended(source)` check kicks in,
+    // the entry must roll its blockedAt back to the pre-probe timestamp so that
+    // once the source is re-enabled the worker can reprobe on the very next
+    // tick — instead of waiting a full TTL because age is computed from
+    // Date.now() of the probe start.
+    vi.useFakeTimers();
+    try {
+      let now = new Date('2026-08-21T12:00:00Z').getTime();
+      vi.setSystemTime(now);
+      let rowid = 0;
+      const query = vi.fn(async () => [{ ...job(++rowid, `msg-${rowid}`) }]);
+      const tx = vi.fn(async () => ({ failCount: 0 }));
+      const embed = vi.fn(async () => {
+        // Flip source-suspended during the reprobe — embeddings resolve
+        // successfully but the post-call source check sees the suspension.
+        setProviderSuspended('chat', true);
+        return { embeddings: [new Array(10).fill(0.1)], tokensUsed: 0, cacheHits: 0 };
+      });
+
+      registerProvider({
+        source: 'chat',
+        getTextsForJobs: async (jobs) =>
+          jobs.map(({ rowid: r, sourceId }) => ({ rowid: r, text: sourceId })),
+      });
+
+      const worker = new EmbeddingWorker({
+        getDbClient: () => ({ query, tx }) as never,
+        getClient: () => ({ embed }) as never,
+        isVecAvailable: () => true,
+        log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never,
+      });
+      const tick = (worker as unknown as { tick: () => Promise<void> }).tick.bind(worker);
+
+      // Tick 1: initial INVALID_MODEL block.
+      await tick();
+      expect(embed).toHaveBeenCalledTimes(1);
+
+      // TTL 1: reprobe runs, succeeds, but source is now suspended. The
+      // blockedAt must roll back to the pre-probe timestamp, otherwise the
+      // entry would age as "just blocked" for the next full TTL.
+      now += 31 * 60_000;
+      vi.setSystemTime(now);
+      await tick();
+      expect(embed).toHaveBeenCalledTimes(2);
+
+      // Re-enable source shortly after (well inside the original TTL window).
+      // If blockedAt was correctly rolled back, age is now > TTL again
+      // (since we advanced 31m from the original block); the next tick must
+      // dispatch another reprobe immediately. If the bug were present,
+      // blockedAt would be Date.now() at the reprobe start and age would be
+      // ~0 here, skipping the reprobe.
+      setProviderSuspended('chat', false);
+      now += 60_000;
+      vi.setSystemTime(now);
+      await tick();
+      expect(embed).toHaveBeenCalledTimes(3);
+    } finally {
+      setProviderSuspended('chat', false);
+      vi.useRealTimers();
+    }
+  });
+
+  it('source suspended mid-TTL-reprobe (error path) rolls back blockedAt and does not consume probeCount (PR #2288 Codex P1)', async () => {
+    // Same scenario as the success-path case but the reprobe itself fails.
+    // The catch's source-suspended branch must also roll back blockedAt to
+    // the pre-probe timestamp and not count this interrupted probe as a
+    // confirmation — otherwise two disable/enable cycles would exhaust the
+    // budget and the model would stop being probed until restart.
+    vi.useFakeTimers();
+    try {
+      let now = new Date('2026-08-21T12:00:00Z').getTime();
+      vi.setSystemTime(now);
+      let rowid = 0;
+      const query = vi.fn(async () => [{ ...job(++rowid, `msg-${rowid}`) }]);
+      const tx = vi.fn(async () => ({ failCount: 0 }));
+      const embed = vi.fn(async () => {
+        if (embed.mock.calls.length === 2) setProviderSuspended('chat', true);
+        throw new EmbeddingError('model not found', 'INVALID_MODEL', 404);
+      });
+
+      registerProvider({
+        source: 'chat',
+        getTextsForJobs: async (jobs) =>
+          jobs.map(({ rowid: r, sourceId }) => ({ rowid: r, text: sourceId })),
+      });
+
+      const worker = new EmbeddingWorker({
+        getDbClient: () => ({ query, tx }) as never,
+        getClient: () => ({ embed }) as never,
+        isVecAvailable: () => true,
+        log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never,
+      });
+      const tick = (worker as unknown as { tick: () => Promise<void> }).tick.bind(worker);
+
+      // Tick 1: initial block.
+      await tick();
+      expect(embed).toHaveBeenCalledTimes(1);
+
+      // Tick 2: TTL reprobe, source flips to suspended on this call.
+      now += 31 * 60_000;
+      vi.setSystemTime(now);
+      await tick();
+      expect(embed).toHaveBeenCalledTimes(2);
+
+      // Re-enable after a short interval. If blockedAt was correctly rolled
+      // back, age is well past TTL (we moved 31m from the original block) and
+      // the next tick must dispatch another reprobe. If the bug were
+      // present, blockedAt would be Date.now() at the reprobe start, age
+      // would be ~0, and we'd stay inside the window (no reprobe).
+      setProviderSuspended('chat', false);
+      now += 60_000;
+      vi.setSystemTime(now);
+      await tick();
+      expect(embed).toHaveBeenCalledTimes(3);
+    } finally {
+      setProviderSuspended('chat', false);
       vi.useRealTimers();
     }
   });

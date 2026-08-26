@@ -396,7 +396,17 @@ export class EmbeddingWorker {
           // 退出检查点: embed() 网络往返期间可能已触发 stop(), 绝不在 abort 后再开
           // 写事务 (这是保证 db.backup 无争用的关键)。该批 job 保持 pending, 下次续跑。
           if (this.aborted) return;
-          if (isProviderSuspended(source)) break;
+          if (isProviderSuspended(source)) {
+            // source 探测期间被停用:回滚本次探测刷新的 blockedAt,让 source
+            // 恢复后仍能进入重探窗口,而不是被探测开始时刻卡住多休眠完整 TTL
+            // (PR #2288 Codex P1)。entry 仍保留(探测未确认 INVALID_MODEL),
+            // probeCount 也不消耗 —— 与 isRouteSuspended(modelId) 处理保持一致。
+            if (probeStartedAt !== undefined) {
+              const entry = this.blockedModels.get(modelId);
+              if (entry) entry.blockedAt = probeStartedAt;
+            }
+            break;
+          }
           // 探测成功 — 若之前熔断过,清除条目恢复正常节奏。
           if (this.blockedModels.has(modelId)) {
             this.blockedModels.delete(modelId);
@@ -429,7 +439,13 @@ export class EmbeddingWorker {
           // 那批 job 保持 pending, 下次启动续跑 (PR #2288 review)。
           if (this.aborted) return;
           // availability 可能在网络往返期间丢失;保留 pending,不要把它记成失败重试。
-          if (isProviderSuspended(source)) break;
+          if (isProviderSuspended(source)) {
+            // 探测被 source 停用打断:回滚探测前刷新的 blockedAt 且不递增 probeCount,
+            // 与 isRouteSuspended(modelId) 处理一致 —— 这次不算一次确认,source
+            // 重新启用后下个 TTL 窗口应能再次探测 (PR #2288 Codex P1)。
+            if (prev && probeStartedAt !== undefined) prev.blockedAt = probeStartedAt;
+            break;
+          }
           // 逐模型停用也可能在网络往返期间发生:该批保持 pending,恢复启用后续跑,
           // 不要把它写成 failed / 写进 blockedModels (PR #2288 review)。
           // 回滚探测前刷新的 blockedAt 且不递增 probeCount:这次探测被停用打断,
