@@ -1215,4 +1215,40 @@ describe('EmbeddingClient · mapStatusToCode (INVALID_MODEL 熔断信号)', () =
       clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
     ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
   });
+
+  it('"The model input_field does not exist" 下划线机器码不误判 → BAD_REQUEST (PR #2288 Codex P1 L823 下划线回归)', async () => {
+    const fetchImpl = errorResponse(400, {
+      error: { message: 'The model input_field does not exist in request body' },
+    });
+    await expect(
+      clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+
+  it('"The model parameter_name does not exist" 下划线机器码不误判 → BAD_REQUEST (PR #2288 Codex P1 L823 下划线回归)', async () => {
+    const fetchImpl = errorResponse(400, {
+      error: { message: 'The model parameter_name does not exist in request body' },
+    });
+    await expect(
+      clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+
+  it('"model: input_field is unsupported" 冒号分支下划线机器码不误判 → BAD_REQUEST (PR #2288 Codex P1 L833 下划线回归)', async () => {
+    const fetchImpl = errorResponse(400, {
+      error: { message: 'model: input_field is unsupported for this endpoint' },
+    });
+    await expect(
+      clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+
+  it('"model: parameter_name is unsupported" 冒号分支下划线机器码不误判 → BAD_REQUEST (PR #2288 Codex P1 L833 下划线回归)', async () => {
+    const fetchImpl = errorResponse(400, {
+      error: { message: 'model: parameter_name is unsupported' },
+    });
+    await expect(
+      clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
 });
