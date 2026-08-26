@@ -820,17 +820,26 @@ const MODEL_NOT_FOUND_PATTERNS = [
   // "unknown model" 独立出现 / 后接冒号引号模型 id;
   // 不匹配 "unknown model parameter / field / input / key / argument" 这类参数错误。
   /unknown[_\s-]?model(?![_\s-]+(?:parameter|field|input|key|argument|property|option|setting|value|type))/i,
-  /the model .* does not exist/i,
+  // "The model `<id>` does not exist" (OpenAI 风格)。排除 "the model input/field/
+  // parameter/... does not exist" 这类参数错误 (PR #2288 Codex P1):中间段开头不能是
+  // 已知的参数／字段名词,否则就是参数描述而非模型标识符。
+  /the model\s+(?!input\b|field\b|parameter\b|argument\b|property\b|option\b|key\b|value\b|type\b|feature\b|attribute\b).*?does not exist/is,
   // LiteLLM: "Invalid model name" (非存在模型);避免误伤 "invalid model input"
   // 这类输入/参数错误,只认 "invalid model name" 或后接冒号/引号模型 id 的措辞。
   /invalid[_\s-]?model[_\s-]?name/i,
   /invalid[_\s-]?model\s*[:='"`]/i,
-  // "model 'x' is unsupported" / `model "x" is unsupported` /
-// "model: x is unsupported" — 已被 providerErrors 共享分类器识别为 model_not_found,
-// 但用同一描述也可在这条路径里命中,避免路径分裂。必须有引号或冒号紧跟 model
-// (后面跟模型 id),否则 "model input is unsupported" 这类参数错误会被误判
-// (PR #2288 Codex P2)。
-  /model\s*(?:['"`][^\n]{1,80}?|:\s*[^\n]{1,80}?)\s+is\s+(?:not\s+supported|unsupported)/i,
+  // "model 'x' is unsupported" / `model "x" is unsupported" —
+  // 引号紧跟 model,中间是模型 id;不会误伤参数措辞。保持不变。
+  /model\s*['"`][^\n]{1,80}?['"`]?\s+is\s+(?:not\s+supported|unsupported)/i,
+  // "model: x is unsupported" 冒号分支 —— 已被 providerErrors 共享分类器识别为
+  // model_not_found,但用同一描述也可在这条路径里命中,避免路径分裂。
+  // 收紧:冒号后首个非空白词不能是 input/field/parameter/... 等参数词,否则就是
+  // 参数错误 ("model: input is unsupported" / "model: parameter dimensions is unsupported"),
+  // 不应触发模型级熔断 (PR #2288 Codex P1 L833)。
+  // 注意:把负向前瞻放在 `\s*` 之后会让 engine 回溯到 cursor 落在冒号后空格的位置,
+  // 此时 lookahead 看到的是空格而非 input,会误判通过。改成把空白匹配放进
+  // lookahead 内部(`[ \t]+` 强制至少一个空白),让 cursor 紧贴首个非空白字符。
+  /model\s*:(?![ \t]*(?:input|field|parameter|argument|property|option|key|value|type|feature|attribute)\b)[ \t]*[^\n]{1,80}?\s+is\s+(?:not\s+supported|unsupported)/i,
 ];
 
 function looksLikeModelNotFound(rawBody: string, parsedMsg: string): boolean {
