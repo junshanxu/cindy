@@ -1251,4 +1251,26 @@ describe('EmbeddingClient · mapStatusToCode (INVALID_MODEL 熔断信号)', () =
       clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
     ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
   });
+
+  it('"model: input field not found" 参数错误不误判 → BAD_REQUEST (PR #2288 Codex P1 L818)', async () => {
+    const fetchImpl = errorResponse(400, {
+      error: { message: 'model: input field not found in request body' },
+    });
+    await expect(
+      clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+
+  it('JSON 体内 model 与无关 not found 共存不误判 → BAD_REQUEST (PR #2288 Codex P1 L818)', async () => {
+    // 错误体里同时出现 "model":"<id>" 与另一个字段的 "... not found" 描述,
+    // L818 旧版贪婪 [^\n]{0,80} 会跨字段命中 not found,误判为 INVALID_MODEL。
+    // 修复后 ID 段不允许含 JSON 结构字符 (`"` `,` `{` `}`),跨字段不会成立。
+    const fetchImpl = errorResponse(
+      400,
+      '{"model":"glm-5","error":"input field not found in request body"}',
+    );
+    await expect(
+      clientWith(fetchImpl).embed({ texts: ['a'], model: 'voyage/voyage-4' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
 });

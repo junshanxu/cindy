@@ -813,9 +813,16 @@ const MODEL_NOT_FOUND_PATTERNS = [
   // "model_not_found", "model-not-found", "model not found"
   // (model 与 not found 之间没有其它词,不会误伤 "model input field was not found")
   /model[_\s-]?not[_\s-]?found/i,
-  // Anthropic 风格: "model: glm-5 not found" / "model 'glm-5' was not found"
-  // 必须在 model 后紧跟冒号或引号(再跟模型 id),避免参数错误措辞命中。
-  /model\s*[:='"`][^\n]{0,80}not[_\s-]?found/i,
+  // Anthropic 风格: "model: glm-5 not found" / "model 'glm-5' was not found"。
+  // 收紧两步 (PR #2288 Codex P1):
+  //   1. 中间段不能以 input/field/parameter/... 等参数词开头 —— "model: input field not found"
+  //      是 input field 错误而非模型不存在。
+  //   2. 中间段不能含 JSON 结构字符 `"` `,` `{` `}` —— 防止错误体中
+  //      {"model":"<id>","error":"<not found>"} 这种无关 `not found` 通过贪婪
+  //      `[^\n]{0,80}` 跨字段命中。
+  // lookahead 内含 `[ \t]*` 避免 engine 回溯到 cursor 落在冒号后空格;参数词后接
+  // `(?=_|-|\b|$)` 同样把下划线/连字符当 word boundary (下划线不是 \b)。
+  /model\s*[:='"`](?![ \t]*(?:input|field|parameter|argument|property|option|key|value|type|feature|attribute)(?=_|-|\b|$))[ \t]*[^"\n,{}]{0,80}not[_\s-]?found/i,
   /deployment[_\s-]?not[_\s-]?found/i,
   // "unknown model" 独立出现 / 后接冒号引号模型 id;
   // 不匹配 "unknown model parameter / field / input / key / argument" 这类参数错误。
