@@ -1861,10 +1861,13 @@ export function createTurnRunner(
     if (attached) {
       try {
         const taken = takePendingInteractionsForSession(row.id);
+        let migrationPromise: Promise<void> | null = null;
         if (richIm) {
-          for (const entry of taken) {
-            void publishMigratedInteraction(entry, userId, row.id, target.scopeKey);
-          }
+          migrationPromise = Promise.all(
+            taken.map((entry) =>
+              publishMigratedInteraction(entry, userId, row.id, target.scopeKey),
+            ),
+          ).then(() => undefined);
         } else {
           // Text-only adapters have a single waiter per user. Preserve the
           // Desktop permission queue's ordering after takeover instead of
@@ -1883,7 +1886,7 @@ export function createTurnRunner(
           for (const entry of taken) {
             registerMigratedOwnership(row.id, entry, 'text', userId);
           }
-          void (async () => {
+          migrationPromise = (async () => {
             for (const entry of taken) {
               // Skip entries the pre-registered watchdog/ABORT already settled
               // while a predecessor was still in flight (their record is gone
@@ -1893,21 +1896,36 @@ export function createTurnRunner(
               }
               await publishMigratedInteraction(entry, userId, row.id, target.scopeKey);
             }
-          })().catch((err) => {
-            const msg = err instanceof Error ? err.message : String(err);
-            log.error(`publish migrated text interaction queue failed: ${msg}`);
-          });
+          })();
         }
         if (taken.length > 0) {
           log.info(
             `migrated ${taken.length} pending interaction(s) from desktop → ${channel} for session=${row.id.slice(-8)}`,
           );
         }
-      } finally {
         // Keep the Desktop queue fenced until the channel has accepted the
         // migrated cohort, preventing a new Desktop permission from racing the
         // handoff and overwriting the renderer's singleton permission slot.
+        if (migrationPromise) {
+          void migrationPromise.then(
+            () => completePermissionQueueTakeoverForSession(row.id),
+            (err) => {
+              const msg = err instanceof Error ? err.message : String(err);
+              log.error(`publish migrated interaction queue failed: ${msg}`);
+              completePermissionQueueTakeoverForSession(row.id);
+            },
+          );
+        } else {
+          completePermissionQueueTakeoverForSession(row.id);
+        }
+      } catch (err) {
+        // Keep the Desktop queue fenced until the channel has accepted the
+        // migrated cohort, preventing a new Desktop permission from racing the
+        // handoff and overwriting the renderer's singleton permission slot.
+        // If takeover extraction itself fails there is no migration promise to
+        // release the barrier, so release it before propagating the error.
         completePermissionQueueTakeoverForSession(row.id);
+        throw err;
       }
     }
 

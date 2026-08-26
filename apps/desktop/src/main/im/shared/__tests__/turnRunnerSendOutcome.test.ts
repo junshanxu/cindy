@@ -824,6 +824,51 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
     }
   });
 
+  it('keeps the Desktop permission queue fenced until migrated cards are accepted', async () => {
+    const h = setupAttachedSession(async () => ({ accepted: true }));
+    const card = deferred<{ messageId: string }>();
+    const resolve = vi.fn();
+    mocks.takePendingInteractionsForSession.mockReturnValue([
+      {
+        requestId: 'migrated-card-fence',
+        request: {
+          kind: 'permission',
+          requestId: 'migrated-card-fence',
+          toolName: 'bash',
+          input: { command: 'pnpm test' },
+        },
+        resolve,
+      },
+    ]);
+    mocks.buildPermissionCard.mockReturnValue({
+      title: 'Permission',
+      body: 'Allow?',
+      buttons: [],
+    });
+    mocks.feishuIm.sendInteractiveCard.mockReturnValueOnce(card.promise);
+    const localRunner = createTurnRunner(fakeAdapter, fakeRepo, fakeCards);
+
+    try {
+      await localRunner.runAgentTurn({
+        botContextId: 'cli_test_bot',
+        userId: 'ou_user',
+        userMessageId: 'msg-migrated-card-fence',
+        text: 'take over',
+        attachments: [],
+      });
+      await waitForAssertion(() => expect(mocks.feishuIm.sendInteractiveCard).toHaveBeenCalledOnce());
+      expect(mocks.completePermissionQueueTakeoverForSession).not.toHaveBeenCalled();
+
+      card.resolve({ messageId: 'migrated-card-fence' });
+      await waitForAssertion(() =>
+        expect(mocks.completePermissionQueueTakeoverForSession).toHaveBeenCalledOnce(),
+      );
+    } finally {
+      h.emit({ type: 'done', data: {} });
+      await localRunner.disposeAllSessions();
+    }
+  });
+
   it('settles a migrated text request while the adapter prompt send is still blocked', async () => {
     const h = setupAttachedSession(async () => ({ accepted: true }));
     const promptDecision = deferred<InteractionDecision>();
