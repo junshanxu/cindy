@@ -3042,7 +3042,9 @@ export function createModelRoutingTransform(
     // 两者都必须先于 Codex 默认 ChatGPT/XD 分支，避免协议或凭证落错上游。
     if (!explicitProviderId && model) {
       if (sessionId && ctx.method === 'POST') {
-        return resolveImplicitLocalBridgeRoute(model, 'codex').then((localRoute) => {
+        return resolveImplicitLocalBridgeRoute(model, 'codex', {
+          preserveDisabled: hasSessionProvider(sessionId),
+        }).then((localRoute) => {
           if (localRoute) {
             return createLocalBridgeDecision(
               localRoute,
