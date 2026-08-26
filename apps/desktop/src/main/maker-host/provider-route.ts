@@ -23,6 +23,7 @@ import {
   actualSourceIdForModel,
   chatEligibleSourcesForModel,
   isExclusiveXaiModelId,
+  isModelSelectableForNewRoute,
   resolvePiModelRoute,
   runtimeCustomProviderId,
   storedCustomProviderId,
