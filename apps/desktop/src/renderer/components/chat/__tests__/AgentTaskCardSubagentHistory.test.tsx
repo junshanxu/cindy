@@ -95,9 +95,10 @@ describe('AgentTaskCard subagent details entry after history reload', () => {
     render(
       <MemoryRouter>
         <AgentTaskCard
-          toolCall={makeToolCall('persisted-run-alias')}
+          toolCall={makeToolCall('persisted-run-alias', 'subagent')}
           result="completed"
           sessionId="lead-1"
+          sessionAgentKind="pi"
         />
       </MemoryRouter>,
     );
@@ -110,7 +111,7 @@ describe('AgentTaskCard subagent details entry after history reload', () => {
 
     expect(openSubagentsTab).toHaveBeenCalledWith('lead-1', {
       focusRunId: 'persisted-run-alias',
-      focusProvider: expect.any(String),
+      focusProvider: 'pi',
       userInitiated: true,
     });
   });

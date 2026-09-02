@@ -372,6 +372,8 @@ export function AgentTaskCard({
     && isSubagentSpawnToolName(toolName);
   const subagentPanelFocusId = update?.taskId ?? toolCall?.toolUseId;
   const canOpenSubagentPanel =
+    (update?.provider === 'pi' || toolCall?.toolName === PI_SUBAGENT_TOOL_NAME) &&
+    sessionAgentKind === 'pi' &&
     Boolean(sessionId)
     && Boolean(subagentPanelFocusId)
     && panelReachable
