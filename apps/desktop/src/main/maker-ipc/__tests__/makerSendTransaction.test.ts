@@ -409,7 +409,13 @@ describe('maker SEND transaction', () => {
       .mockRejectedValue(
         Object.assign(new Error('Session is archived'), { code: 'PRECONDITION_FAILED' }),
       );
-    const { deps, session } = createDeps({ assertSessionActiveForManualDispatch });
+    const applyPendingAgentSwitch = vi.fn();
+    const prepareUnhealthySession = vi.fn();
+    const { deps, session } = createDeps({
+      assertSessionActiveForManualDispatch,
+      applyPendingAgentSwitch,
+      prepareUnhealthySession,
+    });
     const transaction = createMakerSendTransaction(deps);
 
     await expect(
@@ -423,6 +429,8 @@ describe('maker SEND transaction', () => {
 
     expect(assertSessionActiveForManualDispatch).toHaveBeenCalledOnce();
     expect(assertSessionActiveForManualDispatch).toHaveBeenCalledWith('session-1');
+    expect(applyPendingAgentSwitch).not.toHaveBeenCalled();
+    expect(prepareUnhealthySession).not.toHaveBeenCalled();
     expect(session.send).not.toHaveBeenCalled();
   });
 

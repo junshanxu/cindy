@@ -55,6 +55,23 @@ beforeEach(() => {
   h.webContentsSend.mockClear();
 });
 
+describe('/clear lifecycle fence', () => {
+  it('keeps a secondary-window active-session guard for every broadcast consumer', async () => {
+    const { registry } = makeHarness();
+
+    await registry.execute('clear', {
+      sessionId: 'rs',
+      requireActiveSession: true,
+    });
+
+    expect(sentPayloads().at(-1)).toMatchObject({
+      command: 'clear',
+      sessionId: 'rs',
+      requireActiveSession: true,
+    });
+  });
+});
+
 describe('/goal 远程路由', () => {
   it('deviceId + objective → 隧道 maker:goal:set,不触本机 controller', async () => {
     const { registry, goalController, remoteInvoke } = makeHarness();

@@ -791,6 +791,12 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
       sendOpts,
     ): Promise<DesktopMakerSendResult> {
       if (typeof sessionId !== 'string') throwIpcError('INVALID_PARAMS', 'sessionId required');
+      // A secondary-window queued send may race an archive after renderer-side
+      // reconciliation.  Fence before any route switch, recovery, or lazy
+      // bootstrap so an already-archived task cannot recreate an Agent runtime.
+      if (requiresActiveSessionForDispatch(sendOpts)) {
+        await deps.assertSessionActiveForManualDispatch?.(sessionId);
+      }
       // session-agent-switch:pending 切换在发送时刻生效(用户语义:「消息真正发出
       // 去时才切」)。必须在 getSession 之前——apply 会 close 旧引擎的 live session,
       // 让下方走 lazy-create 按 DB 新值 spawn 新引擎。

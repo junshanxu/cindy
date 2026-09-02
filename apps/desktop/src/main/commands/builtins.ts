@@ -102,7 +102,13 @@ function buildPayload(
     ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
     ...(ctx.workingDir ? { workingDir: ctx.workingDir } : {}),
     ...(ctx.args ? { args: ctx.args } : {}),
-    ...(ctx.sessionRouteLockHeld ? { requireActiveSession: true } : {}),
+    // Secondary-window dispatches carry an explicit lifecycle fence because
+    // their route lock lives on the source window.  Keep that fence when this
+    // command is broadcast to every window: otherwise a sibling primary
+    // window can replay /clear without the archived-session guard.
+    ...(ctx.sessionRouteLockHeld || ctx.requireActiveSession
+      ? { requireActiveSession: true }
+      : {}),
   };
 }
 
