@@ -3042,6 +3042,36 @@ describe('AgentInputCoordinator send transaction', () => {
     );
   });
 
+  it('restores a secondary-window retry recovery when the final lifecycle fence wins', async () => {
+    const h = createHarness({ isSessionActiveForManualDispatch: async () => true });
+    const sid = 'retry-secondary-window-fence-wins-after-retry';
+    h.setHasAssistantProgressAfter(async () => false);
+
+    h.coordinator.enqueue(sid, makeItem('q-first', 'original task'));
+    await flush();
+    h.setRunning(false);
+    h.coordinator.onTurnEvent(sid, 'error', 'original retry failure');
+    await flush();
+    h.persistTerminalSendError.mockClear();
+    h.sendToAgent.mockRejectedValueOnce(
+      new Error('[SESSION_NOT_ACTIVE] Session was archived before dispatch'),
+    );
+
+    await h.coordinator.retryLastError(sid, { requireActiveSession: true });
+    await flush();
+
+    const projection = latestProjection(h.projections);
+    expect(projection).toMatchObject({
+      error: 'original retry failure',
+      recovery: { kind: 'active-turn' },
+    });
+    expect(h.persistTerminalSendError).toHaveBeenCalledWith(sid, 'original retry failure');
+    expect(h.onDiscardedQueuedMessage).toHaveBeenCalledWith(
+      sid,
+      expect.objectContaining({ requireActiveSession: true }),
+    );
+  });
+
   it('active-turn retry falls back to resending the original text when the turn produced nothing', async () => {
     const h = createHarness();
     const sid = 'retry-continue-no-progress';

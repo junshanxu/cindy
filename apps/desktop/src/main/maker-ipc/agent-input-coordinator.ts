@@ -730,6 +730,21 @@ interface PendingAutoResumeRecovery {
   attemptToken: number;
 }
 
+/**
+ * Secondary-window Retry clears the visible recovery before its replacement
+ * reaches the final lifecycle fence. Keep that recovery just long enough to
+ * restore it if the task is archived in that last dispatch window.
+ */
+interface PendingManualRetryRecovery {
+  sessionId: string;
+  stateRef: SessionInputState;
+  recovery: NonNullable<AgentInputRecovery>;
+  error: string | null;
+  errorReason: string | null;
+  toolLoop: AgentInputToolLoopDetails | null;
+  stickyError: string | null;
+}
+
 function createInitialInputState(
   generation = 0,
   clearBoundaryMs: number | null = null,
@@ -1054,6 +1069,8 @@ export class AgentInputCoordinator {
    * 并用 stateRef 防止 clearSession 后迟到的旧结果复活新上下文。
    */
   private readonly pendingAutoResumeRecoveries = new Map<string, PendingAutoResumeRecovery>();
+  /** Secondary-window retry checkpoints, keyed by the replacement queue item. */
+  private readonly pendingManualRetryRecoveries = new Map<string, PendingManualRetryRecovery>();
   /** transient busy 期间同一 auto item 已尝试过的派发次数。 */
   private readonly autoResumeDispatchAttempts = new Map<string, number>();
 
@@ -2890,6 +2907,7 @@ export class AgentInputCoordinator {
     const previousErrorReason = state.errorReason;
     const previousToolLoop = state.toolLoop;
     const previousStickyError = state.stickyError;
+    let manualRetryClientId: string | null = null;
     let retryItem = recovery.kind === 'active-turn' ? recovery.item : null;
     if (
       !continueItem &&
@@ -2932,6 +2950,7 @@ export class AgentInputCoordinator {
         };
       }
       item = preserveActiveSessionDispatchFence(item, opts?.requireActiveSession === true);
+      if (!opts?.auto && opts?.requireActiveSession) manualRetryClientId = item.clientId;
       if (opts?.auto && attemptToken !== null) {
         this.pendingAutoResumeRecoveries.set(item.clientId, {
           sessionId,
@@ -2971,7 +2990,19 @@ export class AgentInputCoordinator {
         const nextQueue = [...state.pendingQueue];
         nextQueue[headIndex] = preserveActiveSessionDispatchFence(head, true);
         state.pendingQueue = nextQueue;
+        manualRetryClientId = head.clientId;
       }
+    }
+    if (manualRetryClientId) {
+      this.pendingManualRetryRecoveries.set(manualRetryClientId, {
+        sessionId,
+        stateRef: state,
+        recovery,
+        error: previousError,
+        errorReason: previousErrorReason,
+        toolLoop: previousToolLoop,
+        stickyError: previousStickyError,
+      });
     }
     if (!opts?.auto) this.touchUserSend(sessionId);
     this.emit(sessionId);
@@ -4575,6 +4606,8 @@ export class AgentInputCoordinator {
           latest.activeTurn = null;
           this.clearCredentialSwitchWait(latest);
           this.deps.onDiscardedQueuedMessage?.(sessionId, head);
+          const restoredError = this.restoreManualRetryRecovery(sessionId, head.clientId);
+          if (restoredError) this.persistTerminalSendError(sessionId, restoredError);
           log.info('discarded queued input after final lifecycle fence', {
             sessionId,
             clientId: head.clientId,
@@ -4593,6 +4626,7 @@ export class AgentInputCoordinator {
           );
           return;
         }
+        this.pendingManualRetryRecoveries.delete(head.clientId);
         if (head.autoResume) {
           latest.activeTurn = null;
           this.discardAutoResumeBeforeDispatch(sessionId, head);
@@ -4617,6 +4651,7 @@ export class AgentInputCoordinator {
         this.emit(sessionId);
         return;
       }
+      this.pendingManualRetryRecoveries.delete(head.clientId);
       latest.error = errorMessage(err);
       clearErrorProjectionSignals(latest);
       latest.stickyError = null;
@@ -5201,6 +5236,7 @@ export class AgentInputCoordinator {
   /** 自动续跑项已真正进入 vendor，之后不再需要 pre-vendor 回滚信息。 */
   private commitAutoResumeDispatch(sessionId: string, item: AgentInputQueuedMessage): void {
     this.pendingAutoResumeRecoveries.delete(item.clientId);
+    this.pendingManualRetryRecoveries.delete(item.clientId);
     this.autoResumeDispatchAttempts.delete(item.clientId);
     const attemptToken = item.autoResumeInfo?.sessionTotal;
     const state = this.getState(sessionId);
@@ -5211,6 +5247,21 @@ export class AgentInputCoordinator {
     ) {
       state.autoResumeAttemptToken = null;
     }
+  }
+
+  /** Restore a secondary-window retry only while it still owns this state object. */
+  private restoreManualRetryRecovery(sessionId: string, clientId: string): string | null {
+    const pending = this.pendingManualRetryRecoveries.get(clientId);
+    if (!pending) return null;
+    this.pendingManualRetryRecoveries.delete(clientId);
+    const state = this.states.get(sessionId);
+    if (pending.sessionId !== sessionId || state !== pending.stateRef) return null;
+    state.error = pending.error;
+    state.errorReason = pending.errorReason;
+    state.toolLoop = pending.toolLoop;
+    state.stickyError = pending.stickyError;
+    state.recovery = pending.recovery;
+    return pending.error ?? pending.stickyError;
   }
 
   /**
@@ -5261,6 +5312,12 @@ export class AgentInputCoordinator {
       .filter((item) => item.autoResume)
       .map((item) => item.clientId);
     this.supersedePendingAutoResumeRecoveries(sessionId);
+    // A later user action supersedes the secondary-window retry intent as
+    // well. Session close deliberately does not call this helper: its final
+    // lifecycle fence may still need the checkpoint to restore the retry UI.
+    for (const [clientId, pending] of this.pendingManualRetryRecoveries) {
+      if (pending.sessionId === sessionId) this.pendingManualRetryRecoveries.delete(clientId);
+    }
     for (const clientId of queuedClientIds) this.remove(sessionId, clientId);
 
     const active = state.activeTurn;
