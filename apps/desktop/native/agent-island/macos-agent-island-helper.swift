@@ -3976,6 +3976,7 @@ func sourceLabel(for agentKind: String) -> String {
   let lower = agentKind.lowercased()
   if lower.contains("codex") { return "Codex" }
   if lower.contains("claude") { return "Claude" }
+  if lower == "pi" { return "Pi" }
   return agentKind.isEmpty ? "Agent" : agentKind
 }
 
@@ -4059,10 +4060,14 @@ struct StatusDot: View {
 enum AgentIslandSessionVendor {
   case cc
   case codex
+  case pi
 }
 
 func agentIslandSessionVendor(for session: AgentIslandSession) -> AgentIslandSessionVendor {
-  session.agentKind.lowercased().contains("codex") ? .codex : .cc
+  let kind = session.agentKind.lowercased()
+  if kind.contains("codex") { return .codex }
+  if kind == "pi" { return .pi }
+  return .cc
 }
 
 final class AgentIslandVendorMarkImageStore {
@@ -4071,6 +4076,7 @@ final class AgentIslandVendorMarkImageStore {
   private var cache: [AgentIslandSessionVendor: NSImage] = [:]
 
   func image(for vendor: AgentIslandSessionVendor) -> NSImage? {
+    if vendor == .pi { return nil }
     if let cached = cache[vendor] { return cached }
     let svg = vendor == .codex ? agentIslandCodexMarkSVG : agentIslandClaudeMarkSVG
     guard let data = svg.data(using: .utf8), let image = NSImage(data: data) else {
@@ -4094,7 +4100,7 @@ struct AgentIslandSessionVendorIcon: View {
   }
 
   private var markSize: CGFloat {
-    vendor == .codex ? 12 : 13
+    vendor == .cc ? 13 : 12
   }
 
   var body: some View {
@@ -4135,6 +4141,9 @@ struct AgentIslandSessionVendorIcon: View {
     if vendor == .codex {
       Circle()
         .stroke(lineWidth: 1.4)
+    } else if vendor == .pi {
+      Text("π")
+        .font(.system(size: 12, weight: .semibold, design: .serif))
     } else {
       Text("XD")
         .font(.system(size: 8.5, weight: .bold, design: .rounded))

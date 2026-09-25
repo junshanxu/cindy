@@ -151,6 +151,19 @@ describe('MacAgentIslandNativeHost', () => {
     expect(nativeSource).not.toContain('agentIslandXDIncMarkSVG');
   });
 
+  it('renders Pi sessions with the Pi mark instead of the Claude mark', () => {
+    const source = fs.readFileSync(
+      new URL('../../../../native/agent-island/macos-agent-island-helper.swift', import.meta.url),
+      'utf8',
+    );
+
+    expect(source).toContain('case pi');
+    expect(source).toContain('if kind == "pi" { return .pi }');
+    expect(source).toContain('if vendor == .pi { return nil }');
+    expect(source).toContain('Text("π")');
+    expect(source).toContain('if lower == "pi" { return "Pi" }');
+  });
+
   it('uses semantic icons for expanded terminal and interaction rows', () => {
     const source = fs
       .readFileSync(
