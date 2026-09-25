@@ -156,11 +156,21 @@ describe('MacAgentIslandNativeHost', () => {
       new URL('../../../../native/agent-island/macos-agent-island-helper.swift', import.meta.url),
       'utf8',
     );
+    const vendorResolver = source.match(
+      /func agentIslandSessionVendor\(for session: AgentIslandSession\) -> AgentIslandSessionVendor \{([\s\S]*?)\n\}/,
+    )?.[1];
+    const markImageResolver = source.match(
+      /func image\(for vendor: AgentIslandSessionVendor\) -> NSImage\? \{([\s\S]*?)\n  \}/,
+    )?.[1];
 
     expect(source).toContain('case pi');
-    expect(source).toContain('if kind == "pi" { return .pi }');
-    expect(source).toContain('if vendor == .pi { return nil }');
-    expect(source).toContain('Text("π")');
+    expect(vendorResolver).toContain('if kind == "pi" { return .pi }');
+    expect(markImageResolver).toContain('case .pi:');
+    expect(markImageResolver).toContain('svg = agentIslandPiMarkSVG');
+    expect(source).toContain('private let agentIslandPiMarkSVG = """');
+    expect(source).toContain('<path d="M3.6 6.6h16.8"/>');
+    expect(source).toContain('<path d="M8.4 6.6v11.8"/>');
+    expect(source).toContain('<path d="M15.6 6.6v9.6c0 1.5.9 2.2 2.4 2.2"/>');
     expect(source).toContain('if lower == "pi" { return "Pi" }');
   });
 
